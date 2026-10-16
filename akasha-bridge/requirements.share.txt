@@ -1,0 +1,9 @@
+# akasha-bridge 依赖（Python 3.12）
+# 与 akasha-bridge\requirements.txt 内容一致，这里再给一份便于单独安装。
+requests>=2.31.0
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+pygetwindow>=0.0.9
+uiautomation>=2.0.17
+Pillow>=10.0.0
+websockets>=12.0

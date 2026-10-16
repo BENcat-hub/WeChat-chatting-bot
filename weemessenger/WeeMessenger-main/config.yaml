@@ -1,0 +1,40 @@
+# ============================================================================
+# 统一配置文件 | Unified Configuration File
+# 修改后保存并重启程序即可生效 | Save & restart to apply changes
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# WebSocket 服务器 - 选改 | WebSocket Server - Optional
+# ----------------------------------------------------------------------------
+# 消息来源地址，小信使会将该来源的消息自动转发至微信
+# Messages from this source will be auto-forwarded to WeChat
+ws:
+  enabled: false          # 是否启用 / Enable
+  url: "ws://127.0.0.1:1234/ws"
+
+# ----------------------------------------------------------------------------
+# HTTP 服务器 - 选改 | HTTP Server - Optional
+# ----------------------------------------------------------------------------
+# 可与 WebSocket 并行工作，同时接收指令
+# Works in parallel with WebSocket to receive commands
+http:
+  enabled: true           # 是否启用 / Enable（本机 AI 链路需要 HTTP 指令通道，故开启）
+  host: "127.0.0.1"       # 只监听本机，避免局域网其它机器往微信里发消息
+  port: 9877
+
+# ----------------------------------------------------------------------------
+# 防检测鼠标自然漫游参数 - 选改 | Anti-Detection Mouse Natural Roaming Parameters
+# ----------------------------------------------------------------------------
+wanderer:
+  enabled: false         # 是否启用 / Enable（会主动移动真实鼠标，抢用户鼠标，故关闭）
+  min_interval: 10.0     # 漫游最小间隔（秒） / Min interval (s)
+  max_interval: 30.0     # 漫游最大间隔（秒） / Max interval (s)
+  times_min: 1           # 单次漫游移动次数下限 / Min moves per wander
+  times_max: 3           # 单次漫游移动次数上限 / Max moves per wander
+
+# ----------------------------------------------------------------------------
+# 日志级别 | Log Level
+# 可选值: DEBUG / INFO / WARNING / ERROR
+# Options: DEBUG / INFO / WARNING / ERROR
+# ----------------------------------------------------------------------------
+log_level: "INFO"
