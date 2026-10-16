@@ -1,0 +1,64 @@
+# ---- 运行期数据 / 可再生产物：都不要提交 ----
+
+# Python
+.venv/
+.venv*/
+**/.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Node
+node_modules/
+**/node_modules/
+
+# 日志与运行态
+logs/
+*.log
+*.pid
+bridge.pid
+*.tmp
+
+# bridge 运行态
+akasha-bridge/wxui_queue_assets/
+akasha-bridge/wxui_pending.jsonl
+akasha-bridge/ob_id_map.json
+
+# AstrBot 运行态
+astrbot/data/plugin_data/
+astrbot/data/temp/
+astrbot/data/workspaces/
+astrbot/data/backups/
+astrbot/data/data_v4.db
+astrbot/data/data_v4.db-wal
+astrbot/data/data_v4.db-shm
+astrbot/data/plugins.json
+astrbot/data/config/
+astrbot/cache/
+astrbot/.astrbot
+astrbot/*.lock
+
+# 微信/WeFlow 导出物
+downloads/
+scripts/session-id-map.json
+
+# ---- 密钥与私人配置：绝不提交 ----
+akasha-bridge/config.json
+astrbot/data/cmd_config.json
+secrets/jimeng_api_key.txt
+secrets/volcengine_ak_sk.txt
+secrets/weflow-token.txt
+.env
+*.env
+!*.env.example
+!secrets/.env.example
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
