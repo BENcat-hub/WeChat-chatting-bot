@@ -1,4 +1,4 @@
-# WeFlow 离线防回拨 anchor 体检 / 修复
+﻿# WeFlow 离线防回拨 anchor 体检 / 修复
 #
 # 背景：WeFlow 启动时原生 DLL 的 wcdb_runtime_policy_version() 必须返回魔数 1464206081。
 # 若返回 -105（= 离线防回拨状态损坏或无法安全保存），app.asar 里会打

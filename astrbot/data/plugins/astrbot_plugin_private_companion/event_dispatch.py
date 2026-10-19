@@ -4291,6 +4291,26 @@ class EventDispatchMixin:
             return "说话起手式"
         return ""
 
+    _SMART_DEBOUNCE_VOCATIVE_CHARS = "宝喂欸诶嗨嘿哎嗷嗳"
+
+    def _smart_message_debounce_vocative_reason(self, text: str) -> str:
+        """纯呼唤/称呼（宝、宝宝、喂、欸…）不算说完：先等一会儿，看有没有后续。
+
+        2026-10-19：用户先发「宝」，8 秒后又发「早上好呀」，两次都被本地快判以
+        「短句完整」0 秒放行，同一个联系人被拆成两个独立回合、两套情绪，看起来
+        像两个人格互相打架。纯呼唤一律进等待缓冲，后续消息会并成一轮。
+        """
+        cleaned = _single_line(text, 60)
+        if not cleaned:
+            return ""
+        compact = re.sub(r"\s+", "", cleaned)
+        compact = re.sub(r"[?？。.!！~～…，,、;；]+$", "", compact)
+        if not compact or len(compact) > 4:
+            return ""
+        if not all(ch in self._SMART_DEBOUNCE_VOCATIVE_CHARS for ch in compact):
+            return ""
+        return "纯呼唤未说完"
+
     def _smart_message_debounce_fast_complete_reason(self, text: str) -> str:
         cleaned = _single_line(text, 260)
         if not cleaned:
@@ -4298,11 +4318,17 @@ class EventDispatchMixin:
         compact = re.sub(r"\s+", "", cleaned)
         if self._smart_message_debounce_suspense_intro_reason(compact):
             return ""
+        if self._smart_message_debounce_vocative_reason(compact):
+            return ""
         if re.search(r"[?？。.!！]$", compact):
             return "句末完整标点"
         if re.search(r"^(其实)?我(是|叫|就是).{1,24}$", compact):
             return "完整身份陈述"
-        if re.search(r"(吗|么|嘛|呢|呀|啊|谁|什么|怎么|咋|为何|为什么|哪[个里儿]?|多少|几|是不是|能不能|可不可以|行不行)[?？]?$", compact):
+        if re.search(r"(吗|么|嘛|呢|谁|什么|怎么|咋|为何|为什么|哪[个里儿]?|多少|几|是不是|能不能|可不可以|行不行)[?？]?$", compact):
+            return "完整疑问句"
+        # 2026-10-19：「早上好呀」「好呀」是招呼不是问句，必须带问号才算疑问。
+        # 旧的 |呀|啊 分支会把 08 秒后的第二句招呼也判成「完整疑问句」直接放行。
+        if re.search(r"(呀|啊)[?？]$", compact):
             return "完整疑问句"
         if re.search(r"(摸摸|贴贴|抱抱|亲亲|捏捏|早安|晚安|早上好|晚上好|你好|在吗|谢谢|好呀|好的|嗯嗯|哈哈|草|笑死)[~～。.!！]?$", compact):
             return "短互动完整"
@@ -4437,6 +4463,39 @@ class EventDispatchMixin:
             },
         )
 
+    def _smart_debounce_recent_release_map(self) -> dict[str, float]:
+        store = getattr(self, "_smart_debounce_recent_release", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._smart_debounce_recent_release = store
+        now = time.monotonic()
+        for stale_key, ts in list(store.items()):
+            if now - float(ts or 0.0) > 300.0:
+                store.pop(stale_key, None)
+        return store
+
+    def _smart_debounce_mark_release(self, scope: str, sender_id: str) -> None:
+        try:
+            self._smart_debounce_recent_release_map()[f"{scope}:{sender_id}"] = time.monotonic()
+        except Exception:
+            pass
+
+    def _smart_debounce_recent_release_wait(self, scope: str, sender_id: str) -> float:
+        """上一轮刚放行、还在生成时，让新消息先等一下，避免两轮并发抢着发。"""
+        try:
+            window = float(
+                getattr(self, "smart_message_debounce_previous_turn_window_seconds", 12.0) or 0.0
+            )
+            if window <= 0:
+                return 0.0
+            last = float(self._smart_debounce_recent_release_map().get(f"{scope}:{sender_id}") or 0.0)
+            if last <= 0:
+                return 0.0
+            remaining = window - (time.monotonic() - last)
+            return round(remaining, 2) if remaining > 0.25 else 0.0
+        except Exception:
+            return 0.0
+
     async def _smart_message_debounce_wait_seconds_for_event(
         self,
         event: AstrMessageEvent,
@@ -4553,6 +4612,87 @@ class EventDispatchMixin:
                 _single_line(cleaned, 80),
             )
             return wait
+        vocative_reason = self._smart_message_debounce_vocative_reason(cleaned)
+        # 配置项只用于「显式覆盖」；读不到（插件 schema 里没有这个键）也必须保持 8 秒兜底，
+        # 否则这个补丁会静默失效。
+        vocative_override = _safe_float(
+            _persona_value(self, "smart_message_debounce_vocative_wait_seconds", 0.0), 0.0, 0.0
+        )
+        vocative_wait = min(15.0, vocative_override) if vocative_override > 0 else 8.0
+        if vocative_reason and vocative_wait > 0:
+            self._remember_smart_message_debounce_decision(
+                scope=scope,
+                sender_id=sender_id,
+                text=cleaned,
+                decision="incomplete",
+                confidence=0.9,
+                reason=vocative_reason,
+            )
+            self._record_smart_message_debounce_log(
+                scope=scope,
+                sender_id=sender_id,
+                text=cleaned,
+                decision="incomplete",
+                confidence=0.9,
+                reason=vocative_reason,
+                wait_seconds=vocative_wait,
+                outcome="wait",
+                note="只是叫了一声,先等一会儿看有没有下一句,避免拆成两个独立回合。",
+                source="fast_rule",
+                private_chat=private_chat,
+            )
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            _set_smart_result(
+                "incomplete",
+                wait_seconds=vocative_wait,
+                original_wait_seconds=vocative_wait,
+                elapsed_ms=elapsed_ms,
+                source="fast_rule",
+                reason=vocative_reason,
+            )
+            logger.info(
+                "智能防抖纯呼唤等待: scope=%s sender=%s elapsed=%sms reason=%s wait=%.1fs text=%s",
+                scope,
+                sender_id,
+                elapsed_ms,
+                _single_line(vocative_reason, 80),
+                vocative_wait,
+                _single_line(cleaned, 80),
+            )
+            return vocative_wait
+        recent_turn_wait = self._smart_debounce_recent_release_wait(scope, sender_id)
+        if recent_turn_wait > 0:
+            self._record_smart_message_debounce_log(
+                scope=scope,
+                sender_id=sender_id,
+                text=cleaned,
+                decision="incomplete",
+                confidence=0.85,
+                reason="previous_turn_inflight",
+                wait_seconds=recent_turn_wait,
+                outcome="wait",
+                note="上一轮回复还在生成，先并入本轮，避免两轮的回复在微信里交错。",
+                source="fast_rule",
+                private_chat=private_chat,
+            )
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            _set_smart_result(
+                "incomplete",
+                wait_seconds=recent_turn_wait,
+                original_wait_seconds=wait,
+                elapsed_ms=elapsed_ms,
+                source="fast_rule",
+                reason="previous_turn_inflight",
+            )
+            logger.info(
+                "智能防抖等待上一轮收尾: scope=%s sender=%s elapsed=%sms wait=%.1fs text=%s",
+                scope,
+                sender_id,
+                elapsed_ms,
+                recent_turn_wait,
+                _single_line(cleaned, 80),
+            )
+            return recent_turn_wait
         fast_complete_reason = self._smart_message_debounce_fast_complete_reason(cleaned)
         if fast_complete_reason:
             self._remember_smart_message_debounce_decision(
@@ -4593,6 +4733,7 @@ class EventDispatchMixin:
                 _single_line(fast_complete_reason, 80),
                 _single_line(cleaned, 80),
             )
+            self._smart_debounce_mark_release(scope, sender_id)
             return 0.0
         examples = self._smart_message_debounce_examples()
         example_lines = []
@@ -4720,6 +4861,7 @@ class EventDispatchMixin:
                 _single_line(reason, 80),
                 _single_line(cleaned, 80),
             )
+            self._smart_debounce_mark_release(scope, sender_id)
             return 0.0
         self._remember_smart_message_debounce_decision(
             scope=scope,

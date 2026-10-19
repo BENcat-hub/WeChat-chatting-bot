@@ -52,6 +52,15 @@ LLM_REQUEST_ORIGIN_EXTRA_KEY = "meme_manager_llm_request_origin"
 LLM_REQUEST_ORIGIN_CHAT = "chat"
 LLM_REQUEST_ORIGIN_PLUGIN = "plugin"
 
+# 语义检索词缓存与超时（2026-10-19 提速）。实测 deepseek-flash 把一句回复压成
+# 几个字的检索词要 7s 左右，而它是整条回复发送前的最后一个阻塞点：选图不快，
+# 正文就发不出去。这里做两件事：①同一段回复文本重复出现时复用上次检索词；
+# ②单次生成最多等 3.0s，超时退回「截短后的可见回复」，宁可词粗一点也不堵正文。
+EMOTION_QUERY_CACHE: dict[tuple[str, str], tuple[str, float]] = {}
+EMOTION_QUERY_CACHE_TTL_S = 900.0
+EMOTION_QUERY_CACHE_MAX = 256
+EMOTION_QUERY_TIMEOUT_S = 3.0
+
 
 def normalize_trigger_scope(value: Any) -> str:
     """Resolve a supported trigger scope, defaulting to ordinary chat.
@@ -1086,10 +1095,23 @@ class EventHandlerMixin:
             + json.dumps({"reply": visible_text}, ensure_ascii=False)
             + self._build_emotion_llm_injection_suffix(event)
         )
+        cache_key = (str(provider_id or ""), visible_text)
+        cached = EMOTION_QUERY_CACHE.get(cache_key)
+        if cached and (time.monotonic() - cached[1]) < EMOTION_QUERY_CACHE_TTL_S:
+            return cached[0]
         try:
-            llm_resp = await self._emotion_llm_generate(event, prompt)
+            llm_resp = await asyncio.wait_for(
+                self._emotion_llm_generate(event, prompt),
+                timeout=EMOTION_QUERY_TIMEOUT_S,
+            )
             raw_text = str(getattr(llm_resp, "completion_text", "") or "").strip()
             query = parse_semantic_query_result(raw_text, fallback)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[meme_manager] 检索词生成超过 %.1fs，改用截短后的可见回复",
+                EMOTION_QUERY_TIMEOUT_S,
+            )
+            query = fallback
         except Exception as exc:
             logger.warning(
                 "[meme_manager] 生成短检索词失败，使用截短后的可见回复: %s",
@@ -1097,6 +1119,10 @@ class EventHandlerMixin:
             )
             query = fallback
 
+        if query and query != fallback:
+            if len(EMOTION_QUERY_CACHE) >= EMOTION_QUERY_CACHE_MAX:
+                EMOTION_QUERY_CACHE.clear()
+            EMOTION_QUERY_CACHE[cache_key] = (query, time.monotonic())
         logger.info(f"[meme_manager] 情感模型语义检索词（{len(query)}字）: {query}")
         return query
 

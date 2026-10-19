@@ -1,10 +1,10 @@
 {
-  "config_version": 3,
+  "config_version": 5,
   "platform_settings": {
     "unique_session": false,
     "rate_limit": {
-      "time": 60,
-      "count": 30,
+      "time": 0,
+      "count": 0,
       "strategy": "stall"
     },
     "reply_prefix": "",
@@ -48,7 +48,7 @@
       "provider": "deepseek",
       "type": "openai_chat_completion",
       "provider_type": "chat_completion",
-      "key": "$DEEPSEEK_API_KEY",
+      "key": "<FILL_ME>",
       "api_base": "https://api.deepseek.com/v1",
       "timeout": 120,
       "proxy": "",
@@ -60,7 +60,7 @@
       "provider": "deepseek",
       "type": "openai_chat_completion",
       "provider_type": "chat_completion",
-      "key": "$DEEPSEEK_API_KEY",
+      "key": "<FILL_ME>",
       "api_base": "https://api.deepseek.com/v1",
       "timeout": 120,
       "proxy": "",
@@ -288,8 +288,8 @@
     "image_caption_prompt": "Please describe the image using Chinese.",
     "provider_pool": "*",
     "wake_prefix": "",
-    "web_search": false,
-    "websearch_provider": "tavily",
+    "web_search": true,
+    "websearch_provider": "deepseek",
     "websearch_tavily_key": null,
     "websearch_bocha_key": null,
     "websearch_brave_key": null,
@@ -297,7 +297,9 @@
     "websearch_firecrawl_key": null,
     "websearch_exa_key": null,
     "websearch_anysearch_key": null,
-    "web_search_link": false,
+    "websearch_deepseek_key": "<FILL_ME>",
+    "websearch_serpapi_key": [],
+    "web_search_link": true,
     "display_reasoning_text": false,
     "identifier": true,
     "group_name_display": true,
@@ -326,6 +328,18 @@
       "add_cron_tools": true
     },
     "computer_use_runtime": "local",
+    "computer_use_local_permissions": {
+      "member": {
+        "allow_execution": true,
+        "allow_network": true,
+        "filesystem_scope": "host"
+      },
+      "admin": {
+        "allow_execution": true,
+        "allow_network": true,
+        "filesystem_scope": "host"
+      }
+    },
     "computer_use_require_admin": false,
     "sandbox": {
       "booter": "shipyard_neo",
@@ -344,10 +358,8 @@
       "cua_local": true,
       "cua_api_key": ""
     },
-    "image_compress_enabled": true,
     "image_compress_options": {
-      "max_size": 1280,
-      "quality": 95
+      "max_size": 1280
     }
   },
   "agent_runner": {
@@ -373,7 +385,7 @@
         "fallback_max_tokens": "<FILL_ME>"
       },
       "misc": {
-        "max_steps": 30,
+        "max_steps": 128,
         "tool_schema_mode": "full",
         "tool_call_timeout": 120,
         "sanitize_context_by_modalities": false
@@ -414,7 +426,7 @@
   "content_safety": {
     "also_use_in_response": false,
     "internal_keywords": {
-      "enable": true,
+      "enable": false,
       "extra_keywords": null
     },
     "baidu_aip": {

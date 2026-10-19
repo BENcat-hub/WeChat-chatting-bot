@@ -175,6 +175,9 @@ def restored_rect(hwnd, tries=3):
 def fail(plan, error, retryable=True):
     """Record a send failure. retryable=True means "try again", not "the message is lost"."""
     plan.update(ok=False, error=error, retryable=bool(retryable))
+    # 让 bridge 不必解析文案就能分辨「windows-mcp 不肯驱动桌面」——那种情况要换掉常驻
+    # worker（新客户端才会拿到干净的 control latch），而不是当成普通的发不出去重试。
+    plan["control_preempted"] = preempted(error)
     return False
 
 
@@ -256,7 +259,14 @@ def screen_capturable(client, cfg, rect):
         return False, "WeChat window is minimized/hidden (rect=%s)" % (list(rect),)
     left, top = rect[0], rect[1]
     tiny = [left + 4, top + 4, left + 64, top + 64]
-    if not shot(client, tiny, os.path.join(ROOT, "logs", "wmcp", "probe"), tries=1):
+    png, err = shot_ex(client, tiny, os.path.join(ROOT, "logs", "wmcp", "probe"), tries=1)
+    if not png:
+        # 2026-10-18: windows-mcp answers a refused tool call with a text result, not an
+        # image — a CONTROL_PREEMPTED (human owns the desktop / its latch never cleared)
+        # used to be reported as "screen not capturable", which sent the whole diagnosis
+        # down the "RDP dropped / workstation locked" path. Name the real cause instead.
+        if preempted(err):
+            return False, "desktop control preempted by windows-mcp (CONTROL_PREEMPTED: %s)" % _brief(err)
         return False, "screen not capturable (RDP disconnected or workstation locked)"
     return True, ""
 
@@ -301,6 +311,13 @@ def wait_for_session(client, cfg, plan, hwnd=None):
         if hwnd:
             ctl, wait = control_state(client)
             if ctl not in (None, "ready", "ai"):
+                if ctl == "user" and wait >= 9.9:
+                    # windows-mcp 的 control latch 被 _recover_after_rehook 钉死在 10 秒
+                    # （每次读都是 ~10.0s、状态永远 user），等满 session_wait_s 也不会自己好；
+                    # 立刻交回，由 bridge 丢掉这个常驻 worker，换新客户端重试。
+                    return fail(plan, "desktop control preempted by windows-mcp "
+                                      "(CONTROL_PREEMPTED: state=user wait=%.1fs frozen latch)"
+                                      % wait, retryable=True)
                 reason = "user is using the desktop (control=%s, ~%.0fs)" % (ctl, wait)
             else:
                 ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
@@ -401,8 +418,130 @@ def name_matches_any(key, texts, allow_fuzzy=False):
     return False
 
 
+# 2026-10-18（用户反馈：把「用户B」的备注改成「用户B别名」后，侧边栏 OCR 再也找不到那条
+# 会话，消息直接发不出去）：WeFlow 的 displayName 是旧名字，侧边栏显示的却是新备注，于是
+# 「用 API 名字找 UI 行」永远匹配不上。别名表让一条会话可以有几个合法拼写——手填在
+# wxui-config.json 的 contact_aliases 里，或由一次「WeFlow 回读确认成功」的发送自动学到
+# （logs/wxui-aliases.json），所以改备注只需要别名表里多一个名字，不需要改代码。
+def _alias_pairs(cfg):
+    """{normalized name: [other raw spellings]} from config + the learned alias file."""
+    pairs = {}
+
+    def add(a, b):
+        if not a or not b or name_key(a) == name_key(b):
+            return
+        for src, dst in ((a, b), (b, a)):
+            bucket = pairs.setdefault(name_key(src), [])
+            if name_key(dst) not in {name_key(x) for x in bucket}:
+                bucket.append(dst)
+
+    for primary, others in (cfg.get("contact_aliases") or {}).items():
+        for other in ([others] if isinstance(others, str) else (others or [])):
+            add(primary, other)
+    try:
+        with open(_alias_learn_path(cfg), encoding="utf-8") as fh:
+            learned = json.load(fh)
+    except Exception:
+        learned = {}
+    if isinstance(learned, dict):
+        for primary, others in learned.items():
+            for other in ([others] if isinstance(others, str) else (others or [])):
+                add(primary, other)
+    return pairs
+
+
+def _alias_learn_path(cfg):
+    path = cfg.get("alias_learn_file") or os.path.join(ROOT, "logs", "wxui-aliases.json")
+    return path if os.path.isabs(path) else os.path.join(ROOT, path)
+
+
+def alias_names(cfg, target):
+    """Other known spellings of `target`, primary first (a rename adds one)."""
+    return list(_alias_pairs(cfg).get(name_key(target), []))
+
+
+def target_keys(cfg, target):
+    """Every spelling that may name this chat in the sidebar or the chat header."""
+    return [target] + alias_names(cfg, target)
+
+
+def name_match_keys(keys, text):
+    """Best name_match() over several spellings of the same chat."""
+    return max((name_match(k, text) for k in keys if k), default=0.0)
+
+
+def _learn_alias(cfg, target, plan):
+    """Remember the sidebar spelling that actually opened `target`, after a verified send.
+
+    Called only once WeFlow read-back proved the right talker received the message, so a
+    learned alias can never point at a different chat.
+    """
+    picked = (plan.get("ocr") or {}).get("picked") or {}
+    text = (picked.get("text") or "").strip()
+    if not text or name_key(text) == name_key(target):
+        return None
+    path = _alias_learn_path(cfg)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    others = data.get(target)
+    others = [others] if isinstance(others, str) else list(others or [])
+    if name_key(text) in {name_key(x) for x in others}:
+        return None
+    others.append(text)
+    data[target] = others
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except Exception:
+        return None
+    return text
+
+
+def _result_text(res):
+    """Text content of a windows-mcp tool result (where its refusals are reported)."""
+    parts = []
+    for item in (res or {}).get("content") or []:
+        if item.get("type") == "text":
+            parts.append(item.get("text") or "")
+    return " ".join(p for p in parts if p).strip()
+
+
+CONTROL_PREEMPTED = "CONTROL_PREEMPTED"
+
+
+def preempted(err_text):
+    """True when windows-mcp refused a tool call because the desktop is not ours.
+
+    It refuses *every* tool that way (Screenshot included) while its control latch says
+    the human is driving, so the empty screenshot is not a screen problem at all.
+    """
+    return CONTROL_PREEMPTED in (err_text or "").upper()
+
+
+def _brief(text, limit=180):
+    """One-line excerpt of a JSON-ish windows-mcp status blob, for logs and reasons."""
+    flat = " ".join((text or "").split())
+    return flat[:limit] + ("…" if len(flat) > limit else "")
+
+
+_SHOT_ERR = [""]
+
+
 def shot(client, region, keep_dir, tries=2):
-    """Screenshot `region`; return the saved PNG path (see wmcp CLI for decoding)."""
+    """Screenshot `region`; return the saved PNG path, or None.
+
+    The refusal/failure text is kept in `_SHOT_ERR` (see `shot_ex`) because callers must
+    tell "windows-mcp will not drive the desktop" apart from "OCR found nothing in it".
+    """
+    _SHOT_ERR[0] = ""
     for attempt in range(tries):
         res = client.call("Screenshot", {"region": list(region)})
         for item in (res or {}).get("content") or []:
@@ -413,9 +552,23 @@ def shot(client, region, keep_dir, tries=2):
                 with open(path, "wb") as fh:
                     fh.write(base64.b64decode(item.get("data") or ""))
                 return path
+        text = _result_text(res)
+        if text:
+            _SHOT_ERR[0] = text
         if attempt + 1 < tries:  # the first frame after a window restore can come back empty
             time.sleep(0.5)
     return None
+
+
+def shot_ex(client, region, keep_dir, tries=2):
+    """(png_path, refusal_text): screenshot `region`, and why it came back empty.
+
+    A refused tool call returns a text result instead of an image (see `preempted`).
+    Keeping that text is what lets callers say "windows-mcp will not drive the desktop"
+    instead of the old, wrong "could not locate target row by OCR".
+    """
+    png = shot(client, region, keep_dir, tries)
+    return png, ("" if png else _SHOT_ERR[0])
 
 
 def image_size(path):
@@ -439,7 +592,7 @@ def ocr_lines(path):
 
 
 def header_names_target(key, texts):
-    """True when the open chat's header OCR names `key`.
+    """True when the open chat's header OCR names `key` (a name or a list of spellings).
 
     Exactness or containment on any line (or on the join of the lines, because a remarked
     chat shows the remark with the real group name underneath) is always enough. A merely
@@ -447,10 +600,14 @@ def header_names_target(key, texts):
     was already located from this same name, so "similar and unique" is what OCR noise
     (dropped emoji, a truncated title) leaves behind.
     """
+    keys = [k for k in (key if isinstance(key, (list, tuple)) else [key]) if k]
     lines = [t for t in (texts or []) if t]
-    if name_matches_any(key, lines):
+    if not keys:
+        return False
+    if any(name_matches_any(k, lines) for k in keys):
         return True
-    scored = sorted((name_match(key, t) for t in lines + ([" ".join(lines)] if len(lines) > 1 else [])),
+    scored = sorted((name_match_keys(keys, t)
+                     for t in lines + ([" ".join(lines)] if len(lines) > 1 else [])),
                     reverse=True)
     if not scored or scored[0] <= 0:
         return False
@@ -472,10 +629,11 @@ def find_row(client, cfg, rect, target):
          left + cfg["sidebar_capture_x2_offset"], bottom - cfg["sidebar_capture_bottom_margin"]],
         rect,
     )
-    png = shot(client, region, os.path.join(ROOT, "logs", "wmcp"))
+    png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp"))
     if not png:
-        return None, {"error": "no image from Screenshot (region off screen?)",
-                      "region": [int(v) for v in region]}
+        return None, {"error": "no image from Screenshot (%s)" % (_brief(err) or "region off screen?"),
+                      "region": [int(v) for v in region],
+                      "control_preempted": bool(preempted(err))}
     size = image_size(png)
     res = ocr_lines(png)
     if not res.get("ok"):
@@ -484,6 +642,11 @@ def find_row(client, cfg, rect, target):
     scale_y = (region[3] - region[1]) / float(img_h)
     scale_x = (region[2] - region[0]) / float(img_w)
     key = fit(target)
+    # A renamed chat keeps its old API name, so an alias is accepted — but only as a
+    # whole-line match: a partial hit on an alias would also match a *preview* line such
+    # as "用户B别名：嗯" inside a group row, and clicking that opens the wrong chat.
+    keys = target_keys(cfg, target)
+    exact_keys = {fit(k) for k in keys}
     candidates = []
     for line in res["lines"]:
         text = fit(line["text"])
@@ -495,7 +658,8 @@ def find_row(client, cfg, rect, target):
         candidates.append({"text": line["text"], "x": int(x_phys), "y": int(y_phys),
                            "index": round((y_phys - (top + cfg["first_row_offset_px"]))
                                           / float(cfg["row_pitch_px"])),
-                           "exact": text == key, "partial": key in text or text in key,
+                           "exact": text in exact_keys,
+                           "partial": key in text or text in key,
                            "score": round(name_match(target, line["text"]), 3)})
     exact = [c for c in candidates if c["exact"]]
     partial = [c for c in candidates if c["partial"]]
@@ -512,12 +676,13 @@ def find_row(client, cfg, rect, target):
             if scored[0]["score"] - runner_up >= NAME_MATCH_UNIQUE_MARGIN:
                 pick, fuzzy = [scored[0]], True
     debug = {"png": png, "engine": res.get("engine"), "candidates": candidates[:40],
-             "key": key, "fuzzy": fuzzy}
+             "key": key, "keys": [fit(k) for k in keys], "fuzzy": fuzzy}
     if not pick:
         return None, debug
     pick.sort(key=lambda c: (not c["exact"], c["y"]))
     best = pick[0]
-    debug["picked"] = {"text": best["text"], "score": best.get("score"), "fuzzy": fuzzy}
+    debug["picked"] = {"text": best["text"], "score": best.get("score"), "fuzzy": fuzzy,
+                       "alias": fit(best["text"]) != key}
     # Click on the matched name box, not a fixed offset from the window edge: after a
     # resize (or a different display scale) a fixed x can land in the chat pane, and a
     # fixed y can land on the row above. Small biases keep the point off the box border.
@@ -541,12 +706,13 @@ def row_point(cfg, rect, index):
 
 
 def talker_for(cfg, target, sessions):
-    key = fit(target)
+    keys = target_keys(cfg, target)
+    keyset = {fit(k) for k in keys}
     best_score, best_user = 0.0, None
     for s in sessions:
-        if fit(s.get("displayName")) == key:
+        if fit(s.get("displayName")) in keyset:
             return s.get("username")
-        score = name_match(target, s.get("displayName"))
+        score = name_match_keys(keys, s.get("displayName"))
         if score > best_score:
             best_score, best_user = score, s.get("username")
     if best_user and best_score >= NAME_MATCH_CLEAR:
@@ -563,9 +729,9 @@ def talker_for(cfg, target, sessions):
     fuzzy_user, fuzzy_score = None, 0.0
     for c in contacts:
         names = (c.get("displayName"), c.get("remark"))
-        if any(fit(n) == key for n in names):
+        if any(fit(n) in keyset for n in names):
             return c.get("username")
-        score = max(name_match(target, n) for n in names)
+        score = max(name_match_keys(keys, n) for n in names)
         if score > fuzzy_score:
             fuzzy_score, fuzzy_user = score, c.get("username")
     if fuzzy_user and fuzzy_score >= NAME_MATCH_CLEAR:
@@ -742,7 +908,7 @@ def chat_header_matches(client, cfg, rect, target):
     res = ocr_lines(png)
     texts = [ln["text"] for ln in res.get("lines", [])] if res.get("ok") else []
     key = fit(target)
-    matched = header_names_target(target, texts)
+    matched = header_names_target(target_keys(cfg, target), texts)
     return matched, {"png": png, "texts": texts[:6], "key": key, "matched": matched}
 
 
@@ -905,10 +1071,18 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
         point, dbg = find_row(client, cfg, rect, target)
         plan["ocr"] = {"png": dbg.get("png"), "engine": dbg.get("engine"),
                        "error": dbg.get("error"), "region": dbg.get("region"),
-                       "picked": dbg.get("candidates", [{}])[0] if point else None}
+                       "picked": dbg.get("picked") if point else None}
         if not point:
             plan["ocr_candidates"] = dbg.get("candidates", [])[:20]
-            return fail(plan, "could not locate target row by OCR")
+            if dbg.get("control_preempted"):
+                plan["control_preempted"] = True
+                return fail(plan, "desktop control preempted: windows-mcp refused Screenshot "
+                                  "with CONTROL_PREEMPTED (a fresh windows-mcp client is required)")
+            seen = [c.get("text") for c in (dbg.get("candidates") or []) if c.get("text")][:8]
+            return fail(plan, "could not locate target row by OCR (target=%s, aliases=%s; "
+                              "sidebar shows: %s)"
+                        % (target, alias_names(cfg, target) or "none",
+                           " / ".join(seen) or "nothing"))
         x, y = point
     else:
         x, y = row_point(cfg, rect, int(cfg.get("assume_row_index", 0)))
@@ -952,11 +1126,11 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
     plan["open_attempts"] = attempts
     plan["chat_header"] = header
     if do_ocr and not find_window(cfg, target, fuzzy=True) and not header_names_target(
-            target, header.get("texts", [])):
+            target_keys(cfg, target), header.get("texts", [])):
         return fail(plan, "open chat header does not show the target")
     # 这一条路径确认过「头部名字/独立会话窗口标题」的，才算把 warm 状态置为「名字已确认」。
     plan["warm_header_verified"] = bool(find_window(cfg, target, fuzzy=True)) or bool(
-        header_names_target(target, header.get("texts", [])))
+        header_names_target(target_keys(cfg, target), header.get("texts", [])))
     # WeChat 4.x puts the chat in its own Qt window titled with the contact name.
     # Type only once that window (or the main window) really owns the keyboard.
     return _chat_ready_to_type(cfg, plan, target)
@@ -1080,6 +1254,9 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
             if found:
                 # 只有拿到回读确认才算「输入框已空、窗口仍在原位」，下一条才敢走热路径
                 _warm_mark(target, plan.get("window_rect"), header_verified=True, clean=True)
+                learned = _learn_alias(cfg, target, plan)
+                if learned:
+                    plan["learned_alias"] = learned
                 break
             time.sleep(retry_wait)
     finally:
@@ -1194,6 +1371,9 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                                 "delivered_as": classify_outgoing(found, expect_name, expect_md5) if found else None})
             if found:
                 _warm_mark(target, plan.get("window_rect"), header_verified=True, clean=True)
+                learned = _learn_alias(cfg, target, plan)
+                if learned:
+                    plan["learned_alias"] = learned
                 break
             time.sleep(retry_wait)
     finally:
@@ -1278,7 +1458,8 @@ def worker_dispatch(cfg, client, subcmd, spec):
         hwnd, rect, ok, reason, ctl, wait = probe_session(cfg, client=client)
         return {"ok": ok, "session_ok": ok, "session_reason": reason, "hwnd": hwnd,
                 "rect": list(rect) if rect else None, "control_state": ctl,
-                "control_wait_s": wait}
+                "control_wait_s": wait,
+                "control_preempted": str(reason or "").startswith("desktop control preempted")}
     return {"ok": False, "retryable": False, "error": "unknown worker cmd %r" % (subcmd,)}
 
 
@@ -1325,6 +1506,40 @@ def worker_loop(cfg):
     return 0
 
 
+def sidebar_rows(cfg):
+    """Read-only: OCR the sidebar and report which names it can actually see.
+
+    Exists because "the bot cannot find that chat any more" is almost always a rename:
+    WeFlow still serves the old displayName while WeChat draws the new remark. This dumps
+    what OCR reads, so the fix (one line in contact_aliases) is obvious instead of guessed.
+    """
+    hwnd = find_wechat(cfg)
+    if not hwnd:
+        return {"ok": False, "error": "WeChat window not found"}
+    rect = restored_rect(hwnd)
+    if not rect_usable(rect):
+        return {"ok": False, "error": "WeChat window is minimized/hidden (rect=%s)" % (list(rect),)}
+    left, top = rect[0], rect[1]
+    region = clamp_region(
+        [left + cfg["sidebar_capture_x_offset"], top + cfg["sidebar_capture_y_offset"],
+         left + cfg["sidebar_capture_x2_offset"], rect[3] - cfg["sidebar_capture_bottom_margin"]],
+        rect,
+    )
+    client = Client()
+    try:
+        png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp", "probe"))
+    finally:
+        client.close()
+    if not png:
+        return {"ok": False, "error": "no image from Screenshot (%s)" % (_brief(err) or "empty region"),
+                "control_preempted": bool(preempted(err))}
+    res = ocr_lines(png)
+    return {"ok": bool(res.get("ok")), "png": png, "engine": res.get("engine"),
+            "lines": [{"text": ln.get("text"), "y": ln.get("y")}
+                      for ln in (res.get("lines") or [])],
+            "aliases": cfg.get("contact_aliases") or {}}
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser()
@@ -1333,6 +1548,8 @@ def main():
     sub.add_parser("worker", help="stay resident and serve JSON-line send/verify requests "
                                   "with one warm Windows-MCP client (used by the bridge)")
     sub.add_parser("sessions")
+    sub.add_parser("rows", help="read-only: print the names OCR currently reads in the "
+                                "sidebar (diagnose a renamed contact)")
     sub.add_parser("session", help="probe whether WeChat is usable right now "
                                    "(window / minimized / screen capturable)")
     p = sub.add_parser("send")
@@ -1367,15 +1584,19 @@ def main():
                "rect_restored": list(rect) if rect else None,
                "session_ok": ok, "session_reason": reason,
                "control_state": ctl, "control_wait_s": wait,
+               "control_preempted": str(reason or "").startswith("desktop control preempted"),
                "dry_run": cfg.get("dry_run", True), "geometry": {
                    "sidebar_x_offset_px": cfg["sidebar_x_offset_px"],
                    "first_row_offset_px": cfg["first_row_offset_px"],
                    "row_pitch_px": cfg["row_pitch_px"]}}
+    elif args.cmd == "rows":
+        out = sidebar_rows(cfg)
     elif args.cmd == "session":
         hwnd, rect, ok, reason, ctl, wait = probe_session(cfg)
         out = {"ok": ok, "usable": ok, "reason": reason, "hwnd": hwnd,
                "rect": list(rect) if rect else None,
-               "control_state": ctl, "control_wait_s": wait}
+               "control_state": ctl, "control_wait_s": wait,
+               "control_preempted": str(reason or "").startswith("desktop control preempted")}
     elif args.cmd == "verify":
         if not args.spec:
             print(json.dumps({"ok": False, "error": "--spec required"}, ensure_ascii=False))

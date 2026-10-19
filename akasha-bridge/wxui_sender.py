@@ -159,6 +159,15 @@ class WxuiSender(WeMessengerSender):
                 return False, fatal
             stdout_tail = data.pop("_stdout_tail", "")
 
+        if isinstance(data, dict) and data.get("control_preempted"):
+            # 2026-10-18: windows-mcp 会以 CONTROL_PREEMPTED 拒绝所有工具（连 Screenshot 都拒），
+            # 直到拿到一个“没被接管过”的客户端为止。以前它被误报成「屏幕截不到/锁屏」，
+            # 而且常驻 worker 会一直卡着不重试——这里直接丢弃 worker，下一条用全新客户端。
+            self._worker_kill("windows-mcp 拒绝驱动桌面（CONTROL_PREEMPTED）")
+            log.warning("[wxui] ⚠️ windows-mcp 桌面控制被接管（CONTROL_PREEMPTED），已丢弃常驻 worker；"
+                        "下一条消息使用全新的 MCP 客户端 | 原因=%s",
+                        str(data.get("error") or data.get("session_reason") or "")[:200])
+
         if subcmd == "verify":
             if not quiet and data.get("verified"):
                 log.info("[wxui] ✅ 回读确认已送达 %s（localId=%s）", target, data.get("localId"))

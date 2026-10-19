@@ -728,7 +728,12 @@ _CRITICAL_POSES = (
 )
 
 
-def _critical_requirements_tail(negative: str, head_lower: str = "") -> str:
+def _critical_requirements_tail(
+    negative: str,
+    head_lower: str = "",
+    character_present: bool = True,
+    photographic: bool = False,
+) -> str:
     """Build the requirement block that must survive the upstream 800-char limit.
 
     `head_lower` 传入**已裁剪**的头部小写文本时，头部已经写明的要求会被跳过：上游拼装层
@@ -742,25 +747,32 @@ def _critical_requirements_tail(negative: str, head_lower: str = "") -> str:
         return bool(head_lower) and any(marker in head_lower for marker in markers)
 
     parts: list[str] = []
-    if not carried("about 7 heads tall", "7 heads tall"):
+    if character_present and not carried("about 7 heads tall", "7 heads tall"):
         parts.append("Small head, about 7 heads tall, long legs.")
-    if not carried("light-blue gradient tips", "long blue hair"):
+    if character_present and not carried("light-blue gradient tips", "long blue hair"):
         parts.append("Long blue hair with light-blue gradient tips, blue eyes.")
-    if not carried("whale-fin ears", "whale fin ears"):
+    if character_present and not carried("whale-fin ears", "whale fin ears"):
         parts.append("Keep the reference face, hair colour, whale-fin ears and whale tail.")
     # 2026-10-16 05:2x A/B（同一次盲评、每条 4 张、1024²、4.0、生产脸部裁切参考图、**生产链路**）：
     # 长版画风句（112 字符，见 git 历史的 "slice-of-life" 版本）把 style 轴从 7.75 抬到 9.0，
     # 但同时把 head_proportion 从 7.0 打到 4.25、anatomy 7.5 → 5.5，总分 **45.0 → 41.5**
     # （4/4 张被报 oversized head / chibi proportions）→ 已回退。短版（51 字符）见 findings §29.3 的对照。
-    if not carried("anime illustration", "cel-shaded", "cel shading"):
-        parts.append("2D anime illustration, cel-shaded.")
+    if character_present:
+        if not carried("anime illustration", "cel-shaded", "cel shading"):
+            parts.append("2D anime illustration, cel-shaded.")
+    elif photographic:
+        # 2026-10-18：纯场景的「随手拍」（午饭饭菜、桌面小物）要走手机实拍质感，
+        # 不能再被这层塞一句 2D 动画风，否则前面的写实风格要求会被这一句顶掉。
+        if not carried("realistic photo", "photographic detail"):
+            parts.append("Realistic photo look, natural light, true-to-life texture.")
+    # 纯场景且没要求写实时不加任何画风句：给模型留中性描述，避免「拍午饭」变成平涂插画。
     # 头部的机位/姿势句经常被 `head_budget` 裁成半截（只剩 `Pose override:` 甚至 `Pose`），
     # 只按 "pose override" 去重会让最终提示词留下一条没有内容的姿势要求，而尾部那条完整的
     # 又被跳过。必须确认头部同时含 `framing -` 与 `pose -` 才认为它真的带上了姿势。
     pose_in_head = (
         "pose override" in head_lower and "framing -" in head_lower and "pose -" in head_lower
     )
-    if not pose_in_head:
+    if character_present and not pose_in_head:
         parts.append(
             "Pose override: framing - "
             + random.choice(_CRITICAL_FRAMINGS)
@@ -768,7 +780,7 @@ def _critical_requirements_tail(negative: str, head_lower: str = "") -> str:
             + random.choice(_CRITICAL_POSES)
             + "."
         )
-    if not carried("five clear fingers"):
+    if character_present and not carried("five clear fingers"):
         parts.append("Hands with five clear fingers, not oversized.")
     # 水印句**不做去重**：它是唯一的句子级水印要求，而 `Avoid` 段在超预算时会被从左裁掉。
     # 2026-10-16 审计里 selfie-短 出现过「头部的这句话被裁掉、尾部又被 carried() 跳过」的窗口，
@@ -780,7 +792,7 @@ def _critical_requirements_tail(negative: str, head_lower: str = "") -> str:
     return " ".join(part for part in parts if part)
 
 
-def _assemble(sections: Sequence[PhotoPromptSection], prompt_format: str) -> str:
+def _assemble(sections: Sequence[PhotoPromptSection], prompt_format: str, character_present: bool = True, photographic: bool = False) -> str:
     groups = (
         (
             "User image request",
@@ -822,18 +834,18 @@ def _assemble(sections: Sequence[PhotoPromptSection], prompt_format: str) -> str
         # No [] labels and one flat paragraph: the upstream seedream API documents that
         # prompts should stay under 800 characters and avoid special symbols.
         joined = " ".join(text for _label, text in groups if text)
-        tail = _critical_requirements_tail(negative)
+        tail = _critical_requirements_tail(negative, character_present=character_present, photographic=photographic)
         head_budget = max(200, _PROMPT_CHAR_BUDGET - len(tail))
         head = _clip(joined, head_budget, preserve_tail=False)
         # 头部裁剪之后再比对一次：只有确认这些要求真的活在头部里，尾部才不再重复它们。
         # 短请求（例如「画一只在窗台上睡觉的橘猫」）会把 image_runtime 的身份句留在头部，
         # 于是尾部又追加一遍，模型同时看到两条措辞不同的身份句和一句无关的 Pose override。
-        deduped = _critical_requirements_tail(negative, head.lower())
+        deduped = _critical_requirements_tail(negative, head.lower(), character_present=character_present, photographic=photographic)
         if len(deduped) < len(tail):
             tail = deduped
             head_budget = max(200, _PROMPT_CHAR_BUDGET - len(tail))
             head = _clip(joined, head_budget, preserve_tail=False)
-            tail = _critical_requirements_tail(negative, head.lower())
+            tail = _critical_requirements_tail(negative, head.lower(), character_present=character_present, photographic=photographic)
         # 「Avoid …」另起一段：整段平铺时，模型容易把否定句当成正向描述来处理；
         # 而且下游（测试与排障页）用 `\n\nAvoid ` 作为「正向 / 负向」的切分标记。
         marker = "Avoid "
@@ -1109,6 +1121,8 @@ def resolve_photo_prompt_context(
     prompt_format: str,
     workflow_kind: str,
     reference: Any = None,
+    character_present: bool = True,
+    photographic: bool = False,
 ) -> ResolvedPhotoPromptContext:
     # Requests may originate from another companion package that carries the
     # same public dataclass under a different module name. Normalize by fields
@@ -1139,11 +1153,11 @@ def resolve_photo_prompt_context(
     sanitized, section_detected, section_removed, residual = _sanitize_sections(tuple(prepared), wardrobe)
     detected.extend(section_detected)
     removed.extend(section_removed)
-    complete_prompt = _assemble(sanitized, prompt_format)
+    complete_prompt = _assemble(sanitized, prompt_format, character_present=character_present, photographic=photographic)
     budgeted = _budget_sections(sanitized)
     residual.extend(_scan_residual_conflicts(budgeted, wardrobe))
     return ResolvedPhotoPromptContext(
-        final_prompt=_assemble(budgeted, prompt_format),
+        final_prompt=_assemble(budgeted, prompt_format, character_present=character_present, photographic=photographic),
         complete_prompt=complete_prompt,
         prompt_sections=tuple(budgeted),
         reference=clean_reference,

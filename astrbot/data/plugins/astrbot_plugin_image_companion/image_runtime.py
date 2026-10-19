@@ -10997,15 +10997,139 @@ Output:
 
         return ", ".join(dict.fromkeys(positive_parts)), ", ".join(dict.fromkeys(negative_parts))
 
+    _PHOTO_PERSON_WORD_RE = re.compile(
+        r"\b(?:person|persons|people|man|men|woman|women|boy|girl|boys|girls|"
+        r"character|characters|human|humans|she|he|her|his|him)\b",
+        re.IGNORECASE,
+    )
+    _PHOTO_PERSON_CJK = (
+        "人物", "人像", "自拍", "女孩", "女生", "男孩", "男生",
+        "少女", "少年", "女人", "男人", "路人", "背影", "她", "他",
+    )
+    # 2026-10-18 事故：纯场景请求（桌上一杯牛奶 / 午饭饭菜）会被 private_companion
+    # 追加「; do not insert an unrequested person, character, … face, body, silhouette」，
+    # 这段否定句里本身就带 person/character/face，于是「有没有人」被误判成 True，
+    # 比例/身份/姿势三句又被注回去，模型画出多一条腿的少女。判定前必须先切掉否定从句。
+    _PHOTO_PERSON_NEGATION_MARKERS = (
+        "do not insert",
+        "do not add",
+        "do not draw",
+        "do not include",
+        "do not show",
+        "must not",
+        "should not",
+        "avoid ",
+        "without ",
+        "no person",
+        "no people",
+        "nobody",
+        "不要",
+        "禁止",
+        "不得",
+        "不含",
+        "无人",
+    )
+
+    @classmethod
+    def _photo_prompt_positive_part(cls, text: str) -> str:
+        """切掉否定从句，只留「正向要求」部分，用于判断画面里是否真的有人。"""
+
+        value = str(text or "")
+        if not value:
+            return ""
+        lowered = value.lower()
+        cut = len(value)
+        for marker in cls._PHOTO_PERSON_NEGATION_MARKERS:
+            idx = lowered.find(marker)
+            if 0 <= idx < cut:
+                cut = idx
+        return value[:cut]
+
+    @classmethod
+    def _photo_prompt_mentions_person(cls, text: str) -> bool:
+        """请求里是否真的有人（用于决定要不要注入比例/身份/姿势这三类人设句）。
+
+        2026-10-17 事故：`photo_text` 请求「桌上一杯热牛奶」被判为纯场景、没有参考图，
+        但两层拼装层无条件把「7 头身少女 / 蓝发鲸鳍耳 / Keep the reference face /
+        Pose override」塞进提示词，模型于是凭空画了一个没有身份来源的小女孩站在杯边。
+        2026-10-18 事故：只看整串会命中否定句里的 person，必须只看正向部分。
+        """
+
+        value = cls._photo_prompt_positive_part(text).strip()
+        if not value:
+            return False
+        if cls._PHOTO_PERSON_WORD_RE.search(value):
+            return True
+        return any(token in value for token in cls._PHOTO_PERSON_CJK)
+
+    # 2026-10-18：纯场景（午饭饭菜、桌面小物）默认是「随手拍一张」，
+    # 却因为人设风格是「二次元」被画成平涂插画，质感远不如真实照片。
+    # 这里识别「要写实/实拍」的措辞，让纯场景切到照片质感；人物画面仍然保持二次元人设。
+    _PHOTO_REALISTIC_STYLE_MARKERS = (
+        "realistic",
+        "photorealistic",
+        "photo-realistic",
+        "photograph",
+        "photographic",
+        "camera shot",
+        "shot on",
+        "dslr",
+        "35mm",
+        "50mm",
+        "prime lens",
+        "bokeh",
+        "film grain",
+        "natural light",
+        "写实",
+        "实拍",
+        "照片",
+        "摄影",
+        "真实感",
+        "手机拍",
+    )
+    _PHOTO_ANIME_STYLE_MARKERS = (
+        "anime",
+        "manga",
+        "cel-shaded",
+        "cel shading",
+        "cartoon",
+        "illustration",
+        "watercolor",
+        "二次元",
+        "动漫",
+        "插画",
+        "漫画",
+        "水彩",
+    )
+
+    @classmethod
+    def _photo_prompt_wants_photographic_style(cls, text: str, *, character_present: bool = True) -> bool:
+        """纯场景且文本要求写实/实拍时返回 True；人物画面永远返回 False（保持二次元人设）。"""
+
+        if character_present:
+            return False
+        positive = cls._photo_prompt_positive_part(text).lower()
+        if not positive:
+            return False
+        if any(marker in positive for marker in cls._PHOTO_ANIME_STYLE_MARKERS):
+            return False
+        return any(marker in positive for marker in cls._PHOTO_REALISTIC_STYLE_MARKERS)
+
     def _apply_photo_generation_prompt_format(
         self,
         prompt_text: str,
         *,
         prompt_format: str = "",
+        character_present: bool = True,
+        photographic: bool | None = None,
     ) -> str:
         prompt = str(prompt_text or "").strip()
         if not prompt:
             return ""
+        if photographic is None:
+            photographic = self._photo_prompt_wants_photographic_style(
+                prompt, character_present=character_present
+            )
         mode = (
             self._normalize_photo_generation_prompt_format(prompt_format)
             if prompt_format
@@ -11085,7 +11209,18 @@ Output:
         # A/B (2026-10-16, tail arm n=3): appending "mermaid tail replacing her legs, tail
         # fused with her legs or waist" did NOT reduce tail-attachment defects (47.0 vs
         # 49.33 total, tail complaints present in both arms) -> reverted, clip stays 250.
-        negative_extra = ", ".join((watermark_negative, chibi_negative, hands_negative))
+        if character_present:
+            negative_extra = ", ".join((watermark_negative, chibi_negative, hands_negative))
+        else:
+            # 画面里没有人时，chibi / 手指类负面词没有指代对象，反而把注意力拉回「人」，
+            # 只保留水印类负面词（2026-10-17 事故）。
+            # 2026-10-18 事故：纯食物场景（午饭饭菜）模型仍然自作主张塞了一个食客的背影/
+            # 镜子里的拍摄者，所以补一条「不要人」的负面词。
+            negative_extra = (
+                watermark_negative
+                + ", people, person, human figure, human hands, silhouette of a person, "
+                "visible photographer, crowd"
+            )
         if negative_extra not in negative:
             negative = (negative + ", " + negative_extra).strip(" ,")
         if mode == "natural_language":
@@ -11095,16 +11230,37 @@ Output:
             # identity contract / pose override in the middle were dropped. Assemble the
             # whole prompt inside the budget here so nothing important relies on clamping.
             negative_tail = self._photo_prompt_clip(negative, 250, preserve_tail=True) if negative else ""
-            tail = f" {identity_hint} {pose_hint} {hands_positive} {watermark_positive}"
+            if character_present:
+                tail = f" {identity_hint} {pose_hint} {hands_positive} {watermark_positive}"
+                head_prefix = f"Create a single coherent image showing {proportion_hint} "
+            elif photographic:
+                # 纯场景写实：照片质感放在尾部（尾部不会被 800 字预算裁掉），
+                # 头部用 "A realistic photo of …" 直接把模型拉出插画风格。
+                tail = (
+                    " Realistic photograph, natural light, true-to-life materials and texture, "
+                    f"fine surface detail, soft depth of field. {watermark_positive}"
+                )
+                head_prefix = "A realistic photo of "
+            else:
+                # 纯场景（杯子、食物、街景…）：不注入任何人物 / 身份 / 姿势句。
+                tail = f" {watermark_positive}"
+                head_prefix = "Create a single coherent image showing "
             tail += f" Avoid {negative_tail}." if negative_tail else "."
-            head_prefix = f"Create a single coherent image showing {proportion_hint} "
             head_budget = max(120, 790 - len(head_prefix) - len(tail))
             scene = self._photo_prompt_clip(positive, head_budget, preserve_tail=False)
             natural = f"{head_prefix}{scene}{tail}"
             if len(natural) > 800:
                 natural = self._photo_prompt_clip(natural, 800, preserve_tail=True)
             return natural
-        formatted = f"Positive prompt: {proportion_hint} {positive} {hands_positive} {watermark_positive}"
+        if character_present:
+            formatted = f"Positive prompt: {proportion_hint} {positive} {hands_positive} {watermark_positive}"
+        elif photographic:
+            formatted = (
+                f"Positive prompt: {positive} realistic photograph, natural light, "
+                f"true-to-life texture, fine detail, soft depth of field. {watermark_positive}"
+            )
+        else:
+            formatted = f"Positive prompt: {positive} {watermark_positive}"
         formatted += f" Negative prompt: {negative}." if negative else "."
         return self._photo_prompt_clip(formatted, 6000, preserve_tail=True)
 
@@ -12023,9 +12179,19 @@ Output:
                 "source": reference_intent.source,
             },
         )
+        character_present = bool(
+            bool(explicit_reference_paths)
+            or str(workflow_kind or "").strip().lower() in {"selfie", "portrait", "自拍", "人像"}
+            or self._photo_prompt_mentions_person(request_text)
+        )
+        photographic = self._photo_prompt_wants_photographic_style(
+            original_prompt_text, character_present=character_present
+        )
         base_prompt = self._apply_photo_generation_prompt_format(
             original_prompt_text,
             prompt_format=prompt_format,
+            character_present=character_present,
+            photographic=photographic,
         )
         current_user_request = wardrobe_intent.positive_text
         current_user_exclusions = wardrobe_intent.exclusion_text
@@ -12521,6 +12687,8 @@ Output:
             prompt_format=prompt_format,
             workflow_kind=workflow_kind,
             reference=reference_candidate or None,
+            character_present=character_present,
+            photographic=photographic,
         )
         prompt_text = resolved_context.final_prompt
         complete_prompt_text = resolved_context.complete_prompt

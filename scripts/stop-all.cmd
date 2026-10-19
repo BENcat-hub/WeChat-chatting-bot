@@ -1,10 +1,9 @@
 @echo off
 rem ============================================================
-rem  wechat-ai-stack ä¸€é”®åœæ­¢ï¼ˆåŒå‡»å³å¯ï¼‰
-rem  é»˜è®¤ä¸åŠ¨å¾®ä¿¡ã€ä¸åŠ¨ WeFlow çª—å£ï¼ˆé¿å…è¯¯æ€æ­£åœ¨ç”¨çš„èŠå¤©çª—å£ï¼‰ï¼›
-rem  è¦ä¸€èµ·åœï¼šstop-all.cmd -IncludeWeFlow -IncludeWeChat
+rem  wechat-ai-stack Ò»¼üÍ£Ö¹£¨Ë«»÷¼´¿É£©
+rem  Ä¬ÈÏ²»¶¯Î¢ĞÅ¡¢²»¶¯ WeFlow ´°¿Ú£¨±ÜÃâÎóÉ±ÕıÔÚÓÃµÄÁÄÌì´°¿Ú£©£»
+rem  ÒªÒ»ÆğÍ££ºstop-all.cmd -IncludeWeFlow -IncludeWeChat
 rem ============================================================
-chcp 65001 >nul
 setlocal
 set "HERE=%~dp0"
 set "PSEXE=powershell"
@@ -13,5 +12,5 @@ where pwsh >nul 2>nul && set "PSEXE=pwsh"
 "%PSEXE%" -NoProfile -ExecutionPolicy Bypass -File "%HERE%stop-all.ps1" %*
 
 echo.
-echo === åœæ­¢æµç¨‹ç»“æŸ ===
+echo === Í£Ö¹Á÷³Ì½áÊø ===
 pause

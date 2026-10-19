@@ -11972,6 +11972,22 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             return instruction
         return "consistent visual style, natural daily-life feeling"
 
+    def _photo_pure_scene_realistic(self) -> bool:
+        """纯场景（食物/物品/风景）是否强制走实拍质感。
+
+        2026-10-18：人设风格是「二次元」时，午饭饭菜这类「随手拍一张」被画成平涂插画，
+        用户反馈「质感明显不如真实照片」。纯场景没有人物，不需要维持二次元人设，
+        因此默认切到写实；人物画面（自拍、人物生活照）不受影响。
+        """
+
+        try:
+            value = runtime_persona_setting(self, "photo_pure_scene_realistic", True)
+        except Exception:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off", "否", "关"}
+        return bool(value)
+
     def _daily_outfit_visual_state_text(self, state: dict[str, Any]) -> str:
         fragments: list[str] = []
         energy = _safe_int((state or {}).get("energy"), 70, 0, 100)
@@ -14465,7 +14481,9 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                         "8. 不要默认生成全身镜/对镜自拍/手机挡脸自拍；只有话题、动机或当前日程明确出现“镜前/对镜/镜子/全身镜/mirror”时才允许。普通穿搭图用当前地点里的手持自拍、半身或四分之三身环境人像。\n"
                         "9. `use_persona_reference` 仅表示画面中是否出现 Bot 本人：自拍、人物生活照、人物穿搭图填 true；纯风景、食物、桌面物品、动物、手机屏幕或生日卡填 false。\n"
                         "10. 服装语义优先级为：本次明确服装需求优先；具体场景服装参考用于落实该需求；今日穿搭仅在没有新服装意图时作为连续性补充。不要同时写入彼此冲突的两套服装。\n"
-                        "11. 只有当前请求明确要求关系角色出现/合影，且选中了对应的角色参考图时，才可让该角色按参考图自然入镜；否则禁止凭文字补画另一人的脸、身体、背影、剪影、倒影或肖像。未明确要求时，关系卡只影响情境，并用非人物生活线索间接表达关系。"
+                        "11. 只有当前请求明确要求关系角色出现/合影，且选中了对应的角色参考图时，才可让该角色按参考图自然入镜；否则禁止凭文字补画另一人的脸、身体、背影、剪影、倒影或肖像。未明确要求时，关系卡只影响情境，并用非人物生活线索间接表达关系。\n"
+                        "12. `use_persona_reference` 为 false 时，`prompt` 里禁止出现 girl / her / she / woman / person / 少女 / 她 / 人物 等人物词，也禁止写「有人拍摄」「手持相机」「自拍杆」「视角里的人」这类会让人物入镜的镜头语言；食物、物品、风景一律用俯拍、特写、平铺桌面、桌面一角这类无人视角。\n"
+                        "13. 话题是饭菜、食物、饮品、外卖、甜品时，画面只画食物本身（餐桌、餐具、蒸汽、暖光都可以），不画人、不画手、不画背影；只有当用户明确说想看「你/我」出镜时，才允许出现人物。"
                     ),
                 ), label_style=PromptLabelStyle.FULLWIDTH_COLON),
             )
@@ -14484,8 +14502,6 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         persona = self._get_default_persona_prompt()
         state = self.data.get("daily_state", {})
         current_item = self._proactive_current_plan_item(self.data.get("daily_plan", {}))
-        style_name, style_instruction = self._get_photo_style_instruction()
-        style_prompt_en = self._photo_style_prompt_en(style_name, style_instruction)
         topic_hint = _single_line(user.get("planned_proactive_topic"), 60)
         motive_hint = _single_line(user.get("planned_proactive_motive"), 120)
         schedule_context = self._format_plan_item_for_prompt(current_item)
@@ -14517,6 +14533,19 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             )
             and not explicit_person_scene
         )
+
+        style_name, style_instruction = self._get_photo_style_instruction()
+        style_prompt_en = self._photo_style_prompt_en(style_name, style_instruction)
+        if explicit_pure_scene and style_name == "二次元" and self._photo_pure_scene_realistic():
+            # 2026-10-18：食物/风景/桌面物品这类「随手拍」用二次元插画出来是一层平涂，
+            # 用户要的是手机实拍质感；二次元风格只保留给有人物的画面（自拍、人物生活照）。
+            style_name = "真实"
+            style_instruction = "真实手机随手拍质感,自然光,食物与物品细节可信,不要插画或绘画感"
+            style_prompt_en = (
+                "realistic smartphone photo, natural window light, true-to-life food and "
+                "object texture, shallow depth of field, fine photographic detail, "
+                "not an illustration or a drawing"
+            )
 
         def scene_subject_flags(text: Any) -> tuple[bool, bool]:
             """Classify explicit person and pure-scene cues in scene text."""

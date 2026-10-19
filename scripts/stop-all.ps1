@@ -1,4 +1,4 @@
-# 停止链路：优先按 logs\pids.json 记录的 PID 关闭，再按端口兜底清理
+﻿# 停止链路：优先按 logs\pids.json 记录的 PID 关闭，再按端口兜底清理
 # 用法：  pwsh -File scripts\stop-all.ps1 [-IncludeWeFlow] [-IncludeWeChat]
 # 注意：  默认不动微信、不动 WeFlow 窗口（避免误杀你正在用的聊天窗口）
 
