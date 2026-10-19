@@ -75,8 +75,10 @@ foreach ($d in 'docs', 'deploy', 'patches\weflow', 'tests') {
 
 # ---------------------------------------------------------------- 1. 自研服务（scripts）
 Write-Step '复制 scripts\（自研 UIA 发送 / OCR / 即梦图片服务 / 启动与探测脚本）'
+# `_` 开头的是本机一次性诊断/探针脚本（_probe_*.py / _speedcfg*.py / _add_*），
+# 只服务于开发机排障，不进发布包。
 Copy-Tree -Source (Join-Path $StackRoot 'scripts') -Dest (Join-Path $Repo 'scripts') `
-    -ExcludeDirs '__pycache__' -ExcludeFiles '*.pyc', 'session-id-map.json'
+    -ExcludeDirs '__pycache__' -ExcludeFiles '*.pyc', 'session-id-map.json', '_*.py'
 
 # ---------------------------------------------------------------- 2. Akasha 桥接
 Write-Step '复制 akasha-bridge\（桥接主进程、面板、发送后端；去掉 venv/日志/队列图片/真实配置）'
@@ -249,6 +251,8 @@ $scrubMap = [ordered]@{
     # 1057020421 = 「文件传输助手」，是微信内置对象，不视为隐私，保留原样
     # 联系人 / 群昵称
     '用户B'     = '用户B'
+    # 2026-10-18 改名事故里出现过的备注名，与昵称同等视为隐私
+    '用户B别名'         = '用户B别名'
     '用户A'         = '用户A'
     '用户C'       = '用户C'
     '用户D' = '用户D'

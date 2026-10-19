@@ -1,4 +1,4 @@
-# 链路自检：把「微信 ←→ WeFlow ←→ bridge ←→ AstrBot →(发送) WeeMessenger」每一环的健康状况打出来
+﻿# 链路自检：把「微信 ←→ WeFlow ←→ bridge ←→ AstrBot →(发送) WeeMessenger」每一环的健康状况打出来
 # 用法：  pwsh -File scripts\preflight.ps1
 # 说明：  不修改任何东西，只读探测；没有装/没在跑的项目会显示 ✗，按 docs\SETUP.zh-CN.md 补齐即可。
 

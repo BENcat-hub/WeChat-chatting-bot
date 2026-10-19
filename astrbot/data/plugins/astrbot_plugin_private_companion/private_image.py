@@ -2164,6 +2164,18 @@ class PrivateImageMixin:
             _safe_float(self._private_image_setting("private_image_vision_wait_seconds", 30.0), 30.0, 0.0),
         )
 
+    def _private_image_reply_hold_seconds(self) -> float:
+        """用户发图后，本轮回复最多为「等识图」让出多久（0=不做二次等待）。"""
+        return max(
+            0.0,
+            _safe_float(
+                self._private_image_setting("private_image_reply_hold_seconds", 45.0),
+                45.0,
+                0.0,
+                300.0,
+            ),
+        )
+
     def _private_image_model_image_items(self, image_sources: list[str]) -> list[tuple[str, str]]:
         items, _source_count, _has_gif_frames = self._private_image_model_image_items_with_meta(image_sources)
         return items
@@ -6329,6 +6341,31 @@ class PrivateImageMixin:
                 logger.warning("私聊单图延迟处理时视觉转述仍未完成: user=%s timeout=%.1fs", user_id, timeout)
             except Exception as exc:
                 logger.warning("私聊单图延迟视觉转述失败: user=%s error=%s", user_id, _single_line(exc, 120))
+        if not vision_text and isinstance(vision_task, asyncio.Task) and not vision_task.done():
+            hold = self._private_image_reply_hold_seconds()
+            if hold > 0:
+                logger.info(
+                    "私聊单图识图未完成,按暂缓策略继续等待识图后再回复: user=%s hold=%.1fs",
+                    user_id,
+                    hold,
+                )
+                try:
+                    vision_text = _single_line(
+                        await asyncio.wait_for(asyncio.shield(vision_task), timeout=hold),
+                        image_limit,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "私聊单图暂缓等待识图超时,按无视觉摘要兜底回复: user=%s hold=%.1fs",
+                        user_id,
+                        hold,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "私聊单图暂缓等待识图失败: user=%s error=%s",
+                        user_id,
+                        _single_line(exc, 120),
+                    )
         ownership_line = self._private_image_ownership_line(vision_text)
         intent_line = self._private_image_intent_line(vision_text)
         reply_objective = self._private_image_reply_objective(ownership_line, vision_text=vision_text)

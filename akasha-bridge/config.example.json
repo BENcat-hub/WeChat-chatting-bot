@@ -46,7 +46,7 @@
   "_guard_note": "send_whitelist 为空 = 不限制回复对象（危险）。强烈建议只填允许回复的微信昵称/群名。send_dry_run=true 时只写日志不真发。",
   "send_whitelist": null,
   "send_blacklist": null,
-  "send_min_interval_contact": 2.0,
+  "send_min_interval_contact": 0.8,
   "send_min_interval_global": 1.0,
   "send_dry_run": false,
   "send_max_text_length": 2000

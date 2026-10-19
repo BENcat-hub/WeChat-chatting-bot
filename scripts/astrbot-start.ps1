@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     启动 wechat-ai-stack 的 AstrBot 4.28.2（OneBot v11 反向 WS + DeepSeek）。
 

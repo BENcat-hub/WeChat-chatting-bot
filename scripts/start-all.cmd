@@ -1,21 +1,20 @@
 @echo off
 rem ============================================================
-rem  wechat-ai-stack ä¸€é”®å¯åŠ¨ï¼ˆåŒå‡»è¿™ä¸ªæ–‡ä»¶å³å¯ï¼‰
+rem  wechat-ai-stack Ò»¼üÆô¶¯£¨Ë«»÷Õâ¸öÎÄ¼þ¼´¿É£©
 rem
-rem  ä¾æ¬¡æ‹‰èµ·ï¼š
-rem    1. å¾®ä¿¡ Weixin.exeï¼ˆå·²å¼€åˆ™è·³è¿‡ï¼›éœ€è¦äººå·¥æ‰«ç ç™»å½•ï¼‰
-rem    2. WeFlow 5.0.0ï¼ˆè¯»å¾®ä¿¡æ•°æ®åº“ + SSE æŽ¨é€ï¼Œç«¯å£ 5031ï¼‰
-rem       â€”â€” èµ° start-weflow50.cmdï¼ŒDLL å·²æ‰“ä¸¤å¤„è¡¥ä¸ï¼Œä¸è¦å¼€ 6.3.2
-rem    3. AstrBotï¼ˆAI å¤§è„‘ï¼šé¢æ¿ 6185 / OneBot åå‘ WS 11229ï¼‰
-rem    4. å³æ¢¦ç”Ÿå›¾æœ¬åœ°æœåŠ¡ï¼ˆç«å±±ç­¾å â†’ OpenAI å…¼å®¹ï¼Œç«¯å£ 8790ï¼‰
-rem    5. akasha-bridgeï¼ˆä¸­é—´æ¡¥æŽ¥ï¼Œé¢æ¿ 8766ï¼‰
+rem  ÒÀ´ÎÀ­Æð£º
+rem    1. Î¢ÐÅ Weixin.exe£¨ÒÑ¿ªÔòÌø¹ý£»ÐèÒªÈË¹¤É¨ÂëµÇÂ¼£©
+rem    2. WeFlow 5.0.0£¨¶ÁÎ¢ÐÅÊý¾Ý¿â + SSE ÍÆËÍ£¬¶Ë¿Ú 5031£©
+rem       ¡ª¡ª ×ß start-weflow50.cmd£¬DLL ÒÑ´òÁ½´¦²¹¶¡£¬²»Òª¿ª 6.3.2
+rem    3. AstrBot£¨AI ´óÄÔ£ºÃæ°å 6185 / OneBot ·´Ïò WS 11229£©
+rem    4. ¼´ÃÎÉúÍ¼±¾µØ·þÎñ£¨»ðÉ½Ç©Ãû ¡ú OpenAI ¼æÈÝ£¬¶Ë¿Ú 8790£©
+rem    5. akasha-bridge£¨ÖÐ¼äÇÅ½Ó£¬Ãæ°å 8766£©
 rem
-rem  å‚æ•°ï¼ˆå¯é€‰ï¼Œç›´æŽ¥è·Ÿåœ¨æœ¬è¡ŒåŽé¢ï¼Œä¾‹å¦‚ start-all.cmd -SkipWeChatï¼‰ï¼š
+rem  ²ÎÊý£¨¿ÉÑ¡£¬Ö±½Ó¸úÔÚ±¾ÐÐºóÃæ£¬ÀýÈç start-all.cmd -SkipWeChat£©£º
 rem    -SkipWeChat / -SkipWeFlow / -SkipAstrBot / -SkipBridge / -NoPreflight
-rem  åœæ­¢ï¼šåŒå‡» stop-all.cmd
-rem  å®Œæ•´è¯´æ˜Žï¼šåŒç›®å½• start-all.ps1 é¡¶éƒ¨æ³¨é‡Š
+rem  Í£Ö¹£ºË«»÷ stop-all.cmd
+rem  ÍêÕûËµÃ÷£ºÍ¬Ä¿Â¼ start-all.ps1 ¶¥²¿×¢ÊÍ
 rem ============================================================
-chcp 65001 >nul
 setlocal
 set "HERE=%~dp0"
 set "PSEXE=powershell"
@@ -24,5 +23,5 @@ where pwsh >nul 2>nul && set "PSEXE=pwsh"
 "%PSEXE%" -NoProfile -ExecutionPolicy Bypass -File "%HERE%start-all.ps1" %*
 
 echo.
-echo === å¯åŠ¨æµç¨‹ç»“æŸï¼ˆç«¯å£ä¸€è§ˆè§ä¸Šï¼‰===
+echo === Æô¶¯Á÷³Ì½áÊø£¨¶Ë¿ÚÒ»ÀÀ¼ûÉÏ£©===
 pause
