@@ -1999,6 +1999,9 @@ def _initialize_group_and_provider_config(self: Any, c: Any) -> None:
     elif self.group_high_intensity_merge_scope not in {"group", "same_user"}:
         self.group_high_intensity_merge_scope = "group"
     self.enable_group_interjection = self._cfg_bool(c, "enable_group_interjection", False)
+    # 插话触发概率（百分比）：命中一个插话口后先过这道闸，再交给模型判断要不要说话。
+    # 原先写死 0.8%-5.5%，用户要求提到 60%，于是做成可配置项，默认 60。
+    self.group_interject_probability = self._cfg_int(c, "group_interject_probability_percent", 60, 0, 100) / 100
     self.enable_group_repeat_follow = self._cfg_bool(c, "enable_group_repeat_follow", True)
     self.group_repeat_trigger_threshold = self._cfg_int(c, "group_repeat_trigger_threshold", 4, 3, 20)
     self.group_repeat_count_distinct_users_only = self._cfg_bool(c, "group_repeat_count_distinct_users_only", False)

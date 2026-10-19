@@ -356,6 +356,21 @@ def name_key(text):
     return _NAME_KEEP.sub("", (text or "")).lower()
 
 
+# Windows OCR 最常见的数字/字母认错（示例群聊 → 「杏园6巧08」就是这样来的）。只用于
+# 「整串折一折再比」这一步：两侧都折，所以像 Lisa 里的 l→1 不会单独造成误判；真正防错
+# 的是调用方要求「折完相等且全屏唯一」。
+_OCR_FOLD = str.maketrans({
+    "巧": "5", "弓": "5", "亏": "5", "巳": "6", "己": "6",
+    "〇": "0", "口": "0", "o": "0", "d": "0",
+    "b": "8", "日": "8", "z": "2", "了": "7", "刁": "7", "l": "1", "i": "1",
+})
+
+
+def ocr_fold(text):
+    """`name_key` plus the digit/letter shapes Windows OCR most often swaps."""
+    return name_key(text).translate(_OCR_FOLD)
+
+
 def _longest_common_run(a, b):
     """Length of the longest common substring of two normalized names."""
     if not a or not b:
@@ -606,6 +621,13 @@ def header_names_target(key, texts):
         return False
     if any(name_matches_any(k, lines) for k in keys):
         return True
+    # OCR 把数字读歪（6-508 → 6巧08）时，整串折一折再比；允许前缀命中，因为群标题后面
+    # 常跟着成员数「(7)」。这一关只在前一行已由侧边栏选中该目标时才可能通过。
+    fold_keys = {ocr_fold(k) for k in keys if ocr_fold(k)}
+    for text in lines + ([" ".join(lines)] if len(lines) > 1 else []):
+        folded = ocr_fold(text)
+        if folded and any(folded == fk or folded.startswith(fk) for fk in fold_keys):
+            return True
     scored = sorted((name_match_keys(keys, t)
                      for t in lines + ([" ".join(lines)] if len(lines) > 1 else [])),
                     reverse=True)
@@ -622,6 +644,11 @@ def find_row(client, cfg, rect, target):
     first-row offset has to be exact (they drift as the list scrolls, the window is
     resized or WeChat changes its layout); the box x is used too, so a resized window
     no longer pushes the click into the chat pane.
+
+    A long session list pushes chats below the fold, where no amount of OCR can see them
+    (`sidebar_shows` in the failure text then lists only the neighbours). When the first
+    screen has no match, the list is scrolled down and re-scanned a few times, then scrolled
+    back to the top so the next call starts from a known place.
     """
     left, top, right, bottom = rect
     region = clamp_region(
@@ -629,6 +656,41 @@ def find_row(client, cfg, rect, target):
          left + cfg["sidebar_capture_x2_offset"], bottom - cfg["sidebar_capture_bottom_margin"]],
         rect,
     )
+    pages = max(1, int(cfg.get("sidebar_scroll_pages", 4)))
+    wheel_times = max(1, int(cfg.get("sidebar_scroll_wheel_times", 5)))
+    wait_s = float(cfg.get("sidebar_scroll_wait_s", 0.5))
+    hover = [int(region[0] + 40), int((region[1] + region[3]) // 2)]
+    debug: dict = {}
+    for page in range(pages):
+        point, debug = _scan_sidebar(client, cfg, region, top, target)
+        if point:
+            if page:
+                debug["scrolled_pages"] = page
+            return point, debug
+        if page + 1 >= pages:
+            break
+        # 目标行在可视区之外：把鼠标移到侧边栏上，再滚一屏重新 OCR。
+        client.call("Move", {"loc": hover})
+        client.call("Scroll", {"loc": hover, "type": "vertical",
+                               "direction": "down", "wheel_times": wheel_times})
+        time.sleep(wait_s)
+    if pages > 1:
+        # 没找到也把列表滚回顶部，下一次探测不必从中间开始。
+        try:
+            client.call("Move", {"loc": hover})
+            for _ in range(pages - 1):
+                client.call("Scroll", {"loc": hover, "type": "vertical",
+                                       "direction": "up", "wheel_times": wheel_times})
+                time.sleep(0.15)
+        except Exception:
+            pass
+        client.call("Move", {"loc": hover})
+    debug["scrolled_pages"] = pages
+    return None, debug
+
+
+def _scan_sidebar(client, cfg, region, top, target):
+    """One OCR pass over the visible sidebar; ((x, y), debug) or (None, debug)."""
     png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp"))
     if not png:
         return None, {"error": "no image from Screenshot (%s)" % (_brief(err) or "region off screen?"),
@@ -660,11 +722,18 @@ def find_row(client, cfg, rect, target):
                                           / float(cfg["row_pitch_px"])),
                            "exact": text in exact_keys,
                            "partial": key in text or text in key,
+                           "fold": ocr_fold(line["text"]) == ocr_fold(target),
                            "score": round(name_match(target, line["text"]), 3)})
     exact = [c for c in candidates if c["exact"]]
     partial = [c for c in candidates if c["partial"]]
     pick = (exact or partial)
     fuzzy = False
+    folded = False
+    if not pick:
+        # OCR 把 508 读成「巧08」这类：整串折一折再比。必须全屏唯一，否则宁可继续找。
+        fold_hits = [c for c in candidates if c["fold"]]
+        if len(fold_hits) == 1:
+            pick, folded = fold_hits, True
     if not pick:
         # Emoji-laden or truncated names never satisfy exact/partial, so fall back to a
         # similarity match — but only when one row is clearly the best candidate, since a
@@ -676,13 +745,13 @@ def find_row(client, cfg, rect, target):
             if scored[0]["score"] - runner_up >= NAME_MATCH_UNIQUE_MARGIN:
                 pick, fuzzy = [scored[0]], True
     debug = {"png": png, "engine": res.get("engine"), "candidates": candidates[:40],
-             "key": key, "keys": [fit(k) for k in keys], "fuzzy": fuzzy}
+             "key": key, "keys": [fit(k) for k in keys], "fuzzy": fuzzy, "folded": folded}
     if not pick:
         return None, debug
     pick.sort(key=lambda c: (not c["exact"], c["y"]))
     best = pick[0]
     debug["picked"] = {"text": best["text"], "score": best.get("score"), "fuzzy": fuzzy,
-                       "alias": fit(best["text"]) != key}
+                       "folded": folded, "alias": fit(best["text"]) != key}
     # Click on the matched name box, not a fixed offset from the window edge: after a
     # resize (or a different display scale) a fixed x can land in the chat pane, and a
     # fixed y can land on the row above. Small biases keep the point off the box border.

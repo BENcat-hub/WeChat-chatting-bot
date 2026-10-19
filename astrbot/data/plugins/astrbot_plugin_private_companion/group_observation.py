@@ -4089,14 +4089,21 @@ class GroupObservationMixin:
         def adjusted_probability(value: float) -> float:
             return probability_getter(value) if callable(probability_getter) else value
 
+        # 2026-10-19（用户要求「插话概率调成 60%」）：原先这里每个插话口写死了 0.8%-5.5%，
+        # 折算下来一天几乎不可能开口。改成从配置读一个基础概率（group_interject_probability_percent，
+        # 默认 60），四种插话口共用；命中之后仍由模型判断是否真有价值开口。
+        configured = getattr(self, "group_interject_probability", None)
+        if configured is None:
+            configured = _persona_value(self, "group_interject_probability", 0.6)
+        base_probability = _safe_float(configured, 0.6, 0.0, 1.0)
         if re.search(r"(有没有人|谁懂|救命|怎么回事|咋办)", text):
-            return random.random() < adjusted_probability(0.055), "有开放式接话口"
+            return random.random() < adjusted_probability(base_probability), "有开放式接话口"
         if re.search(r"(笑死|绷不住|太离谱)", text):
-            return random.random() < adjusted_probability(0.018 if mood == "玩笑" else 0.008), "玩笑反应口"
+            return random.random() < adjusted_probability(base_probability), "玩笑反应口"
         if mood == "玩笑":
-            return random.random() < adjusted_probability(0.015), "玩笑气氛"
+            return random.random() < adjusted_probability(base_probability), "玩笑气氛"
         if mood == "求助":
-            return random.random() < adjusted_probability(0.035), "求助气氛"
+            return random.random() < adjusted_probability(base_probability), "求助气氛"
         return False, "没有自然插话口"
 
     def _group_repeat_signature(self, text: str) -> str:
