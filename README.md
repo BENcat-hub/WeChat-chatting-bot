@@ -139,21 +139,6 @@ curl.exe -X POST http://127.0.0.1:8766/send -H "Content-Type: application/json" 
 
 ---
 
-## 上传到 GitHub
-
-发布树本身就是可直接 `git init` 的仓库骨架：`.gitignore` 已就位，密钥（`config.json` / `cmd_config.json` /
-`secrets/*.txt`）与全部运行期数据（`plugin_data/`、日志、队列图片、数据库）都已在忽略列表里。
-
-```powershell
-cd wechat-ai-stack
-git init
-git add -A
-git commit -m "wechat-ai-stack: 微信 AI 伴侣系统（WeFlow + 补丁、akasha-bridge、AstrBot 六个自研插件）"
-git branch -M main
-git remote add origin https://github.com/<你的账号>/<仓库名>.git
-git push -u origin main
-```
-
 体积与上限：
 
 | 项 | 数值 |
