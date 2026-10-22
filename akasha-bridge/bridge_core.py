@@ -9,6 +9,7 @@
 """
 
 import json
+import html
 import logging
 import os
 import queue
@@ -17,6 +18,8 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime
+
+import pathlib
 
 import requests
 
@@ -90,6 +93,109 @@ def prefill_id_map() -> int:
 # ============ 桥接核心 ============
 
 
+def _is_voice_text(content: str) -> bool:
+    """判断消息正文是不是微信语音的占位文本。
+
+    实测 WeFlow 对 localType=34 返回的 content 是 "[语音消息]"（不是 "[语音]"），
+    不同版本/来源还可能给 "[语音]"、"[Voice]"、"[voice]"，统一在这里判定。
+    """
+    text = (content or "").strip()
+    if not text:
+        return False
+    if text in ("[语音]", "[语音消息]", "[Voice]", "[voice]", "[Voice Message]"):
+        return True
+    return text.startswith("[语音")
+
+
+# 转发「聊天记录」卡片的占位文本（WeFlow 推送 content 里就是这几个字）
+_RECORD_PLACEHOLDERS = ("[聊天记录]", "[聊天记录消息]", "[转发聊天记录]", "[聊天记录 ]")
+
+
+def _is_chat_record_type(local_type) -> bool:
+    """判断 WeFlow 的 localType 是不是「聊天记录」卡片。
+
+    实测这类 appmsg 卡片的 localType 是 81604378673（高 32 位为 19），
+    所以按位判断而不是只比 19。
+    """
+    try:
+        lt = int(local_type or 0)
+    except (TypeError, ValueError):
+        return False
+    if lt in (19, 81604378673):
+        return True
+    return (lt >> 32) == 19
+
+
+def _parse_chat_record_xml(xml: str) -> dict | None:
+    """把微信「聊天记录」卡片的 appmsg XML 解析成 {title, count, items}。
+
+    XML 里真正有用的是 <title> 与 <datalist> 下每一条 <dataitem> 的
+    <datadesc>（正文，图片/表情是 [图片] 之类占位）和 <sourcename>（说话人）。
+    parsedContent 字段实测是空串，所以只能自己解析。
+    """
+    text = xml or ""
+    if "<datalist" not in text and "<recordinfo" not in text:
+        return None
+    title_match = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>", text, re.S) or \
+        re.search(r"<title>(.*?)</title>", text, re.S)
+    title = (title_match.group(1).strip() if title_match else "").strip()
+    items = []
+    for block_match in re.finditer(r"<dataitem\b[^>]*>(.*?)</dataitem>", text, re.S):
+        block = block_match.group(1)
+        desc = re.search(r"<datadesc>(.*?)</datadesc>", block, re.S)
+        who = re.search(r"<sourcename>(.*?)</sourcename>", block, re.S)
+        if not desc:
+            continue
+        items.append((
+            (who.group(1).strip() if who else ""),
+            desc.group(1).strip(),
+        ))
+    if not title and not items:
+        return None
+    count_match = re.search(r'<datalist[^>]*count="(\d+)"', text)
+    try:
+        count = int(count_match.group(1)) if count_match else len(items)
+    except ValueError:
+        count = len(items)
+    return {"title": title, "count": count, "items": items}
+
+
+def _format_chat_record(record: dict, max_items: int = 25, max_chars: int = 1200) -> str:
+    """把解析结果压成给大模型看的可读文本。"""
+    title = (record.get("title") or "聊天记录").strip()
+    items = record.get("items") or []
+    count = record.get("count") or len(items)
+    lines = [f"[转发聊天记录]「{title}」共 {count} 条，前 {min(len(items), max_items)} 条："]
+    for who, desc in items[:max_items]:
+        desc = re.sub(r"\s+", " ", html.unescape(str(desc or ""))).strip()
+        if not desc:
+            continue
+        lines.append(f"{who or '某人'}：{desc}")
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "…"
+    return text
+
+
+# 菜单回执别名：插件 selection.py 认这些词（取消/翻页）
+_MENU_REPLY_ALIASES = {"取消", "取消选择", "上一页", "上页", "下一页", "下页"}
+
+
+def _is_menu_reply(text: str) -> bool:
+    """判断消息是不是“菜单回执”（纯序号或翻页/取消词）。
+
+    插件 astrbot_plugin_matsuko_cover 的菜单用
+    `re.fullmatch(r"[0-9]{1,6}", event.message_str)` 匹配整句，群消息若被加上
+    “某某在群里说：”前缀就永远匹配不上，导致回序号选不了歌。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if re.fullmatch(r"[0-9]{1,6}", t):
+        return True
+    return t in _MENU_REPLY_ALIASES
+
+
 class WeFlowBridge:
     """WeFlow ↔ AstrBot 桥接器（OneBot v11 版）。"""
 
@@ -115,10 +221,11 @@ class WeFlowBridge:
             return True
         if config.BOT_WXID and data.get("talkerId", "") == config.BOT_WXID:
             return True
-        if msg_type in (34,):  # 34=语音
-            return True
-        if content and "[语音]" in content:
-            return True
+        # 34=语音 / "[语音]" 不再丢弃：bridge 负责把语音导出成 wav、调 ASR 转成
+        # 文字后以纯文字推给 AstrBot。语音消息的 content 可能是 "[语音]" 也可能是空，
+        # 所以必须在空内容过滤之前放行。
+        if msg_type == 34 or _is_voice_text(content):
+            return False
         if not content or content.strip() == "":
             return True
         return False
@@ -156,6 +263,16 @@ class WeFlowBridge:
         group_name_raw = data.get("groupName", "")
         is_group = (data.get("sessionType", "") == "group") or bool(group_name_raw) or "@chatroom" in session_id_data
 
+        if content in _RECORD_PLACEHOLDERS or _is_chat_record_type(
+                data.get("type", 0) or data.get("msgType", 0)):
+            # 转发的「聊天记录」卡片：把 XML 里的条目解析成可读文本再往下走，
+            # 否则 AstrBot 只能看到字面量「[聊天记录]」。
+            resolved_record = self._resolve_chat_record(data)
+            if resolved_record:
+                data = dict(data)
+                data["content"] = resolved_record
+                content = resolved_record
+
         if content == "[图片]":
             # 图片消息（mention 模式下需 @ 才处理）
             if is_group and state.group_reply_mode == "mention" and not self._is_mentioned(data):
@@ -165,6 +282,16 @@ class WeFlowBridge:
                 return
             threading.Thread(target=self.process_image_message,
                            args=(data,), daemon=True).start()
+            return
+
+        _msg_type_raw = data.get("type", 0) or data.get("msgType", 0)
+        if _is_voice_text(content) or _msg_type_raw == 34:
+            # 群聊 mention 模式下语音里没有 @ 字样，无法判断是否在叫机器人，直接跳过。
+            if is_group and state.group_reply_mode == "mention":
+                log.info("⏭️ 群语音跳过（mention 模式无法检测 @）")
+                return
+            threading.Thread(target=self.process_voice_message,
+                             args=(data,), daemon=True).start()
             return
 
         if content in ("[动画表情]", "[表情]"):
@@ -324,7 +451,14 @@ class WeFlowBridge:
                         clean_text = clean_text.replace(at_pattern, "").strip()
 
                 formatted = clean_text
-                if sender_name:
+                # 指令直通：以唤醒前缀开头的消息（/svc 歌名）不能加"某某在群里说："前缀，
+                # 否则 AstrBot 的唤醒检查看到首字符不是 "/"，插件指令不会触发。
+                is_command = any(clean_text.startswith(p) for p in config.COMMAND_PREFIXES if p)
+                # 菜单回执直通：插件的“选择歌曲/选择音色”菜单只认整句序号（
+                # selection.py 用 re.fullmatch(r"[0-9]{1,6}") 匹配 message_str），
+                # 加了"某某在群里说："前缀就永远匹配不上，序号选歌会失效。
+                is_menu_reply = _is_menu_reply(clean_text)
+                if sender_name and not is_command and not is_menu_reply:
                     formatted = f'{sender_name}在群{entry.get("group_name", contact)}中说：{clean_text}'
 
             # 消息段：mention 模式带 at 机器人标记；文本里的 CQ 图片码会拆成图片段
@@ -369,6 +503,294 @@ class WeFlowBridge:
                 if entry["messages"]:
                     self._arm_flush_locked(sender_id, entry, 1.0)
 
+    def _fetch_wechat_voice(self, talker: str, attempts: int = 8,
+                            delay: float = 1.5, expect_id: str = "") -> str | None:
+        """从 WeFlow 导出最新一条语音为 wav 并落盘。
+
+        WeFlow 的 /api/v1/messages 支持 voice=true，会把 localType=34 语音从
+        silk 转成 wav 暴露成 mediaUrl（mediaType=voice）。微信客户端把语音写进
+        数据库到 WeFlow 能导出之间有延迟，所以带重试。
+        """
+        try:
+            chosen = None
+            for attempt in range(1, attempts + 1):
+                url = f"{config.WE_FLOW_BASE_URL}/api/v1/messages"
+                params = {
+                    "access_token": config.ACCESS_TOKEN,
+                    "talker": talker,
+                    "media": "true",
+                    "voice": "true",
+                    "limit": 6,
+                }
+                resp = requests.get(url, params=params, timeout=15)
+                if resp.status_code != 200:
+                    log.error(f"WeFlow 语音API: HTTP {resp.status_code}")
+                    return None
+                payload = resp.json()
+                messages = payload.get("messages") if isinstance(payload, dict) else payload
+                voices = [m for m in (messages or [])
+                          if m.get("localType") == 34 and m.get("mediaUrl")]
+                # 优先按 SSE 带来的 serverId/rawid 精确定位这条语音；
+                # 精确定位不到时只接受「刚发来」的语音，避免把历史语音误转写。
+                now = time.time()
+                fresh = [m for m in voices
+                         if int(m.get("createTime") or 0) >= now - 180]
+                if expect_id:
+                    def _same_id(a, b):
+                        a = re.sub(r"\D", "", str(a or ""))
+                        b = re.sub(r"\D", "", str(b or ""))
+                        if not a or not b:
+                            return False
+                        if a == b:
+                            return True
+                        return len(a) >= 10 and len(b) >= 10 and (a.endswith(b) or b.endswith(a))
+                    exact = [m for m in voices
+                             if _same_id(m.get("serverId", ""), expect_id)
+                             or _same_id(m.get("localId", ""), expect_id)]
+                    voices = exact or fresh
+                else:
+                    voices = fresh
+                incoming = [m for m in voices if not m.get("isSend")]
+                chosen = (incoming or voices or [None])[0]
+                if chosen and chosen.get("isSend"):
+                    log.info(f"⏭️ 最新一条语音是自己发出的（isSend=1），跳过 (talker={talker})")
+                    return None
+                if chosen:
+                    break
+                if attempt < attempts:
+                    log.info(f"⏳ 语音还没导出（第 {attempt}/{attempts} 次），等待重试")
+                    time.sleep(delay)
+
+            if not chosen:
+                log.warning(f"消息列表没有可导出的语音 mediaUrl (talker={talker})")
+                return None
+
+            media_url = chosen["mediaUrl"]
+            sep = "&" if "?" in media_url else "?"
+            dl_url = f"{media_url}{sep}access_token={config.ACCESS_TOKEN}"
+            voice_resp = requests.get(dl_url, timeout=60)
+            if voice_resp.status_code != 200:
+                log.error(f"下载语音失败: HTTP {voice_resp.status_code} ({media_url})")
+                return None
+            if len(voice_resp.content) < 1024:
+                log.error(f"语音文件太小，疑似导出失败: {len(voice_resp.content)} 字节")
+                return None
+
+            save_dir = os.path.join(config.ASTRBOT_ATTACHMENTS, "wechat_voices")
+            os.makedirs(save_dir, exist_ok=True)
+            filename = f"voice_{chosen.get('localId')}_{int(time.time())}.wav"
+            save_path = os.path.join(save_dir, filename)
+            with open(save_path, "wb") as f:
+                f.write(voice_resp.content)
+            log.info(f"🎤 微信语音已导出: {save_path} "
+                     f"({len(voice_resp.content) // 1024}KB, localId={chosen.get('localId')})")
+            return save_path
+        except Exception as e:
+            log.error(f"获取微信语音异常: {e}")
+            return None
+
+    def _transcribe_voice(self, wav_path: str) -> str | None:
+        """调用 MiMo ASR 把语音 wav 转成文字。
+
+        该网关的 ASR 接口只接受纯 audio：带任何 text part 都会返回
+        {"code":400,"param":"ASR request must not include text parts"}，
+        所以请求体里只有一个 user + input_audio，没有 system/text。
+        """
+        if not config.ASR_ENABLED:
+            log.warning("ASR 未启用（asr_enabled=false），忽略语音")
+            return None
+        if not config.ASR_API_KEY:
+            log.warning("ASR 未配置 api_key，无法转写语音")
+            return None
+        try:
+            import base64
+            import mimetypes
+            with open(wav_path, "rb") as f:
+                raw = f.read()
+            if len(raw) < 1024:
+                return None
+            b64 = base64.b64encode(raw).decode("ascii")
+            mime = mimetypes.guess_type(wav_path)[0] or "audio/wav"
+            payload = {
+                "model": config.ASR_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": f"data:{mime};base64,{b64}",
+                            "format": "wav",
+                        },
+                    }],
+                }],
+                "max_completion_tokens": 1024,
+            }
+            url = config.ASR_API_BASE.rstrip("/") + "/chat/completions"
+            t0 = time.time()
+            resp = requests.post(
+                url, json=payload, timeout=config.ASR_TIMEOUT,
+                headers={"Authorization": f"Bearer {config.ASR_API_KEY}"},
+            )
+            if resp.status_code != 200:
+                log.error(f"ASR 转写失败: HTTP {resp.status_code} {resp.text[:200]}")
+                return None
+            data = resp.json()
+            choices = data.get("choices") or [{}]
+            text = (choices[0].get("message", {}) or {}).get("content") or ""
+            text = text.strip()
+            log.info(f"📝 语音转写({time.time() - t0:.1f}s): {text!r}")
+            return text or None
+        except Exception as e:
+            log.error(f"ASR 转写异常: {e}")
+            return None
+
+    def _notify_asr_failure(self, source_name: str, group_name: str = "") -> None:
+        """语音没听清时给用户一句提示，避免「发了语音但完全没反应」。"""
+        msg = getattr(config, "ASR_FAIL_REPLY", "") or ""
+        if not msg:
+            return
+        try:
+            inst = getattr(state, "sender_instance", None)
+            target = group_name or source_name
+            if inst is None or not target:
+                return
+            inst.send_text(target, msg)
+            log.info(f"💬 已提示语音未识别: {target}")
+        except Exception as e:
+            log.warning(f"发送语音失败提示出错: {e}")
+
+    def process_voice_message(self, data):
+        """收到语音：导出 wav → bridge 侧 ASR 转文字 → 以纯文字推给 AstrBot。"""
+        session_id = data.get("sessionId", "") or ""
+        source_name = data.get("sourceName", "") or "未知"
+        group_name = data.get("groupName", "")
+        rawid = data.get("rawid", "") or data.get("serverId", "")
+        is_group = bool(group_name) or "@chatroom" in session_id
+
+        log.info(f"🎤 收到语音: {source_name}" +
+                 (f" (群:{group_name})" if group_name else ""))
+
+        # 自己发出去的语音（比如 TTS 语音回复）回流时不能当作用户说话，否则会自问自答
+        if data.get("isSend") or data.get("isSelf") or data.get("fromSelf"):
+            log.info(f"⏭️ 自己发出的语音跳过 [{source_name}]")
+            return
+
+        # 同一条语音可能被 SSE/轮询重复推送，60 秒内同一 localId/serverId 只处理一次
+        dedupe_seed = str(rawid or data.get("localId") or "")
+        if dedupe_seed:
+            dedupe_key = f"{session_id}:{dedupe_seed}"
+            now_ts = time.time()
+            recent = getattr(self, "_recent_voice_keys", None)
+            if recent is None:
+                recent = self._recent_voice_keys = {}
+            for stale in [k for k, ts in recent.items() if now_ts - ts > 120]:
+                recent.pop(stale, None)
+            if now_ts - recent.get(dedupe_key, 0.0) < 60:
+                log.info(f"↩️ 重复语音事件已跳过 [{source_name}] key={dedupe_key}")
+                return
+            recent[dedupe_key] = now_ts
+
+        # 调试入口 /test_voice 会设置 _voice_override，跳过 WeFlow 导出直接用本地 wav
+        path = getattr(self, "_voice_override", None) or self._fetch_wechat_voice(
+            session_id, expect_id=str(rawid or ""))
+        if not path:
+            return
+
+        transcript = self._transcribe_voice(path)
+        if not transcript:
+            log.warning("⚠️ 语音转写为空/失败，本条不推送（record 段会触发 AstrBot STT 400）")
+            self._notify_asr_failure(source_name, group_name)
+            return
+        text = (config.ASR_TEXT_PREFIX or "") + transcript
+
+        # 同一句话 30 秒内只推一次，防止语音自我回流造成连环回复
+        recent_texts = getattr(self, "_recent_voice_texts", None)
+        if recent_texts is None:
+            recent_texts = self._recent_voice_texts = {}
+        now_v = time.time()
+        for stale in [k for k, ts in recent_texts.items() if now_v - ts > 120]:
+            recent_texts.pop(stale, None)
+        if now_v - recent_texts.get(text, 0.0) < 30:
+            log.info(f"↩️ 重复语音内容已跳过 [{source_name}]: {text[:30]!r}")
+            return
+        recent_texts[text] = now_v
+
+        segments = [{"type": "text", "data": {"text": text}}]
+        mid = onebot_message_id(rawid)
+
+        if is_group:
+            sender_name = data.get("senderName", "") or source_name
+            user_id = state._wxid_to_int(f"{session_id}_{sender_name}")
+            group_id = state._group_id_int(session_id)
+            base_name = re.sub(r'\s*\(\d+\)\s*$', '', group_name or source_name).strip()
+            event = make_message_event("group", user_id, segments,
+                                       group_id=group_id, group_name=base_name,
+                                       nickname=sender_name, message_id=mid)
+            state.remember_ob_contact(group_id, base_name)
+        else:
+            user_id = state._wxid_to_int(session_id)
+            event = make_message_event("private", user_id, segments,
+                                       nickname=source_name, message_id=mid)
+            state.remember_ob_contact(user_id, source_name)
+
+        if push_event(event):
+            log.info(f"✅ 语音转写文字已推送至 AstrBot [{source_name}]: {text[:40]!r}")
+        else:
+            log.warning(f"⚠️ AstrBot 离线，语音事件已入缓存队列 [{source_name}]")
+
+    def push_test_text(self, session_id: str, text: str,
+                       nickname: str = "", group_name: str = "") -> bool:
+        """调试/自检用：把一条文字当作用户消息推给 AstrBot。
+
+        走的是 bridge 现有的同一条 WebSocket，因此 AstrBot 的回复也仍然从
+        bridge 出站，不会出现「第二个 OneBot 客户端抢回包」的问题。
+        """
+        segments = [{"type": "text", "data": {"text": text}}]
+        is_group = bool(group_name) or "@chatroom" in session_id
+        mid = onebot_message_id("")
+        if is_group:
+            user_id = state._wxid_to_int(f"{session_id}_{nickname or session_id}")
+            group_id = state._group_id_int(session_id)
+            event = make_message_event("group", user_id, segments,
+                                       group_id=group_id, group_name=group_name,
+                                       nickname=nickname or session_id, message_id=mid)
+            state.remember_ob_contact(group_id, group_name)
+        else:
+            user_id = state._wxid_to_int(session_id)
+            event = make_message_event("private", user_id, segments,
+                                       nickname=nickname or session_id, message_id=mid)
+            state.remember_ob_contact(user_id, nickname or session_id)
+        log.info(f"🧪 注入测试消息 → {nickname or session_id}: {text!r}")
+        return bool(push_event(event))
+
+    def handle_push_payload(self, data: dict) -> bool:
+        """处理一条 WeFlow 推送（SSE 与自检入口共用同一条入口）。
+
+        真实推送只带 event/sessionId/sessionType/rawid/avatarUrl/sourceName/
+        content/timestamp，没有 localType、isSend、mediaUrl —— 所以语音的
+        媒体要回查 /api/v1/messages 才能拿到（见 _fetch_wechat_voice）。
+        """
+        msg_time = data.get("timestamp", 0)
+        if msg_time and msg_time < self.start_timestamp:
+            return False
+        raw_id = data.get("rawid", "")
+        if raw_id and raw_id in self.processed_ids:
+            return False
+        if raw_id:
+            self.processed_ids.add(raw_id)
+        if self.should_ignore(data):
+            return False
+        content = data.get("content", "") or ""
+        if data.get("sessionType", "") == "group" or "@chatroom" in data.get("sessionId", ""):
+            log.info(f"📩 群消息 [{data.get('sourceName','')}]: {content[:60]}")
+            if state.group_reply_mode == "mention":
+                mentioned = any(f"@{n}" in content for n in config.BOT_NICKNAMES)
+                log.info(f"   @={mentioned}")
+        else:
+            log.info(f"📩 收到: {data.get('sourceName','')} → {content[:50]}")
+        self.add_to_buffer(data)
+        return True
+
     def listen_sse(self):
         """连接 WeFlow SSE 推送。"""
         sse_url = f"{config.WE_FLOW_BASE_URL}/api/v1/push/messages?access_token={config.ACCESS_TOKEN}"
@@ -395,25 +817,9 @@ class WeFlowBridge:
                         continue
                     try:
                         data = json.loads(data_str)
-                        msg_time = data.get("timestamp", 0)
-                        if msg_time < self.start_timestamp:
-                            continue
-                        raw_id = data.get("rawid", "")
-                        if raw_id in self.processed_ids:
-                            continue
-                        self.processed_ids.add(raw_id)
-                        if not self.should_ignore(data):
-                            if data.get("sessionType", "") == "group" or "@chatroom" in data.get("sessionId", ""):
-                                content = data.get("content", "")
-                                log.info(f"📩 群消息 [{data.get('sourceName','')}]: {content[:60]}")
-                                if state.group_reply_mode == "mention":
-                                    mentioned = any(f"@{n}" in content for n in config.BOT_NICKNAMES)
-                                    log.info(f"   @={mentioned}")
-                            else:
-                                log.info(f"📩 收到: {data.get('sourceName','')} → {data.get('content','')[:50]}")
-                            self.add_to_buffer(data)
                     except json.JSONDecodeError:
-                        pass
+                        continue
+                    self.handle_push_payload(data)
 
         except requests.exceptions.ConnectionError:
             log.error("无法连接 WeFlow")
@@ -465,6 +871,48 @@ class WeFlowBridge:
         data = resp.json()
         messages = data if isinstance(data, list) else data.get("messages", data.get("data", []))
         return messages if isinstance(messages, list) else []
+
+    def _resolve_chat_record(self, data: dict) -> str | None:
+        """把「[聊天记录]」占位换成可读文本。
+
+        WeFlow 的消息推送只带 content="[聊天记录]"，真正的条目在
+        /api/v1/messages 返回的 content/rawContent 里的 appmsg XML 中
+        （<datalist> 下每条 <dataitem> 的 datadesc/sourcename）。
+        这里回查该会话最近消息，取最新一条聊天记录卡片解析。
+        """
+        talker = (data.get("sessionId") or data.get("groupName")
+                  or data.get("sourceName") or "").strip()
+        if not talker:
+            return None
+        try:
+            messages = self._query_messages_with_media(talker, limit=40)
+        except Exception as exc:
+            log.warning(f"📜 聊天记录回查失败: {exc}")
+            return None
+        cards = [m for m in messages if _is_chat_record_type(m.get("localType"))]
+        if not cards:
+            log.info(f"📜 未找到聊天记录卡片（talker={talker}，最近 {len(messages)} 条）")
+            return None
+
+        def _sort_key(msg):
+            try:
+                return int(msg.get("localId") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        cards.sort(key=_sort_key)
+        for card in reversed(cards[-3:]):
+            # media=true 时 content 只有占位文本「[聊天记录]」，XML 在 rawContent 里
+            xml = card.get("rawContent") or ""
+            if "<dataitem" not in xml:
+                xml = card.get("content") or ""
+            record = _parse_chat_record_xml(xml)
+            if not record:
+                continue
+            formatted = _format_chat_record(record)
+            log.info(f"📜 聊天记录已解析：{formatted.splitlines()[0][:60]}")
+            return formatted
+        return None
 
     @staticmethod
     def _pick_media_message(messages: list) -> dict | None:

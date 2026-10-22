@@ -500,6 +500,18 @@ class MemorySummarizer:
             )[:6]
             evidence_rows = [row_by_id[ref] for ref in refs]
             if not refs or not self.fact_supported_by_rows(fact, evidence_rows):
+                # 2026-10-22：群聊总结一直被判「未通过证据门禁」的根因——
+                # 模型经常写 key_facts 时把 refs 写成消息号/自己编的 id，
+                # 一个都落不到 timeline 的 tl_xxx 上，于是整批事实被丢弃，
+                # summary_quality=low → 同一批次无限重试（retry_count=20）。
+                # 这里做一次「按原文回捞」：用事实文本去原始时间线里找直接支持它的
+                # 那一行，把真实 id 补进 refs。事实仍然必须有原文依据，只是不再
+                # 强依赖模型自己写对的 id。
+                auto_refs = self._auto_refs_for_fact(fact, rows)
+                if auto_refs:
+                    refs = auto_refs
+                    evidence_rows = [row_by_id[ref] for ref in refs]
+            if not refs or not self.fact_supported_by_rows(fact, evidence_rows):
                 continue
             fact_key = fact.casefold()
             if fact_key not in seen_facts:
@@ -509,6 +521,23 @@ class MemorySummarizer:
             if len(facts) >= 8:
                 break
         return facts[:8], traced[:8]
+
+    def _auto_refs_for_fact(self, fact: Any, rows: list[dict[str, Any]]) -> list[str]:
+        """Find the timeline rows that directly support this fact."""
+        found: list[str] = []
+        for row in rows:
+            rid = clean_text(row.get("id"), 160)
+            if not rid:
+                continue
+            try:
+                if self.fact_supported_by_rows(fact, [row]):
+                    if rid not in found:
+                        found.append(rid)
+            except Exception:                     # noqa: BLE001
+                continue
+            if len(found) >= 2:
+                break
+        return found
 
     @staticmethod
     def fact_supported_by_rows(fact: Any, rows: list[dict[str, Any]]) -> bool:

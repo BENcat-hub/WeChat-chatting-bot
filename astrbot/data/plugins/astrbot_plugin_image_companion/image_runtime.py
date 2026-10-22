@@ -11062,6 +11062,45 @@ Output:
             return True
         return any(token in value for token in cls._PHOTO_PERSON_CJK)
 
+    _PERSONA_CLAUSE_PATTERNS = (
+        r"\bPetite slender teen girl, small head, about \d+ heads tall, long legs\.?\s*",
+        r"\bPose override: framing - [^.]*\.\s*Pose override: pose - [^.]*\.\s*",
+        r"\bKeep the reference face, hair colour and whale-fin ears;[^.]*\.\s*",
+        r"\bHands with five clear fingers\.?\s*",
+    )
+
+    @classmethod
+    def _strip_persona_for_pure_scene(cls, prompt: str) -> str:
+        """纯场景请求去掉人设句（比例/身份/姿势/手部），避免猫狗被画成人。
+
+        判据顺序很重要：先把人设句本身剥掉，再看剩下的请求里还有没有「人」。
+        否则「Petite slender teen girl…」自己的人设词会把纯场景判成有人物，
+        于是剥离永远不生效（2026-10-22 小猫被画成人腿的根因）。
+        """
+        text = str(prompt or "")
+        if not text:
+            return text
+        stripped = text
+        for pattern in cls._PERSONA_CLAUSE_PATTERNS:
+            stripped = re.sub(pattern, "", stripped, flags=re.I)
+        stripped = re.sub(r"[ \t]{2,}", " ", stripped)
+        # 剥掉句首人设后常留下一个孤零零的逗号（行首 ", orange tabby cat…"），清掉。
+        stripped = re.sub(r"(?m)^[ \t]*,[ \t]*", "", stripped)
+        stripped = re.sub(r",\s*,", ",", stripped)
+        # 人设句被剥掉之后，若请求里真的还有人物描述，就原样保留（自拍/人像场景）。
+        subject = stripped
+        marker = "[User image request]"
+        if marker in stripped:
+            tail = stripped.partition(marker)[2]
+            subject = re.split(
+                r"\n\s*\[(?:Reference and wardrobe ruling|Scene, style and final preset|Composition and continuity|Negative prompt)\]",
+                tail,
+                maxsplit=1,
+            )[0]
+        if cls._photo_prompt_mentions_person(subject):
+            return text
+        return stripped.strip()
+
     # 2026-10-18：纯场景（午饭饭菜、桌面小物）默认是「随手拍一张」，
     # 却因为人设风格是「二次元」被画成平涂插画，质感远不如真实照片。
     # 这里识别「要写实/实拍」的措辞，让纯场景切到照片质感；人物画面仍然保持二次元人设。
@@ -11130,6 +11169,15 @@ Output:
             photographic = self._photo_prompt_wants_photographic_style(
                 prompt, character_present=character_present
             )
+        try:
+            import traceback as _tb
+            _frames = [f"{fr.filename.split(chr(92))[-1]}:{fr.lineno}:{fr.function}" for fr in _tb.extract_stack()[-6:-1]]
+            with open(r"C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack\logs\fmt_probe.log", "a", encoding="utf-8") as _f:
+                _f.write("%s mode=%s cp=%s photo=%s head=%r stack=%s\n" % (
+                    time.strftime("%H:%M:%S"), prompt_format, character_present, photographic,
+                    prompt[:90], " <- ".join(_frames)))
+        except Exception:
+            pass
         mode = (
             self._normalize_photo_generation_prompt_format(prompt_format)
             if prompt_format
@@ -12179,11 +12227,41 @@ Output:
                 "source": reference_intent.source,
             },
         )
-        character_present = bool(
-            bool(explicit_reference_paths)
-            or str(workflow_kind or "").strip().lower() in {"selfie", "portrait", "自拍", "人像"}
-            or self._photo_prompt_mentions_person(request_text)
-        )
+        _cp_ref = bool(explicit_reference_paths)
+        _cp_kind = str(workflow_kind or "").strip().lower() in {"selfie", "portrait", "自拍", "人像"}
+        _cp_person = bool(self._photo_prompt_mentions_person(request_text))
+        character_present = bool(_cp_ref or _cp_kind or _cp_person)
+        try:
+            # 2026-10-22 诊断：小猫图被注入人设比例句 = character_present 误判。
+            # 这里把三个判据和正向片段都记进 trace，定位是哪一项命中。
+            self._append_photo_generation_trace_event(
+                trace_id,
+                "character_presence_decided",
+                data={
+                    "character_present": character_present,
+                    "by_reference": _cp_ref,
+                    "by_workflow_kind": _cp_kind,
+                    "by_person_words": _cp_person,
+                    "workflow_kind": str(workflow_kind or ""),
+                    "request_head": str(request_text or "")[:120],
+                    "positive_part": self._photo_prompt_positive_part(str(request_text or ""))[:160],
+                },
+            )
+        except Exception:
+            pass
+        try:
+            with open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))))), "logs",
+                    "character_present_probe.log"), "a", encoding="utf-8") as _cpf:
+                _cpf.write(
+                    "%s present=%s ref=%s kind=%s(%s) person_words=%s positive=%r\n" % (
+                        time.strftime("%H:%M:%S"), character_present, _cp_ref, _cp_kind,
+                        str(workflow_kind or ""), _cp_person,
+                        self._photo_prompt_positive_part(str(request_text or ""))[:160],
+                    )
+                )
+        except Exception:
+            pass
         photographic = self._photo_prompt_wants_photographic_style(
             original_prompt_text, character_present=character_present
         )
@@ -19219,6 +19297,12 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         reference_image_paths: Any = (),
         image_size: str = "",
     ) -> _ExternalPhotoGenerationOutcome:
+        # 2026-10-22：纯场景请求（小猫/饭菜/风景…）被上游拼进了人设句
+        # 「Petite slender teen girl, small head, about 7 heads tall, long legs.」
+        # 和 `Keep the reference face…`/`Hands with five clear fingers.`，
+        # 模型于是给小猫画出人类头发和人类双腿。这里在真正调 API 之前再兜一层：
+        # 用户请求段落里没有任何「人」→ 把这些人设句剥掉。
+        prompt_text = self._strip_persona_for_pure_scene(str(prompt_text or ""))
         lock = getattr(self, "_external_image_api_runtime_lock", None)
         if lock is None:
             lock = asyncio.Lock()
@@ -19957,6 +20041,12 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         image_size: str = "",
     ) -> tuple[str, str]:
         platform = self._resolved_external_image_api_platform()
+        prompt_text = self._strip_persona_for_pure_scene(str(prompt_text or ""))
+        try:
+            with open(r"C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack\logs\strip_probe.log", "a", encoding="utf-8") as _sf:
+                _sf.write("%s head=%r\n" % (time.strftime("%H:%M:%S"), prompt_text[:150]))
+        except Exception:
+            pass
         endpoint = self._external_image_endpoint()
         if platform == "bailian":
             endpoint = self._bailian_multimodal_endpoint() or self._bailian_api_root()

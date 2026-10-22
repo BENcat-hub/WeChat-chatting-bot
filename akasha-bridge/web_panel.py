@@ -9,12 +9,17 @@ Web 控制面板模块。
 import json
 import logging
 import os
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import state
 import config
 
 log = logging.getLogger("ob11-bridge")
+
+# 语音发送（TTS→SVC→微信录音）同一时刻只允许一个任务
+_VOICE_LOCK = threading.Lock()
+from ui_lock import UI_LOCK  # 与文字/图片发送共用的桌面输入锁
 
 
 PAGE = """<!DOCTYPE html>
@@ -498,7 +503,7 @@ class WebHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 log.error(f"[Web] 保存配置失败: {e}")
             self.send_json({"ok": True, "group_reply_mode": new_mode})
-        elif self.path in ("/send", "/send_image", "/send_sticker"):
+        elif self.path in ("/send", "/send_image", "/send_sticker", "/send_file"):
             # 主动发送接口：所有出站都会经过 sender 的白名单 / 黑名单 / 限频 / dry_run 护栏
             try:
                 inst = getattr(state, "sender_instance", None)
@@ -523,6 +528,16 @@ class WebHandler(BaseHTTPRequestHandler):
                         return
                     ok = bool(inst.send_image(target, path))
                     log.info("[Web] 主动发送(图片) → %s | %s | ok=%s", target, path, ok)
+                elif self.path == "/send_file":
+                    path = payload.get("path") or payload.get("file_path") or ""
+                    if not path or not os.path.exists(path):
+                        self.send_json({"ok": False, "error": f"文件路径不存在: {path}"}, 400)
+                        return
+                    if not hasattr(inst, "send_file"):
+                        self.send_json({"ok": False, "error": "当前发送后端不支持文件"}, 400)
+                        return
+                    ok = bool(inst.send_file(target, path))
+                    log.info("[Web] 主动发送(文件) → %s | %s | ok=%s", target, path, ok)
                 else:
                     path = payload.get("path") or payload.get("sticker_path") or ""
                     if not path or not os.path.exists(path):
@@ -537,6 +552,201 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": ok, "target": target, "dry_run": getattr(config, "SEND_DRY_RUN", None)})
             except Exception as e:
                 log.error("[Web] 主动发送异常: %s", e)
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif self.path == "/send_voice":
+            # 文本 → MiMo TTS → so-vits-svc 音色 → 微信「语音消息气泡」
+            # （CABLE Output 当麦克风 → 微信录音条 → 回读 localType=34 校验送达）
+            try:
+                import subprocess
+                if not _VOICE_LOCK.acquire(blocking=False):
+                    self.send_json({"ok": False, "error": "已有语音任务在跑"}, 429)
+                    return
+                # 语音链路独占桌面输入：文字/图片链路拿着 UI_LOCK 时排队等它。
+                if not UI_LOCK.acquire(timeout=float(config.VOICE_BUBBLE_TIMEOUT)):
+                    _VOICE_LOCK.release()
+                    self.send_json({"ok": False, "error": "desktop input busy"}, 429)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                    target = (payload.get("target") or "").strip()
+                    text = payload.get("text") or ""
+                    wav = payload.get("wav") or ""
+                    model = payload.get("model") or "知更鸟"
+                    # engine: svc = MiMo TTS + so-vits-svc 模型；bv2 = 知更鸟 Bert-VITS2（网上公开权重）
+                    engine = (payload.get("engine") or "").strip().lower()
+                    if not engine:
+                        if model in ("纳西妲", "胡桃", "神里绫华", "可莉", "心海", "宵宫"):
+                            engine = "gl"
+                        elif text and model in ("知更鸟", "robin", "Robin"):
+                            engine = "bv2"
+                        else:
+                            engine = "svc"
+                    if engine not in ("svc", "bv2", "gl"):
+                        self.send_json({"ok": False, "error": f"未知 engine: {engine}"}, 400)
+                        return
+                    transpose = int(payload.get("transpose") or 0)
+                    if not target or (not text and not wav):
+                        self.send_json({"ok": False, "error": "需要 target 以及 text 或 wav"}, 400)
+                        return
+                    stack = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    py = os.path.join(stack, "rvc-backend", ".venv", "Scripts", "python.exe")
+                    script = os.path.join(stack, "scripts", "voice_send.py")
+                    cmd = [py, "-X", "utf8", script, "--target", target, "--model", model,
+                           "--engine", engine, "--transpose", str(transpose)]
+                    if wav:
+                        if not os.path.exists(wav):
+                            self.send_json({"ok": False, "error": f"wav 不存在: {wav}"}, 400)
+                            return
+                        cmd += ["--wav", wav]
+                    else:
+                        cmd += ["--text", text]
+                    log.info("[Web] 语音发送开始 → %s | engine=%s model=%s", target, engine, model)
+                    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                       errors="replace", timeout=300, cwd=stack)
+                    res = {}
+                    for line in reversed((r.stdout or "").strip().splitlines()):
+                        line = line.strip()
+                        if line.startswith("{"):
+                            try:
+                                res = json.loads(line)
+                                break
+                            except Exception:
+                                pass
+                    if not res:
+                        res = {"ok": False, "error": (r.stderr or r.stdout or "")[-500:]}
+                    log.info("[Web] 语音发送结果 → %s | ok=%s | verify=%s", target,
+                             res.get("ok"), res.get("verify"))
+                    self.send_json(res)
+                finally:
+                    _VOICE_LOCK.release()
+                    UI_LOCK.release()
+            except Exception as e:
+                log.error("[Web] 语音发送异常: %s", e)
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif self.path == "/test_push":
+            # 调试用：伪造一条与 WeFlow 真实推送同形状的消息（event/sessionId/
+            # sessionType/rawid/avatarUrl/sourceName/content/timestamp），直接走
+            # handle_push_payload → add_to_buffer → process_sender 全链路。
+            # 用来验证群里 "/" 指令直通（不加"某某在群里说："前缀）是否生效。
+            try:
+                import time as _time
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                session_id = (payload.get("session_id") or "").strip()
+                content = payload.get("content") or ""
+                if not session_id or not content:
+                    self.send_json({"ok": False, "error": "需要 session_id 和 content"}, 400)
+                    return
+                inst = getattr(state, "bridge_instance", None)
+                if inst is None:
+                    self.send_json({"ok": False, "error": "bridge 未运行"}, 409)
+                    return
+                is_group = payload.get("session_type", "group") == "group"
+                data = {
+                    "event": "message.new",
+                    "sessionId": session_id,
+                    "sessionType": "group" if is_group else "private",
+                    "rawid": payload.get("rawid") or f"testpush-{int(_time.time()*1000)}",
+                    "avatarUrl": "",
+                    "sourceName": payload.get("source_name") or "测试",
+                    "content": content,
+                    "timestamp": _time.time(),
+                }
+                if is_group:
+                    data["groupName"] = payload.get("group_name") or ""
+                ok = inst.handle_push_payload(data)
+                self.send_json({"ok": bool(ok), "payload": data})
+            except Exception as e:
+                log.error("[Web] test_push 异常: %s", e)
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif self.path == "/test_cmd":
+            # 调试/自检用：以普通用户消息的形式把一条文字推给 AstrBot（复用现有 WS）
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                target = (payload.get("target") or "").strip()
+                text = payload.get("text") or ""
+                if not target or not text:
+                    self.send_json({"ok": False, "error": "需要 target 和 text"}, 400)
+                    return
+                inst = getattr(state, "bridge_instance", None)
+                if inst is None:
+                    self.send_json({"ok": False, "error": "bridge 未运行"}, 409)
+                    return
+                ok = inst.push_test_text(target, text,
+                                         nickname=payload.get("nickname") or "",
+                                         group_name=payload.get("group_name") or "")
+                self.send_json({"ok": ok, "target": target, "text": text})
+            except Exception as e:
+                log.error("[Web] test_cmd 异常: %s", e)
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif self.path == "/test_sse_voice":
+            # 调试用：伪造一条「真实形状」的 WeFlow 推送（只有 event/sessionId/
+            # sessionType/rawid/avatarUrl/sourceName/content/timestamp，没有
+            # localType/mediaUrl），走 handle_push_payload 这一条真实入口，
+            # 用来验证 should_ignore → add_to_buffer → 语音分支 → ASR → 推送。
+            try:
+                import threading
+                import time as _time
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                target = (payload.get("target") or "").strip()
+                path = payload.get("path") or ""
+                if not target or not path or not os.path.exists(path):
+                    self.send_json({"ok": False, "error": "需要 target 和存在的 path"}, 400)
+                    return
+                inst = getattr(state, "bridge_instance", None)
+                if inst is None:
+                    self.send_json({"ok": False, "error": "bridge 未运行"}, 409)
+                    return
+                inst._voice_override = path
+                content = payload.get("content") or "[语音]"
+                data = {
+                    "event": "message.new",
+                    "sessionId": target,
+                    "sessionType": payload.get("session_type") or "private",
+                    "rawid": payload.get("rawid") or f"sse-test-{int(_time.time() * 1000)}",
+                    "avatarUrl": "",
+                    "sourceName": payload.get("nickname") or target,
+                    "content": content,
+                    "timestamp": _time.time(),
+                }
+                if payload.get("group_name"):
+                    data["groupName"] = payload["group_name"]
+                    data["sessionType"] = "group"
+                ok = inst.handle_push_payload(data)
+                self.send_json({"ok": ok, "payload": data, "path": path})
+            except Exception as e:
+                log.error("[Web] test_sse_voice 异常: %s", e)
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif self.path == "/test_voice":
+            # 调试用：用本地 wav 走一遍「导出 → ASR 转写 → 推送文字给 AstrBot」的链路。
+            # 真实微信语音还没到时可先用它验证 bridge 侧 ASR 是否正常。
+            try:
+                import threading
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                target = (payload.get("target") or "").strip()
+                path = payload.get("path") or ""
+                if not target or not path or not os.path.exists(path):
+                    self.send_json({"ok": False, "error": "需要 target 和存在的 path"}, 400)
+                    return
+                inst = getattr(state, "bridge_instance", None)
+                if inst is None:
+                    self.send_json({"ok": False, "error": "bridge 未运行"}, 409)
+                    return
+                inst._voice_override = path
+                data = {
+                    "sessionId": target,
+                    "sourceName": payload.get("nickname") or target,
+                    "groupName": payload.get("group_name") or "",
+                    "rawid": payload.get("rawid") or "",
+                }
+                threading.Thread(target=inst.process_voice_message, args=(data,), daemon=True).start()
+                self.send_json({"ok": True, "target": target, "path": path})
+            except Exception as e:
+                log.error("[Web] test_voice 异常: %s", e)
                 self.send_json({"ok": False, "error": str(e)}, 500)
         elif self.path == "/api/config":
             try:

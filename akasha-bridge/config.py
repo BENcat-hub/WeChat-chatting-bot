@@ -28,6 +28,9 @@ BOT_WXID = config.get("bot_wxid", "")
 BUFFER_SECONDS = config.get("buffer_seconds", 5)
 WEB_PORT = config.get("web_port", 8766)
 GROUP_REPLY_MODE = config.get("group_reply_mode", "mention")  # "mention" / "all"
+# 这些前缀开头的群消息按“指令”直通给 AstrBot（不加"某某在群里说："前缀，
+# 否则 AstrBot 的唤醒检查看不到首字符 "/"，插件指令不会触发）
+COMMAND_PREFIXES = tuple(config.get("command_prefixes", ["/", "／"]))
 
 # AstrBot OneBot 连接配置（bridge 作为 WebSocket 客户端连 AstrBot 的 aiocqhttp 服务端）
 ASTRBOT_OB_URL = config.get("astrbot_ob_url", "ws://127.0.0.1:19777")
@@ -45,6 +48,20 @@ IMAGE_FORWARD_MODE = config.get("image_forward_mode", "direct")
 # Ollama 图片描述配置（provider=ollama 时使用）
 OLLAMA_BASE_URL = config.get("ollama_base_url", "http://127.0.0.1:61000")
 OLLAMA_TIMEOUT = config.get("ollama_timeout", 60)
+
+# ============ 语音转文字（入向语音） ============
+# bridge 直接调 MiMo ASR（OpenAI 兼容 /chat/completions），再把识别出的文字当普通
+# 文字消息推给 AstrBot。不走 AstrBot 的 STT 管线，因为该网关的 ASR 接口明确拒绝
+# 带 text part 的请求（AstrBot 的 mimo_stt provider 总会附带 system + text）。
+ASR_ENABLED = config.get("asr_enabled", True)
+ASR_API_BASE = config.get("asr_api_base", "https://token-plan-cn.xiaomimimo.com/v1")
+ASR_API_KEY = config.get("asr_api_key", "")
+ASR_MODEL = config.get("asr_model", "mimo-v2.5-asr")
+ASR_TIMEOUT = config.get("asr_timeout", 60)
+# 识别出的文字前缀，让模型知道这是语音转写（留空则完全当普通文字）
+ASR_TEXT_PREFIX = config.get("asr_text_prefix", "")
+# 语音识别为空（静音/纯音乐/失败）时给用户的提示；留空则不提示
+ASR_FAIL_REPLY = config.get("asr_fail_reply", "（语音没听清，再说一遍吧）")
 
 # ============ 发送后端与出站护栏 ============
 # "weemessenger" = 文本走 WeeMessenger 指令通道（推荐）；"uia" = 全部由 bridge 自己操作微信
@@ -64,6 +81,18 @@ WXUI_TIMEOUT = config.get("wxui_timeout", 90)
 WXUI_RETRY_QUEUE = config.get("wxui_retry_queue", "")
 WXUI_QUEUE_INTERVAL = config.get("wxui_queue_interval", 20)
 WXUI_QUEUE_MAX_ATTEMPTS = config.get("wxui_queue_max_attempts", 5)
+WXUI_QUEUE_ENABLED = bool(config.get("wxui_queue_enabled", True))
+# 语音气泡（2026-10-22）：AstrBot 的 TTS（知更鸟 Bert-VITS2）把音频放在 record 段里，
+# 过去一律当文件卡片发（微信里显示「语音回复_xxxx.wav」）。现在短音频改走
+# scripts\voice_send.py 的 --wav 模式：切默认麦克风到 CABLE Output → 微信录音条录进来 →
+# 点发送，真正变成语音消息气泡。超过微信 60s 上限的长音频（整首歌等）仍按文件发。
+STACK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VOICE_BUBBLE_ENABLED = bool(config.get("voice_bubble_enabled", True))
+VOICE_BUBBLE_MAX_SEC = float(config.get("voice_bubble_max_sec", 55))
+VOICE_BUBBLE_PYTHON = config.get("voice_bubble_python") or os.path.join(
+    STACK_ROOT, "rvc-backend", ".venv", "Scripts", "python.exe")
+VOICE_BUBBLE_SCRIPT = os.path.join(STACK_ROOT, "scripts", "voice_send.py")
+VOICE_BUBBLE_TIMEOUT = float(config.get("voice_bubble_timeout", 200))
 # 出站按联系人成组：同时有多个会话要回复时，先把一个人的消息发完，再换下一个人；
 # 同一联系人本次连发的第 2 条起走「只校验聊天头部」的快路径，省掉一次侧边栏全量 OCR。
 # 这个值是换人前的聚集窗口（秒）：上一段发完后最多等这么久，等到同一个人的后续分段
@@ -102,3 +131,4 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("ob11-bridge")
+

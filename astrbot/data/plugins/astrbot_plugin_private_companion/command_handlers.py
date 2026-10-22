@@ -4686,6 +4686,35 @@ class CommandHandlersMixin:
         )
 
     @staticmethod
+    def _natural_photo_prompt_is_pure_scene(prompt: Any) -> bool:
+        """True when the request is about animals / objects / food / scenery.
+
+        2026-10-22 用户反馈：跟陈奥琦聊小猫时，图又变成二次元插画了。
+        「没有人物出现的画面一律要写实风」——所以除了风景食物桌面，
+        动物（猫狗鸟）也算纯场景，走手机实拍质感而不是平涂插画。
+        """
+        text = _single_line(prompt, 1200).lower()
+        if not text:
+            return False
+        markers = (
+            "猫", "小猫", "猫咪", "狗", "小狗", "狗狗", "鸟", "兔", "仓鼠", "宠物",
+            "动物", "风景", "景色", "风光", "日落", "晚霞", "天空", "海边",
+            "食物", "美食", "早餐", "午餐", "晚餐", "甜点", "蛋糕", "咖啡", "饮料",
+            "桌面", "物品", "礼物", "花束", "花瓶", "卡片", "屏幕",
+        )
+        if any(marker in text for marker in markers):
+            return True
+        return bool(
+            re.search(
+                r"\b(?:cat|cats|kitten|dog|puppy|bird|rabbit|hamster|pet|animal|"
+                r"scenery|landscape|sunset|sky|seascape|food|breakfast|lunch|dinner|"
+                r"dessert|cake|coffee|drink|tabletop|object|gift|bouquet|vase|card|screen)s?\b",
+                text,
+                flags=re.I,
+            )
+        )
+
+    @staticmethod
     def _natural_photo_prompt_has_explicit_back_view_request(prompt: Any) -> bool:
         text = _single_line(prompt, 1200).lower()
         if not text:
@@ -4753,10 +4782,18 @@ class CommandHandlersMixin:
         explicit_back_view_request = self._natural_photo_prompt_has_explicit_back_view_request(prompt)
         referenced_group_request = bool(has_reference and _photo_group_request_matches(prompt))
         if kind not in {"edit", "selfie"} and style_name == "二次元" and not explicit_people_request:
-            style_prompt = (
-                "2D anime illustration style, detailed environment and object art, "
-                "cel-shaded rendering, soft colors, slice-of-life atmosphere"
-            )
+            if self._natural_photo_prompt_is_pure_scene(prompt):
+                # 2026-10-22：无人物画面（猫狗/食物/风景/桌面物品）一律写真风格。
+                style_prompt = (
+                    "realistic smartphone photo, natural available light, "
+                    "true-to-life fur and object texture, shallow depth of field, "
+                    "fine photographic detail, not an illustration or a drawing"
+                )
+            else:
+                style_prompt = (
+                    "2D anime illustration style, detailed environment and object art, "
+                    "cel-shaded rendering, soft colors, slice-of-life atmosphere"
+                )
         if kind == "edit" and has_reference:
             user_request = _single_line(prompt, 420) or "edit the reference image"
             positive = [
