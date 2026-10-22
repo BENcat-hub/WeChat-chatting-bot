@@ -122,7 +122,7 @@ class WxuiSender(WeMessengerSender):
                            "error": "queued behind earlier undelivered message"})
             return False
         ok, data = self._scheduled_run("send", {"target": target, "text": text}, target)
-        if not ok and self._retryable(data) and not data.get("_enqueued"):
+        if not ok and self._retryable(data) and not data.get("_enqueued") and not data.get("no_requeue"):
             self._block_contact(target)
             self._enqueue("send", {"target": target, "text": text}, target, data)
         return ok
@@ -157,7 +157,7 @@ class WxuiSender(WeMessengerSender):
             return False
         ok, data = self._scheduled_run("send-image", spec, contact)
         self._settle()
-        if not ok and self._retryable(data) and not data.get("_enqueued"):
+        if not ok and self._retryable(data) and not data.get("_enqueued") and not data.get("no_requeue"):
             self._block_contact(contact)
             self._enqueue("send-image", spec, contact, data)
         return ok
@@ -184,7 +184,7 @@ class WxuiSender(WeMessengerSender):
             return False
         ok, data = self._scheduled_run("send-file", spec, contact)
         self._settle()
-        if not ok and self._retryable(data) and not data.get("_enqueued"):
+        if not ok and self._retryable(data) and not data.get("_enqueued") and not data.get("no_requeue"):
             self._block_contact(contact)
             self._enqueue("send-file", spec, contact, data)
         return ok
@@ -517,7 +517,7 @@ class WxuiSender(WeMessengerSender):
                 ok, data = False, {"retryable": True, "error_kind": "scheduler",
                                    "error": "scheduler run failed: %s" % e}
             job["ok"], job["data"] = ok, data
-            if not ok and self._retryable(data):
+            if not ok and self._retryable(data) and not data.get("no_requeue"):
                 # 先让「失败的那条」入队，再把同一联系人排在后面的任务也排到它后面：
                 # 顺序在这里保证（调用方看到 _enqueued 就不再重复入队）。
                 self._block_contact(contact)
