@@ -1793,7 +1793,48 @@ def _chat_ready_to_type(cfg, plan, target):
 
     Shared by every path that has already decided the right conversation is open, so the
     "refuse to type blind" checks can never drift apart.
+
+    2026-10-22 事故（「卷子分完了没」被连发到陈奥琦那边 6 遍）：搜索框兜底路径
+    (`opened by Ctrl+F search`) 点完结果行就直接宣称「已打开」，没有回头确认聊天头部，
+    于是文本被粘进了当时开着的**另一个**会话；WeFlow 回读当然找不到 → 判失败 →
+    重试 3 次 + 重发队列，全都粘进同一个错会话。这里补最后一道闸：只有头部 OCR 或
+    侧栏绿底选中行**确认是目标**，才允许继续打字。
     """
+    if plan.get("target_verified") is not True:
+        rect_now = tuple(plan.get("window_rect") or ())
+        if not rect_now:
+            try:
+                rect_now = tuple(restored_rect(find_wechat(cfg)))
+            except Exception:
+                rect_now = ()
+        verified_by = ""
+        header_detail = {}
+        if rect_now:
+            try:
+                ok_header, header_detail = chat_header_matches(None, cfg, rect_now, target)
+            except Exception as exc:          # noqa: BLE001
+                ok_header, header_detail = False, {"error": str(exc)}
+            if ok_header:
+                verified_by = "header"
+            else:
+                row_now = None
+                try:
+                    row_now = selected_row_text(cfg, rect_now)
+                except Exception:             # noqa: BLE001
+                    row_now = None
+                if row_now and name_match(target, _row_text_of(row_now)) >= NAME_MATCH_LENIENT:
+                    verified_by = "selected_row"
+                plan["identity_check"] = {
+                    "header": (header_detail.get("texts") or [])[:4],
+                    "selected_row": row_now,
+                    "verified_by": verified_by,
+                }
+        if not verified_by and find_window(cfg, target, fuzzy=True) is None:
+            return fail(plan, "chat identity not confirmed before typing "
+                              "(header=%s selected_row=%s)" % (
+                                  (header_detail.get("texts") or [])[:3],
+                                  (plan.get("identity_check") or {}).get("selected_row")))
+        plan["target_verified"] = verified_by or "detached_window"
     chat = find_window(cfg, target, fuzzy=True) or find_wechat(cfg)
     if chat and foreground() != chat and not focus(chat):
         return fail(plan, "chat window did not take focus; refusing to type blind")
@@ -2136,6 +2177,7 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                     _warm_ok = True
             if _warm_ok:
                 plan["claimed"] = "chat already on target (warm session: header verified)"
+                plan["target_verified"] = True
                 plan["warm_header_verified"] = True
                 plan["assume_current"] = {"matched": True, "warm": True,
                                           "header_texts": _warm_hd.get("texts", [])[:6]}
@@ -2158,6 +2200,7 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                                   "png": header0.get("png")}
         if matched:
             plan["claimed"] = "chat already on target (assume-current: sidebar OCR skipped)"
+            plan["target_verified"] = True
             plan["warm_header_verified"] = True
             plan["row_point"] = []
             plan["open_attempts"] = 0
@@ -2261,6 +2304,7 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
         surface_ok = bool(picked_text) and header_matches_surface(header0.get("texts", []), picked_text)
         if already or surface_ok:
             plan["claimed"] = "chat already open" if already else "chat already open (surface match)"
+            plan["target_verified"] = True
             plan["warm_header_verified"] = True
             plan["row_point"] = [x, y]
             plan["open_attempts"] = 0
@@ -2287,6 +2331,7 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                 break
             if _matched or _same:
                 plan["claimed"] = "chat already open (click dedup)"
+                plan["target_verified"] = True
                 plan["warm_header_verified"] = True
                 plan["row_point"] = list(_memo["point"])
                 plan["click_dedup"] = {"age_s": round(time.time() - _memo["ts"], 1)}
@@ -2303,6 +2348,7 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                     _row_now = None
                 if _row_now and name_match(target, _row_text_of(_row_now)) >= NAME_MATCH_LENIENT:
                     plan["claimed"] = "chat already open (click dedup: selected row match)"
+                    plan["target_verified"] = True
                     plan["warm_header_verified"] = False
                     plan["row_point"] = list(_memo["point"])
                     plan["click_dedup"] = {"age_s": round(time.time() - _memo["ts"], 1),
@@ -2602,6 +2648,10 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
             client.close()
 
     plan["before_local_id"] = since
+    if not found and (plan.get("identity_check") or {}).get("verified_by") in ("", None):
+        # 身份闸拦下的发送：一个字都没敲出去，重发只会把同一条内容再塞进当前会话。
+        # 标记 no_requeue，让 wxui_sender 不要把它塞进重发队列（2026-10-22 连发 10 条事故）。
+        plan["no_requeue"] = True
     return _assemble(plan, attempt_log, found, "text", cfg, talker, text=text)
 
 
