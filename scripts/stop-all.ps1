@@ -38,6 +38,7 @@ Write-Host "`n=== 端口兜底清理 ===" -ForegroundColor Cyan
 Stop-ByPort 8766 "bridge 面板"
 Stop-ByPort 9877 "WeeMessenger"
 Stop-ByPort 11229 "AstrBot 反向 WS"
+Stop-ByPort 3333 "AI点歌后端"
 if ($IncludeWeFlow) { Stop-ByPort 5031 "WeFlow API" } else { Write-Host "  - WeFlow(5031) 保留（需要时加 -IncludeWeFlow）" }
 if ($IncludeWeChat) {
     Get-Process -Name "Weixin" -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.Id -Force; Write-Host ("  ✗ 已停止微信 4.x PID {0}" -f $_.Id) }

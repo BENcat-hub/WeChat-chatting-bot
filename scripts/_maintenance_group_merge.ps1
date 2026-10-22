@@ -1,4 +1,4 @@
-# 维护窗口：停 AstrBot -> 应用群档案合并 -> 重新拉起 AstrBot（加载新配置/代码）
+﻿# 维护窗口：停 AstrBot -> 应用群档案合并 -> 重新拉起 AstrBot（加载新配置/代码）
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root

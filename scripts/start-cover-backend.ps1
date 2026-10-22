@@ -1,4 +1,4 @@
-# 启动 AI点歌（matsuko_cover）本地后端：Gradio 中间层 + so-vits-svc + Demucs
+﻿# 启动 AI点歌（matsuko_cover）本地后端：Gradio 中间层 + so-vits-svc + Demucs
 # 用法：pwsh -File scripts\start-cover-backend.ps1 [-Port 3333]
 param(
     [int]$Port = 3333,

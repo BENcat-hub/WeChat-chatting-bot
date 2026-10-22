@@ -1,9 +1,9 @@
-# WeFlow -101 diagnosis, attempt 4 (elevated):
+﻿# WeFlow -101 diagnosis, attempt 4 (elevated):
 #   1) stop the two driver groups the user asked for (MuMu virtualization driver + Tencent ACE anti-cheat drivers) and probe
 #   2) test the community hypothesis from hicccc77/WeFlow issue #1227 ("确实是时间的问题") by sweeping the system clock back
 #   3) restore drivers and system time, always
 $ErrorActionPreference = 'Continue'
-$root = '<REPO_ROOT>'
+$root = 'C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack'
 $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
 $log = Join-Path $root "logs\weflow-admin-try4-$ts.log"
 Start-Transcript -Path $log -Force | Out-Null

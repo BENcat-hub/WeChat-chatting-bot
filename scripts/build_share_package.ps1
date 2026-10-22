@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     把 wechat-ai-stack 打包成「可分享」的发布树（默认给朋友分享 / 私有仓库用）。
 
@@ -40,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 
 $StackRoot = Split-Path -Parent $PSScriptRoot
 $WorkspaceRoot = Split-Path -Parent $StackRoot
-$WeFlowSrc = '<WEFLOW_ROOT>'
+$WeFlowSrc = 'C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\weflow-old\WeFlow-main'
 if (-not $OutBase) { $OutBase = Join-Path $WorkspaceRoot 'wechat-ai-stack-share' }
 $Repo = Join-Path $OutBase 'wechat-ai-stack'
 
@@ -202,12 +202,12 @@ if (Test-Path $tpl) {
 # 只处理自研部分；weflow\ 是第三方源码树，保持原样。
 Write-Step '脱敏：绝对路径 / wxid / 数字 uid / 联系人昵称 / token -> 占位符'
 
-$bodySlash  = '<REPO_ROOT>'
-$bodyBs     = '<REPO_ROOT>'
-$weflowSlash = '<WEFLOW_ROOT>'
-$weflowBs    = '<WEFLOW_ROOT>'
-$homeSlash  = 'C:/Users/<YOU>'
-$homeBs     = 'C:\Users\<YOU>'
+$bodySlash  = 'C:/Users/Administrator.DESKTOP-LD9CS9H/Documents/deepseek-harness/default-workspace/wechat-ai-stack'
+$bodyBs     = 'C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack'
+$weflowSlash = 'C:/Users/Administrator.DESKTOP-LD9CS9H/Documents/weflow-old/WeFlow-main'
+$weflowBs    = 'C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\weflow-old\WeFlow-main'
+$homeSlash  = 'C:/Users/Administrator.DESKTOP-LD9CS9H'
+$homeBs     = 'C:\Users\Administrator.DESKTOP-LD9CS9H'
 
 # 顺序有意义：先长后短，否则短前缀会先把长路径切断。
 $scrubMap = [ordered]@{
@@ -218,51 +218,51 @@ $scrubMap = [ordered]@{
     $homeBs      = 'C:\Users\<YOU>'
     $homeSlash   = 'C:/Users/<YOU>'
     # 开发机目录名（家目录替换后仍会残留的路径尾部）
-    'Documents\<WORKSPACE>' = 'Documents\<WORKSPACE>'
-    'Documents\<WORKSPACE>'                  = 'Documents\<WORKSPACE>'
-    'Documents/<WORKSPACE>' = 'Documents/<WORKSPACE>'
-    'Documents/<WORKSPACE>'                  = 'Documents/<WORKSPACE>'
-    '<WEFLOW_SRC>'                      = '<WEFLOW_SRC>'
-    '<WEFLOW_SRC>'                                  = '<WEFLOW_SRC>'
+    'Documents\deepseek-harness\default-workspace' = 'Documents\<WORKSPACE>'
+    'Documents\deepseek-harness'                  = 'Documents\<WORKSPACE>'
+    'Documents/deepseek-harness/default-workspace' = 'Documents/<WORKSPACE>'
+    'Documents/deepseek-harness'                  = 'Documents/<WORKSPACE>'
+    'weflow-old\WeFlow-main'                      = '<WEFLOW_SRC>'
+    'weflow-old'                                  = '<WEFLOW_SRC>'
     # 微信账号标识
-    'wxid_BOTACCOUNT'  = 'wxid_BOTACCOUNT'
-    'wxid_CONTACT_A'  = 'wxid_CONTACT_A'
-    'wxid_CONTACT_B'  = 'wxid_CONTACT_B'
-    'wxid_CONTACT_C'  = 'wxid_CONTACT_C'
-    'wxid_CONTACT_D'  = 'wxid_CONTACT_D'
+    'wxid_h05bg877ppkj22'  = 'wxid_BOTACCOUNT'
+    'wxid_iwfcw218p6pq22'  = 'wxid_CONTACT_A'
+    'wxid_ml4l1e98nlyn22'  = 'wxid_CONTACT_B'
+    'wxid_jzjp7bpw8vd422'  = 'wxid_CONTACT_C'
+    'wxid_qvj04bh9wqhl22'  = 'wxid_CONTACT_D'
     # OneBot 数字 uid（保留纯数字形态，脚本里 int/str 两种上下文都还能跑）
-    '1000000001' = '1000000001'
-    '1000000002' = '1000000002'
-    '1000000003' = '1000000003'
-    '1000000004' = '1000000004'
-    '1000000005'  = '1000000005'
-    '1000000006' = '1000000006'
-    '1000000007' = '1000000007'
-    '1000000008' = '1000000008'
-    '1000000009' = '1000000009'
-    '1000000010' = '1000000010'
-    '1000000011'  = '1000000011'
+    '1007787221' = '1000000001'
+    '1377925089' = '1000000002'
+    '1045254607' = '1000000003'
+    '1874393111' = '1000000004'
+    '617632665'  = '1000000005'
+    '1043793717' = '1000000006'
+    '1481411842' = '1000000007'
+    '2064369466' = '1000000008'
+    '2073548445' = '1000000009'
+    '2105969459' = '1000000010'
+    '501850891'  = '1000000011'
     # 其余真实账号 / 群（来自 ob_id_map.json 的权威映射）
-    '1000000012' = '1000000012'
-    '1000000013' = '1000000013'
-    '1000000015' = '1000000015'
-    '1000000016' = '1000000016'
-    '1000000017' = '1000000017'
+    '1025241982' = '1000000012'
+    '1031792701' = '1000000013'
+    '1564355052' = '1000000015'
+    '1929461734' = '1000000016'
+    '1980411314' = '1000000017'
     # 1057020421 = 「文件传输助手」，是微信内置对象，不视为隐私，保留原样
     # 联系人 / 群昵称
-    '用户B'     = '用户B'
+    '桃桃真可爱'     = '用户B'
     # 2026-10-18 改名事故里出现过的备注名，与昵称同等视为隐私
-    '用户B别名'         = '用户B别名'
-    '用户A'         = '用户A'
-    '用户C'       = '用户C'
-    '用户D' = '用户D'
-    '示例群聊'      = '示例群聊'
-    '用户E'          = '用户E'
-    '用户E'           = '用户E'
-    '示例群聊B' = '示例群聊B'
+    '陈铭坚'         = '用户B别名'
+    '陈奥琦'         = '用户A'
+    '天文学家'       = '用户C'
+    '不曾为世界整除' = '用户D'
+    '杏园6-508'      = '示例群聊'
+    '鱼宝🐳'          = '用户E'
+    '鱼宝'           = '用户E'
+    '㊙️情🔞VIP💎508🉑👅🈲✈️' = '示例群聊B'
     # 真实密钥
-    '<FILL_ME_WEFLOW_TOKEN>' = '<FILL_ME_WEFLOW_TOKEN>'
-    '<FILL_ME>' = '<FILL_ME>'
+    'f146a99df14ea85a439461902666d83a' = '<FILL_ME_WEFLOW_TOKEN>'
+    'sk-baf824468b5b4212bce77740015b8efa' = '<FILL_ME>'
 }
 
 $textExt = '.py', '.md', '.json', '.ps1', '.txt', '.cmd', '.bat', '.js', '.ts', '.yaml', '.yml',

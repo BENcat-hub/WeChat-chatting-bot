@@ -1,4 +1,4 @@
-# 一键启动 wechat-ai-stack（顺序：微信 → WeFlow → AstrBot → bridge）
+﻿# 一键启动 wechat-ai-stack（顺序：微信 → WeFlow → AstrBot → bridge）
 #
 # 用法（在任意终端里执行，无需管理员）：
 #     pwsh -File C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack\scripts\start-all.ps1
