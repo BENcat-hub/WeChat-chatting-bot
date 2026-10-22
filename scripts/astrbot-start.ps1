@@ -42,7 +42,15 @@ if (Test-Path (Join-Path $ffmpegDir 'ffmpeg.exe')) {
     $env:PATH = $ffmpegDir + ';' + $env:PATH
 }
 $env:PYTHONIOENCODING = 'utf-8'
-if ($PSVersionTable.PSVersion.Major -ge 6) { $OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }
+# 2026-10-22：Windows PowerShell 5.1 的默认控制台码页是 936，直接 ``& $exe | Tee-Object`` 会把
+# AstrBot 的 UTF-8 输出按 GBK 解码再写回日志（日志全变乱码），stderr 还会被当成
+# NativeCommandError 直接中断整条管道。5.1 与 7 都显式设成 UTF-8。
+try {
+    $utf8 = [System.Text.Encoding]::UTF8
+    [Console]::OutputEncoding = $utf8
+    [Console]::InputEncoding  = $utf8
+    $OutputEncoding = $utf8
+} catch { }
 
 # 插件热重载：AstrBot 4.28 只在 ASTRBOT_RELOAD=1 时才启动 watchfiles 监视器
 # （astrbot\core\star\star_manager.py:222）。不开的话，改完插件 .py 必须整进程重启，
@@ -83,7 +91,14 @@ Write-Host ""
 Set-Location $astrbotRoot
 if ($NoTee) {
     & $exe run
-} else {
-    & $exe run *>&1 | Tee-Object -FilePath $LogFile
+    exit $LASTEXITCODE
 }
-exit $LASTEXITCODE
+# 用 Start-Process 重定向而不是 ``| Tee-Object``：后者在 5.1 下会把 stderr 变成
+# NativeCommandError 并中断管道（实测停在 “Loading plugin meme_manager”）。
+$errLog = $LogFile -replace '\.log$', '.err.log'
+$proc = Start-Process -FilePath $exe -ArgumentList @('run') -WorkingDirectory $astrbotRoot `
+    -WindowStyle Hidden -RedirectStandardOutput $LogFile -RedirectStandardError $errLog -PassThru
+Write-Host ("AstrBot PID  : {0}" -f $proc.Id)
+Write-Host ("stderr log   : {0}" -f $errLog)
+$proc.WaitForExit()
+exit $proc.ExitCode
