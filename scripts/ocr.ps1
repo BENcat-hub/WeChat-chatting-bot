@@ -1,4 +1,4 @@
-# Windows OCR (Windows.Media.Ocr) over an image file -> JSON lines with boxes.
+﻿# Windows OCR (Windows.Media.Ocr) over an image file -> JSON lines with boxes.
 # Why: WeChat's Qt window exposes no UI-automation children, so the only robust
 # way to find a session-list row by NAME (instead of a fragile index that shifts
 # whenever a new message reorders the list) is to read the screenshot. Windows'

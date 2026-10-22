@@ -1,4 +1,4 @@
-# 重启 AstrBot（停掉旧进程树 -> 用 scripts\astrbot-start.ps1 重新拉起，脚本内已带 ASTRBOT_RELOAD=1）
+﻿# 重启 AstrBot（停掉旧进程树 -> 用 scripts\astrbot-start.ps1 重新拉起，脚本内已带 ASTRBOT_RELOAD=1）
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root

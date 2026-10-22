@@ -1,4 +1,4 @@
-# 盯主动消息是否真的落到微信：记录 bridge 的发送结果 + 插件排期状态变化
+﻿# 盯主动消息是否真的落到微信：记录 bridge 的发送结果 + 插件排期状态变化
 #
 # 背景：bridge 是「先回 OK 再发送」，失败只在 bridge.log 里留痕；插件侧记 status=sent。
 # 所以判断「有没有真的发出去」必须看 bridge.log 的 [wxui] 行 + companions.json 的排期。
