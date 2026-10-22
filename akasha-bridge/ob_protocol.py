@@ -24,6 +24,128 @@ import config
 
 log = logging.getLogger("ob11-bridge")
 
+# 同一条翻唱插件既发 record 又发 file 时，内容相同只投递一次（record 可能被转成
+# 临时文件，路径不同但字节一样），窗口内按内容指纹去重。
+_FILE_DEDUPE_WINDOW = 20.0
+_recent_file_sends: dict[str, float] = {}
+_file_dedupe_lock = threading.Lock()
+
+
+def _file_fingerprint(path: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha1()
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        digest.update(fh.read(256 * 1024))
+    return f"{size}:{digest.hexdigest()}"
+
+
+_FFMPEG = os.path.join(config.STACK_ROOT, "tools", "ffmpeg", "ffmpeg.exe")
+
+
+def _audio_duration_sec(path: str) -> float:
+    """尽力估算音频时长（秒）；认不出返回 0.0。
+
+    wav 直接读头（最准，TTS 产物基本都是 wav）；其他格式让 ffmpeg 打印信息后从
+    「Duration: hh:mm:ss.xx」抠出来。这个值只用来决定「走语音气泡还是走文件」。
+    """
+    try:
+        if os.path.splitext(path)[1].lower() == ".wav":
+            import wave
+
+            with wave.open(path, "rb") as wf:
+                rate = wf.getframerate() or 1
+                return float(wf.getnframes()) / float(rate)
+    except Exception:
+        pass
+    if not os.path.isfile(_FFMPEG):
+        return 0.0
+    try:
+        import re
+        import subprocess
+
+        proc = subprocess.run(
+            [_FFMPEG, "-hide_banner", "-i", path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20,
+        )
+        head = (proc.stderr or "") + (proc.stdout or "")
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", head)
+        if m:
+            h, mi, s = m.groups()
+            return int(h) * 3600 + int(mi) * 60 + float(s)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _voice_bubble_ok(path: str) -> bool:
+    """短到能塞进微信语音（≤60s）才走气泡，长音频（整首歌）仍按文件发。"""
+    if not config.VOICE_BUBBLE_ENABLED:
+        return False
+    if os.path.splitext(path)[1].lower() not in (".wav", ".mp3", ".m4a", ".ogg"):
+        return False
+    dur = _audio_duration_sec(path)
+    if dur <= 0:
+        return False
+    return dur <= config.VOICE_BUBBLE_MAX_SEC
+
+
+def _send_voice_bubble_sync(contact: str, path: str, tag: str) -> dict:
+    """调 scripts\\voice_send.py 把一个本地音频发成微信语音气泡。
+
+    voice_send.py 会自己切默认麦克风到 CABLE Output、点微信录音条、播放、点发送，
+    再从 WeFlow 回读确认（localType=34），最后还原默认麦克风。
+    """
+    import subprocess
+
+    cmd = [
+        config.VOICE_BUBBLE_PYTHON, "-X", "utf8",
+        config.VOICE_BUBBLE_SCRIPT,
+        "--wav", path,
+        "--target", contact,
+        "--tag", tag,
+    ]
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=config.STACK_ROOT, timeout=config.VOICE_BUBBLE_TIMEOUT,
+    )
+    payload = ""
+    for line in (proc.stdout or "").splitlines():
+        if line.strip().startswith("{"):
+            payload = line.strip()
+    if not payload:
+        raise RuntimeError(
+            "voice_send 无输出: " + ((proc.stderr or proc.stdout or "")[-400:]))
+    return json.loads(payload)
+
+
+# 2026-10-22: 语音气泡是一次「点麦克风→播放→点发送」的连续 UI 录制（约 6–12 秒）。
+# 期间如果别的事件往同一个微信窗口打字/点发送，会把录制打断或把内容打进输入框
+# （实测 08:00 那次：TTS 语音正在录，AstrBot 同时补发 5 段文字 → 气泡没出来，
+# 只剩回落文件卡片）。所以所有微信发送动作共用一把异步锁串行化。
+_SEND_LOCK = asyncio.Lock()
+
+
+async def _send_voice_bubble(contact: str, path: str) -> dict | None:
+    """发语音气泡；返回 voice_send 的结果（含 verify），失败返回 None 由调用方回落文件。"""
+    tag = time.strftime("%H%M%S")
+    try:
+        async with _SEND_LOCK:
+            info = await asyncio.to_thread(_send_voice_bubble_sync, contact, path, tag)
+    except Exception as exc:
+        log.warning(f"[OB11] 语音气泡发送失败（回落文件投递）: {exc}")
+        return None
+    ver = info.get("verify") or {}
+    if info.get("ok") and ver.get("ok"):
+        log.info(
+            f"[OB11] 语音气泡已发送至 {contact}: localId={ver.get('localId')} "
+            f"{ver.get('voicelength_ms')}ms")
+        return info
+    log.warning(f"[OB11] 语音气泡未确认送达（回落文件投递）: {json.dumps(info, ensure_ascii=False)[:300]}")
+    return None
+
 # 分段回复：AstrBot 把一条回复按标点切成多段、整条链一次性发过来，我们逐段发到微信。
 # 每段都是一次 UI 自动化（约 7–15 秒，期间占用鼠标键盘），所以段数要封顶。
 # 短段（「哈？」「在呢」）是模型自己换行写出来的，保留原样，不合并。
@@ -57,6 +179,68 @@ def _merge_text_segments(message: list) -> list:
     return out
 
 
+async def _send_ob_response(payload: dict) -> bool:
+    """把一条 OneBot API 响应发回 AstrBot；WS 暂时断连时等一会重试。"""
+    for retry in range(10):
+        try:
+            if state._ob_ws:
+                await state._ob_ws.send(json.dumps(payload, ensure_ascii=False))
+                return True
+            if retry < 9:
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            log.warning(f"[OB11] 回响应失败 (重试 {retry}/10): {e}")
+            if retry < 9:
+                await asyncio.sleep(0.5)
+    return False
+
+
+# 这些 action 的响应要带「真实结果」才有意义（文件到底发出去没有、file_id 是什么），
+# 所以必须等投递完成再回，不能像 send_msg 那样先回一个空 data。空 data 的后果已经踩过：
+# 翻唱插件 upload_group_file 拿到 {}，以为群文件上传成功，其实微信里什么都没发，
+# 于是「命中缓存 + 已上传群文件」两条都报成功、音频却永远收不到。
+def _defer_response(action: str) -> bool:
+    return action in ("upload_group_file", "upload_private_file",
+                      "get_group_root_files", "get_group_file_url")
+
+
+async def _deliver_upload(params: dict, is_group: bool) -> dict:
+    """upload_group_file / upload_private_file —— 落到当前发送后端（wxui 文件发送）。
+
+    微信没有「群文件」概念，这里统一按**文件消息**投递到会话，行为对插件透明。
+    """
+    target_id = params.get("group_id" if is_group else "user_id", 0)
+    contact = state._ob_id_to_contact.get(target_id, str(target_id))
+    file_val = str(params.get("file") or params.get("path") or "")
+    name_val = str(params.get("name") or os.path.basename(file_val) or "")
+    fpath = await asyncio.to_thread(_resolve_local_file, file_val, name_val)
+    if not fpath:
+        log.warning(f"[OB11] 上传请求的文件不存在: contact={contact} file={file_val[:120]}")
+        return {"status": "failed", "retcode": 1200, "data": {},
+                "wording": f"file not found: {file_val[:120]}"}
+    try:
+        size = os.path.getsize(fpath)
+    except OSError:
+        size = 0
+    try:
+        ok = await asyncio.to_thread(state.sender_instance.send_file, contact, fpath)
+    except NotImplementedError:
+        log.error(f"[OB11] 当前发送后端不支持文件发送: {fpath}")
+        return {"status": "failed", "retcode": 1404, "data": {}, "wording": "file sending unsupported"}
+    except Exception as e:  # 后端异常也不能让插件以为成功
+        log.error(f"[OB11] 文件投递异常: {contact} {os.path.basename(fpath)}: {e}")
+        return {"status": "failed", "retcode": 1201, "data": {}, "wording": str(e)[:200]}
+    # send_file 返回 False = 已交给后台重发队列，最终会送达，所以仍报成功（否则插件会
+    # 再发一遍 File 段，造成重复文件）。
+    if ok:
+        log.info(f"[OB11] 上传请求已投递为文件消息: {contact} {os.path.basename(fpath)} ({size} B)")
+    else:
+        log.warning(f"[OB11] 文件未即时验证送达（已交重发队列）: {contact} {os.path.basename(fpath)}")
+    return {"status": "ok", "retcode": 0,
+            "data": {"file_id": os.path.basename(fpath), "file_name": name_val or os.path.basename(fpath),
+                     "file_size": size}}
+
+
 async def _handle_ob_api(data: dict):
     """处理 AstrBot 发来的 API 请求。"""
     action = data.get("action", "")
@@ -64,27 +248,16 @@ async def _handle_ob_api(data: dict):
     echo = data.get("echo", "")
     log.info(f"[OB11] API: {action} echo={echo}")
 
-    # 先回响应（必须在处理消息前回，否则 AstrBot 超时）
-    resp_sent = False
+    defer = _defer_response(action)
     resp_data = {"status": "ok", "retcode": 0, "data": {}}
     if echo:
         resp_data["echo"] = echo
-    # 如果 WS 暂时断连，等一会重试
-    for retry in range(10):
-        try:
-            if state._ob_ws:
-                await state._ob_ws.send(json.dumps(resp_data, ensure_ascii=False))
-                resp_sent = True
-                log.info(f"[OB11] 已回响应: {action}")
-                break
-            if retry < 9:
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            log.warning(f"[OB11] 回响应失败 (重试 {retry}/10): {e}")
-            if retry < 9:
-                await asyncio.sleep(0.5)
-    if not resp_sent:
-        log.warning(f"[OB11] 无法回响应（WS 未连接），消息仍尝试本地处理: {action}")
+    if not defer:
+        # 消息类请求先回响应（必须在处理消息前回，否则 AstrBot 超时）
+        if await _send_ob_response(resp_data):
+            log.info(f"[OB11] 已回响应: {action}")
+        else:
+            log.warning(f"[OB11] 无法回响应（WS 未连接），消息仍尝试本地处理: {action}")
 
     if action in ("send_msg", "send_private_msg", "send_group_msg"):
         is_group = action == "send_group_msg"
@@ -104,7 +277,8 @@ async def _handle_ob_api(data: dict):
             if seg_type == "text":
                 text = seg_data.get("text", "")
                 if text:
-                    ok = await asyncio.to_thread(state.sender_instance.send_text, contact, text)
+                    async with _SEND_LOCK:
+                        ok = await asyncio.to_thread(state.sender_instance.send_text, contact, text)
                     if ok:
                         log.info(f"[OB11] 文字已发送至 {contact}: {text[:50]}")
                     else:
@@ -147,14 +321,22 @@ async def _handle_ob_api(data: dict):
                             log.warning(f"[OB11] 图片文件未找到: {file_val}")
 
                 if img_path:
+                    normalized = img_path
                     try:
                         # 使用线程池执行同步的 UIA 发送，避免阻塞事件循环
-                        ok = await asyncio.to_thread(state.sender_instance.send_image, contact, img_path)
+                        normalized = await asyncio.to_thread(_normalize_image_for_wechat, img_path)
+                        async with _SEND_LOCK:
+                            ok = await asyncio.to_thread(state.sender_instance.send_image, contact, normalized)
                         if ok:
                             log.info(f"[OB11] 图片已发送至 {contact}")
                         else:
                             log.warning(f"[OB11] ⚠ 图片未验证送达（已交重发队列，稍后自动补发）{contact}")
                     finally:
+                        if normalized != img_path and "tmp" in os.path.basename(normalized or ""):
+                            try:
+                                os.unlink(normalized)
+                            except Exception:
+                                pass
                         # 临时文件用完删除
                         if img_path and "tmp" in img_path:
                             try:
@@ -163,15 +345,102 @@ async def _handle_ob_api(data: dict):
                                 pass
 
             elif seg_type == "face":
-                await asyncio.to_thread(state.sender_instance.send_text, contact, "[表情]")
+                async with _SEND_LOCK:
+                    await asyncio.to_thread(state.sender_instance.send_text, contact, "[表情]")
                 log.info(f"[OB11] 表情已发送至 {contact}")
 
-            # 其他类型（record, video 等）忽略
+            elif seg_type in ("file", "record"):
+                # 2026-10-20: AI 点歌的翻唱是整首歌（3~5 分钟 mp3）——微信语音消息上限 60s，
+                # 当 record 发根本发不出去，所以 record 也按**文件**投递（appmsg 文件卡片）。
+                file_val = seg_data.get("file", "") or seg_data.get("path", "")
+                name_val = seg_data.get("name", "") or os.path.basename(str(file_val))
+                fpath = await asyncio.to_thread(_resolve_local_file, file_val, name_val)
+                if not fpath:
+                    log.warning(f"[OB11] {seg_type} 段未找到本地文件: {file_val}")
+                    continue
+                # 微信语音格式（silk/amr）当文件发出去对方打不开；整首歌也不该走语音，
+                # 所以这类只记一条日志，真正的音频由随后的 file 段（mp3）投递。
+                if os.path.splitext(fpath)[1].lower() in (".silk", ".slk", ".amr"):
+                    log.info(f"[OB11] 跳过语音格式文件（改由音频文件段投递）: {os.path.basename(fpath)}")
+                    continue
+                # 2026-10-22: record 段里的短音频（AstrBot TTS / 知更鸟音色）优先发成
+                # 真语音气泡；失败或太长（整首歌）才回落成下面的文件卡片投递。
+                if seg_type == "record" and await asyncio.to_thread(_voice_bubble_ok, fpath):
+                    bubble = await _send_voice_bubble(contact, fpath)
+                    if bubble:
+                        continue
+                try:
+                    fingerprint = await asyncio.to_thread(_file_fingerprint, fpath)
+                except Exception:
+                    fingerprint = ""
+                if fingerprint:
+                    now = time.time()
+                    with _file_dedupe_lock:
+                        for stale in [k for k, ts in _recent_file_sends.items() if now - ts > _FILE_DEDUPE_WINDOW]:
+                            _recent_file_sends.pop(stale, None)
+                        last_sent = _recent_file_sends.get(fingerprint)
+                        if last_sent is not None and now - last_sent < _FILE_DEDUPE_WINDOW:
+                            log.info(f"[OB11] 跳过重复文件（{seg_type} 段，同一内容刚发过）: {os.path.basename(fpath)}")
+                            continue
+                        _recent_file_sends[fingerprint] = now
+                if seg_type == "record":
+                    # 语音回复在微信里显示成「tmpXXXX.wav」很难认，复制成带时间的中文名再发
+                    _ext = os.path.splitext(fpath)[1].lower()
+                    if _ext in (".wav", ".mp3", ".m4a", ".ogg"):
+                        try:
+                            import shutil
+                            import tempfile
+                            _nice = os.path.join(
+                                tempfile.gettempdir(),
+                                f"语音回复_{time.strftime('%m%d-%H%M%S')}{_ext}")
+                            shutil.copyfile(fpath, _nice)
+                            fpath = _nice
+                        except Exception as _e:
+                            log.debug(f"[OB11] 语音段改名失败（不影响投递）: {_e}")
+                try:
+                    async with _SEND_LOCK:
+                        ok = await asyncio.to_thread(state.sender_instance.send_file, contact, fpath)
+                    if ok:
+                        log.info(
+                            f"[OB11] 文件已发送至 {contact}: {os.path.basename(fpath)}"
+                            + ("（语音段按文件投递）" if seg_type == "record" else "")
+                        )
+                    else:
+                        log.warning(
+                            f"[OB11] ⚠ 文件未验证送达（已交重发队列，稍后自动补发）"
+                            f"{contact}: {os.path.basename(fpath)}"
+                        )
+                except NotImplementedError:
+                    log.error(f"[OB11] 当前发送后端不支持文件发送: {fpath}")
+                finally:
+                    # base64 解出来的临时文件用完删除；原路径（后端 output 目录）保留
+                    if fpath and "tmp" in fpath and file_val.startswith("base64://"):
+                        try:
+                            os.unlink(fpath)
+                        except Exception:
+                            pass
+
+            # 其他类型（video 等）忽略
+
+    elif action in ("upload_group_file", "upload_private_file"):
+        result = await _deliver_upload(params, is_group=(action == "upload_group_file"))
+        resp_data.update(result)
+
+    elif action == "get_group_root_files":
+        # 微信侧没有可枚举的「群文件」，插件只在上传异常时才用它核验，返回空列表即可。
+        resp_data["data"] = {"files": []}
+
+    elif action == "get_group_file_url":
+        resp_data["data"] = {"url": ""}
 
     else:
         log.debug(f"[OB11] 未处理 API: {action}")
 
-    # 注意：API 响应已在函数开头统一发送，此处不再重复
+    if defer:
+        if await _send_ob_response(resp_data):
+            log.info(f"[OB11] 已回响应（含投递结果）: {action} {resp_data.get('status')}")
+        else:
+            log.warning(f"[OB11] 无法回响应（WS 未连接）: {action}")
 
 
 def _extract_text(message: list) -> str:
@@ -348,6 +617,12 @@ async def flush_offline_events(ws=None) -> int:
     return sent
 
 
+
+def _normalize_image_for_wechat(path: str) -> str:
+    """兼容旧调用点：真正的实现在 imgutil（两条发送路径共用）。"""
+    from imgutil import normalize_image_for_wechat
+    return normalize_image_for_wechat(path)
+
 def _guess_image_suffix(data: bytes) -> str:
     """按魔数判断图片真实格式，用于给临时文件取正确后缀。
 
@@ -377,3 +652,68 @@ def _decode_base64_image(b64_data: str) -> str | None:
     tmp.write(img_data)
     tmp.close()
     return tmp.name
+
+
+def _guess_media_suffix(raw: bytes) -> str:
+    """按文件头猜扩展名：AstrBot 的 record 段只给 base64，没有文件名。"""
+    head = raw[:16]
+    if head[:3] == b"ID3" or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return ".mp3"
+    if head[:4] == b"fLaC":
+        return ".flac"
+    if head[:4] == b"RIFF" and raw[8:12] == b"WAVE":
+        return ".wav"
+    if head[:4] == b"OggS":
+        return ".ogg"
+    if head[:4] in (b"#!AM",) or head[:5] == b"#!AMR":
+        return ".amr"
+    if head[:2] == b"\x02#" or head[:4] == b"SILK":
+        return ".silk"
+    if head[:4] == b"\x89PNG":
+        return ".png"
+    if head[:2] == b"\xff\xd8":
+        return ".jpg"
+    return ".dat"
+
+
+def _resolve_local_file(file_val: str, name: str = "") -> str | None:
+    """把 OneBot 的 file 段（base64:// / file:// / 绝对路径 / 附件目录文件名）落成真实路径。
+
+    AstrBot 的 aiocqhttp 在私聊里发 File 时给的是本地绝对路径或 file://；群文件/临时
+    文件有时给 base64:// 或只有文件名。三种都接住，否则文件会被静默丢掉。
+    """
+    import tempfile
+
+    val = str(file_val or "").strip()
+    if not val:
+        return None
+    if val.startswith("base64://"):
+        try:
+            raw = base64.b64decode(val[9:])
+        except Exception as e:
+            log.warning(f"[OB11] 文件 base64 解码失败: {e}")
+            return None
+        suffix = os.path.splitext(name or "")[1] or _guess_media_suffix(raw)
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp.write(raw)
+        tmp.close()
+        return tmp.name
+    raw = val[7:] if val.startswith("file://") else val
+    # CQ 里常见的写法是 `file:///C:/x/y.mp3`（三个斜杠）：去掉 scheme 后是 `/C:/...`，
+    # 在 Windows 上直接判别失败。这里把「/盘符:/」还原成 `C:/`。
+    if len(raw) >= 3 and raw[0] == "/" and raw[1].isalpha() and raw[2] == ":":
+        raw = raw[1:]
+    if os.path.isabs(raw) and os.path.isfile(raw):
+        return raw
+    if os.path.isfile(raw):
+        return raw
+    # 附件目录兜底：name 为空时 join 出来的就是目录本身，会被 isfile 过滤掉，
+    # 不会再出现「把目录当文件去发」的怪异报错。
+    if config.ASTRBOT_ATTACHMENTS and name:
+        for cand in (
+            os.path.join(config.ASTRBOT_ATTACHMENTS, raw),
+            os.path.join(config.ASTRBOT_ATTACHMENTS, name),
+        ):
+            if os.path.isfile(cand):
+                return cand
+    return None

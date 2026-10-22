@@ -37,6 +37,14 @@ ROOT = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 from wmcp import Client  # noqa: E402
 
+try:  # 原生驱动（SendInput/BitBlt/剪贴板）。~30ms 一次，而 windows-mcp 一次输入要 ~0.5s
+    import winio  # noqa: E402
+except Exception:  # pragma: no cover - 没有 Pillow 等依赖时退回纯 MCP
+    winio = None
+
+# 人为在用键鼠时原生层抛出它；没有原生层时用一个永不抛出的类型占位，except 分支保持同形。
+HumanBusy = winio.HumanBusy if winio is not None else type("HumanBusy", (RuntimeError,), {})
+
 try:  # noqa: E402  - must match Windows-MCP's physical-pixel space
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
@@ -47,7 +55,11 @@ CONFIG_PATH = os.path.join(HERE, "wxui-config.json")
 
 def config():
     with open(CONFIG_PATH, encoding="utf-8") as fh:
-        return json.load(fh)
+        cfg = json.load(fh)
+    # 防双击参数随配置下发（winio 自己不知道配置文件在哪）：同点连点的最小间隔与位置容差。
+    if winio is not None:
+        winio.set_click_guard(cfg.get("double_click_guard_s"), cfg.get("double_click_slop_px"))
+    return cfg
 
 
 def token(cfg):
@@ -56,6 +68,20 @@ def token(cfg):
 
 
 def api(cfg, path, **params):
+    # 2026-10-22：WeFlow 的 /messages 偶发 500（会话列表/回读同时坏掉），
+    # 以前直接抛异常 → 重发队列把「其实已送达」判成失败 → 同一条消息刷屏 12 次。
+    # 这里给所有 GET 加 3 次重试，把瞬时 5xx/超时吸收掉。
+    _last = None
+    for _i in range(3):
+        try:
+            return _api_once(cfg, path, **params)
+        except Exception as _e:            # noqa: BLE001
+            _last = _e
+            time.sleep(0.35 + 0.3 * _i)
+    raise _last
+
+
+def _api_once(cfg, path, **params):
     params["access_token"] = token(cfg)
     url = cfg["weflow_base_url"] + path + "?" + urllib.parse.urlencode(params)
     with urllib.request.urlopen(url, timeout=20) as resp:
@@ -81,6 +107,7 @@ def find_window(cfg, title, fuzzy=False):
     """
     user32 = ctypes.windll.user32
     hits = []
+    hidden = []
     proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
     def visit(hwnd, _):
@@ -88,13 +115,34 @@ def find_window(cfg, title, fuzzy=False):
         cls = ctypes.create_unicode_buffer(512)
         user32.GetWindowTextW(hwnd, t, 512)
         user32.GetClassNameW(hwnd, cls, 512)
-        if cls.value.startswith(cfg["window_class_prefix"]) and user32.IsWindowVisible(hwnd):
-            if (name_match(title, t.value) > 0) if fuzzy else (t.value == title):
-                hits.append(hwnd)
+        if cls.value.startswith(cfg["window_class_prefix"]):
+            matched = (name_match(title, t.value) > 0) if fuzzy else (t.value == title)
+            if matched:
+                (hits if user32.IsWindowVisible(hwnd) else hidden).append(hwnd)
         return True
 
     user32.EnumWindows(proc(visit), 0)
-    return hits[0] if hits else None
+    if hits:
+        return hits[0]
+    # 2026-10-21: 微信被最小化到托盘后 Qt 主窗口变成「不可见但仍然存在」——
+    # wxui 因此报 "WeChat window not found"，发送在 90s 后超时、重发队列越积越多，
+    # 而用户只觉得自己关了窗口。这里把隐藏的主窗口恢复出来（只有窗口已存在才不会
+    # 拉起新实例），恢复后再确认它真的可见。
+    for hwnd in hidden:
+        try:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        except Exception:
+            continue
+        for _ in range(10):
+            if user32.IsWindowVisible(hwnd):
+                try:
+                    sys.stderr.write("[wxui] 微信窗口原本在托盘里，已自动恢复显示\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                return hwnd
+            time.sleep(0.15)
+    return None
 
 
 def device_class(hwnd):
@@ -122,15 +170,26 @@ def focus(hwnd):
     window is on top and the typed text goes to the wrong application.
     """
     user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
-    # 2026-10-16: 分段回复每条都要聚焦一次，而 ShowWindow + 0.45s 的等待只有「窗口不在前台
+    # 2026-10-16: 分段回复每条都要聚焦一次，而 ShowWindow + 长等待只有「窗口不在前台
     # 或已最小化」时才需要。已经在最前面就直接返回，省掉每条消息 0.45s。
+    # 2026-10-21: 而且那 0.45s 是**盲等**——SetForegroundWindow 通常几十毫秒就生效。
+    # 改成每 20ms 探一次前景窗口，一旦是目标就走，实测 focus 从 755ms 降到 ~30ms。
     if user32.GetForegroundWindow() == hwnd and not user32.IsIconic(hwnd):
         return True
-    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-    time.sleep(0.45)  # a window restored from minimized ignores clicks for a moment
+    if user32.IsIconic(hwnd) or not user32.IsWindowVisible(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+
+    def _wait_foreground(limit_s):
+        deadline = time.time() + limit_s
+        while time.time() < deadline:
+            if user32.GetForegroundWindow() == hwnd:
+                return True
+            time.sleep(0.02)
+        return user32.GetForegroundWindow() == hwnd
+
+    if _wait_foreground(0.5):
+        return True
     for _ in range(3):
-        if user32.GetForegroundWindow() == hwnd:
-            return True
         fg = user32.GetForegroundWindow()
         mine = kernel32.GetCurrentThreadId()
         theirs = user32.GetWindowThreadProcessId(fg, None)
@@ -140,7 +199,8 @@ def focus(hwnd):
             user32.SetForegroundWindow(hwnd)
         finally:
             user32.AttachThreadInput(mine, theirs, False)
-        time.sleep(0.3)
+        if _wait_foreground(0.45):
+            return True
     return user32.GetForegroundWindow() == hwnd
 
 
@@ -209,17 +269,29 @@ def clear_input(client, cfg, rect, focused_clean=False):
     if not cfg.get("clear_input_box", True) or not rect:
         return {"skipped": True}
     x, y = input_box_point(cfg, rect)
+    native = _native_on(cfg, "native_input")
     if focused_clean and cfg.get("input_fast_clear", True):
-        client.call("Shortcut", {"shortcut": "delete"})
+        if native:
+            winio.chord(winio.VK_BACK)
+        else:
+            client.call("Shortcut", {"shortcut": "delete"})
         time.sleep(0.05)
-        return {"x": x, "y": y, "fast": True}
+        return {"x": x, "y": y, "fast": True, "driver": "native" if native else "mcp"}
+    if native:
+        winio.click(x, y)
+        time.sleep(0.06)
+        winio.chord(winio.VK_CTRL, winio.VK_A)
+        time.sleep(0.04)
+        winio.chord(winio.VK_BACK)
+        time.sleep(0.05)
+        return {"x": x, "y": y, "driver": "native"}
     client.call("Click", {"loc": [x, y], "clicks": 1})
     time.sleep(0.15)
     client.call("Shortcut", {"shortcut": "ctrl+a"})
     time.sleep(0.08)
     client.call("Shortcut", {"shortcut": "delete"})
     time.sleep(0.12)
-    return {"x": x, "y": y}
+    return {"x": x, "y": y, "driver": "mcp"}
 
 
 def clamp_region(region, rect, margin=6):
@@ -306,10 +378,18 @@ def wait_for_session(client, cfg, plan, hwnd=None):
     started = time.time()
     deadline = started + float(cfg.get("session_wait_s", 60))
     reason = "WeChat window not found"
+    native = _native_on(cfg, "native_input")
     while True:
         hwnd = find_wechat(cfg) or hwnd
         if hwnd:
-            ctl, wait = control_state(client)
+            if native:
+                # 原生驱动下不看 windows-mcp 的 control latch：它的 user 状态被中断过的
+                # 自动化钉在 ~10s 不动（每次读都是 9.9/10.0），一旦信它就永远发不出去。
+                # 真正该让路的是「人现在正握着鼠标键盘」，这一条用 GetLastInputInfo 自己判，
+                # 而且会忽略我们自己投出去的合成事件（见 winio.human_busy）。
+                ctl, wait = ("user", 0.0) if winio.human_busy() else ("ready", 0.0)
+            else:
+                ctl, wait = control_state(client)
             if ctl not in (None, "ready", "ai"):
                 if ctl == "user" and wait >= 9.9:
                     # windows-mcp 的 control latch 被 _recover_after_rehook 钉死在 10 秒
@@ -337,18 +417,28 @@ def wait_for_session(client, cfg, plan, hwnd=None):
 
 
 def fit(text):
-    """Whitespace-insensitive comparison key (Windows OCR puts spaces in CJK)."""
-    return "".join((text or "").split()).lower()
+    """Whitespace-insensitive comparison key (Windows OCR puts spaces in CJK).
+
+    2026-10-22：这里以前直接 `(text or "").split()`，一旦调用方把**异常对象**当
+    文本传进来（`wxui.open_chat` 找「文件传输助手」时确实发生过），就会抛
+    `AttributeError: 'AttributeError' object has no attribute 'split'`，
+    把「定位失败」伪装成代码 bug。现在统一先转成 str。
+    """
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return "".join(text.split()).lower()
 
 
 # Windows OCR cannot read emoji and drops most symbols, and WeChat truncates a long name
-# in the sidebar — so a group named 示例群聊B comes back as "情VIP508" (or split
+# in the sidebar — so a group named ㊙️情🔞VIP💎508🉑👅🈲✈️ comes back as "情VIP508" (or split
 # over two lines). Comparing raw strings can therefore never match, whatever the remark is.
 _NAME_KEEP = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
 NAME_MATCH_CLEAR = 0.9         # one side contains the other: trust it like today's partial
 NAME_MATCH_MIN_RATIO = 0.7     # otherwise: this share of the shorter name, as one run
 NAME_MATCH_MIN_CHARS = 3       # ...and at least this many characters in a row
 NAME_MATCH_UNIQUE_MARGIN = 0.15  # a fuzzy winner must beat the runner-up by this much
+NAME_MATCH_LENIENT = 0.55       # 同长度+首字相同（OCR 形近替身，如 测试群→测讠羊）；
+                                # 低于 CLEAR，只供"唯一最佳"分支使用，闸门一概不认
 
 
 def name_key(text):
@@ -356,7 +446,7 @@ def name_key(text):
     return _NAME_KEEP.sub("", (text or "")).lower()
 
 
-# Windows OCR 最常见的数字/字母认错（示例群聊 → 「杏园6巧08」就是这样来的）。只用于
+# Windows OCR 最常见的数字/字母认错（杏园6-508 → 「杏园6巧08」就是这样来的）。只用于
 # 「整串折一折再比」这一步：两侧都折，所以像 Lisa 里的 l→1 不会单独造成误判；真正防错
 # 的是调用方要求「折完相等且全屏唯一」。
 _OCR_FOLD = str.maketrans({
@@ -404,10 +494,19 @@ def name_match(key, text):
     if a in b or b in a:
         return NAME_MATCH_CLEAR
     run = _longest_common_run(a, b)
-    if run < NAME_MATCH_MIN_CHARS:
-        return 0.0
-    ratio = run / float(min(len(a), len(b)))
-    return ratio if ratio >= NAME_MATCH_MIN_RATIO else 0.0
+    if run >= NAME_MATCH_MIN_CHARS:
+        ratio = run / float(min(len(a), len(b)))
+        if ratio >= NAME_MATCH_MIN_RATIO:
+            return ratio
+    # 2026-10-21：「测试群」在侧边栏和聊天标题里被 Windows OCR 稳定读成「测讠羊」
+    # （实测 1x/2x/3x/4x 放大结果一致，放大救不回来——所以只能改判定），只要有一个
+    # 字读错，exact/containment 就全废，于是明明在列表第二行也报
+    # "could not locate target row by OCR"。同长度 + 首字相同是这种"部首/形近替身"的
+    # 典型特征；但 0.55 远低于 NAME_MATCH_CLEAR，因此它**只能**通过需要"同一屏里唯一
+    # 最佳"的 fuzzy 分支（find_row / 标题复核）生效，凡是要求精确的闸门都不认它。
+    if len(a) == len(b) >= 2 and a[0] == b[0]:
+        return NAME_MATCH_LENIENT
+    return 0.0
 
 
 def name_matches_any(key, texts, allow_fuzzy=False):
@@ -433,7 +532,7 @@ def name_matches_any(key, texts, allow_fuzzy=False):
     return False
 
 
-# 2026-10-18（用户反馈：把「用户B」的备注改成「用户B别名」后，侧边栏 OCR 再也找不到那条
+# 2026-10-18（用户反馈：把「桃桃真可爱」的备注改成「陈铭坚」后，侧边栏 OCR 再也找不到那条
 # 会话，消息直接发不出去）：WeFlow 的 displayName 是旧名字，侧边栏显示的却是新备注，于是
 # 「用 API 名字找 UI 行」永远匹配不上。别名表让一条会话可以有几个合法拼写——手填在
 # wxui-config.json 的 contact_aliases 里，或由一次「WeFlow 回读确认成功」的发送自动学到
@@ -538,12 +637,16 @@ def preempted(err_text):
     It refuses *every* tool that way (Screenshot included) while its control latch says
     the human is driving, so the empty screenshot is not a screen problem at all.
     """
-    return CONTROL_PREEMPTED in (err_text or "").upper()
+    if not isinstance(err_text, str):
+        err_text = "" if err_text is None else str(err_text)
+    return CONTROL_PREEMPTED in err_text.upper()
 
 
 def _brief(text, limit=180):
     """One-line excerpt of a JSON-ish windows-mcp status blob, for logs and reasons."""
-    flat = " ".join((text or "").split())
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    flat = " ".join(text.split())
     return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
@@ -557,6 +660,18 @@ def shot(client, region, keep_dir, tries=2):
     tell "windows-mcp will not drive the desktop" apart from "OCR found nothing in it".
     """
     _SHOT_ERR[0] = ""
+    cfg_now = config()
+    if _native_on(cfg_now, "native_shots") and _foreground_is_wechat(cfg_now):
+        # 原生 BitBlt 抓屏：局部区域 ~30ms，而 windows-mcp 的 Screenshot 走 JSON-RPC + base64
+        # 要 ~240ms。抓不到就退回 MCP（例如区域越界、被最小化窗口挡住）。
+        # 前提是微信确实在最前面：抓屏拿到的是**屏幕像素**，被别的窗口盖住就会把别人的 UI 读成
+        # 微信的侧边栏/头部，然后点到别的窗口里去。
+        try:
+            os.makedirs(keep_dir, exist_ok=True)
+            path = os.path.join(keep_dir, "wxui-%d.png" % time.time())
+            return winio.grab(region, path)
+        except Exception as exc:
+            _SHOT_ERR[0] = "native grab failed: %s" % exc
     for attempt in range(tries):
         res = client.call("Screenshot", {"region": list(region)})
         for item in (res or {}).get("content") or []:
@@ -584,6 +699,77 @@ def shot_ex(client, region, keep_dir, tries=2):
     """
     png = shot(client, region, keep_dir, tries)
     return png, ("" if png else _SHOT_ERR[0])
+
+
+def _native_on(cfg, name, default=True):
+    """配置开关 + 原生模块是否可用。"""
+    return bool(cfg.get(name, default)) and winio is not None
+
+
+def _foreground_is_wechat(cfg):
+    """最前面的窗口是不是微信**主窗口**（原生抓屏只在这时可信）。
+
+    侧栏/头部的偏移量都是按主窗口布局量出来的；如果前台是「被弹出成独立窗口的某个会话」，
+    BitBlt 抓到的将是那个会话的像素，OCR 读出来的文字会被当成侧栏列表 → 点到别处去。
+    所以这里要求前台 hwnd 就是主窗口（`find_wechat`），而不是「任何 Qt 微信窗口」。
+    """
+    if winio is None:
+        return False
+    try:
+        hwnd, title, cls = winio.foreground_info()
+    except Exception:
+        return False
+    # 注意 `native_shot_class_prefix: null` 也要落到默认值：str(None) == "None" 会让每次
+    # 原生截图都被判「前台不是微信」，于是静默退回 windows-mcp（+240ms/张）。
+    prefix = str(cfg.get("native_shot_class_prefix") or "Qt51514QWindowIcon")
+    if prefix and not cls.startswith(prefix):
+        return False
+    if not title:
+        return False
+    if title == cfg["window_title"]:
+        return True
+    if not cfg.get("native_shot_require_main", True):
+        return True
+    main = find_wechat(cfg)  # 弹窗标题虽然是会话名，但只有主窗口才允许按侧栏偏移量抓屏
+    return bool(main) and int(hwnd) == int(main)
+
+
+def ui_click(client, cfg, point):
+    """点一下屏幕坐标：原生 SendInput 优先（~20ms），windows-mcp 兜底（~580ms）。
+
+    人为在用键鼠时原生层抛 HumanBusy，调用方按“桌面不归我们”处理，不跟人抢。
+    """
+    x, y = int(point[0]), int(point[1])
+    if _native_on(cfg, "native_input"):
+        winio.click(x, y)
+        return "native"
+    client.call("Click", {"loc": [x, y], "clicks": 1})
+    return "mcp"
+
+
+def ui_paste(client, cfg, point, text):
+    """在坐标处粘贴一段文字（原生：点 + 写剪贴板 + Ctrl+V，一次约 40ms）。"""
+    x, y = int(point[0]), int(point[1])
+    focus_wait = float(cfg.get("search_focus_wait_s", 0.35))
+    paste_wait = float(cfg.get("search_paste_wait_s", 0.7))
+    if _native_on(cfg, "native_input"):
+        winio.paste_text(x, y, text, focus_wait=focus_wait, paste_wait=paste_wait)
+        return "native"
+    client.call("Click", {"loc": [x, y], "clicks": 1})
+    time.sleep(focus_wait)
+    client.call("Clipboard", {"mode": "set", "text": text})
+    client.call("Shortcut", {"shortcut": "ctrl+v"})
+    time.sleep(paste_wait)
+    return "mcp"
+
+
+def ui_escape(client, cfg):
+    """按 Escape 收起搜索面板。"""
+    if _native_on(cfg, "native_input"):
+        winio.press_escape()
+        return "native"
+    client.call("Shortcut", {"shortcut": "escape"})
+    return "mcp"
 
 
 def image_size(path):
@@ -637,6 +823,252 @@ def header_names_target(key, texts):
     return scored[0] - runner_up >= NAME_MATCH_UNIQUE_MARGIN
 
 
+def _header_group_clean(text):
+    """去掉群标题尾巴上的成员数：「测试群（3）」→「测试群」。"""
+    return re.sub(r"\s*[（(]\s*\d+\s*[)）]\s*$", "", text or "").strip()
+
+
+def _char_dice(a, b):
+    """字符级 Dice 系数（按重数算交集）：容忍 OCR 多读/少读一个字。"""
+    if not a or not b:
+        return 0.0
+    from collections import Counter
+    inter = sum((Counter(a) & Counter(b)).values())
+    return 2.0 * inter / float(len(a) + len(b))
+
+
+def header_matches_surface(texts, surface, threshold=0.5):
+    """聊天标题的 OCR 与「刚才点的那一行」是不是同一个名字。
+
+    Windows OCR 对「测试群」这个短名很不稳定：侧边栏读成「测讠羊」，同一时刻聊天标题
+    又读成「测讠胡羊（3）」——两边都不等于目标名，但两边互相同源（字符重合 3/4）。所以
+    复核分两步：先按目标名/别名严格比，不中再退回「标题 ≈ 我点的这一行」，两者都过不了
+    才拒绝打字。这一条只在侧边栏已经用唯一最佳匹配选中该行之后才会用到，不会放宽发错人。
+    """
+    s = name_key(_header_group_clean(surface))
+    if not s:
+        return False
+    for t in (texts or []):
+        tt = name_key(_header_group_clean(t))
+        if not tt:
+            continue
+        if tt == s or s in tt or tt in s or _char_dice(tt, s) >= threshold:
+            return True
+    return False
+
+
+# 侧栏当前滚动位置（只记我们自己滚的唯一状态机）：`at_top` 为 True 表示「上一次滚动把列表
+# 带到了顶部」，下一次定位就不必再花 0.9s 回顶。人手滚过会由 human_busy 兜底重置。
+_SCROLL_POS = {"at_top": True, "ts": 0.0, "serial": 0}
+
+
+# 2026-10-21（用户反复实测「怎么还是点两次」）：一次 send() 可能重试多次，每次都走 open_chat
+# 又点一下侧栏同一行；名字 OCR 读不准的会话（「测试群」→「测讠羊」）靠名字永远复核不过，
+# 于是重试 = 再点一次鼠标，用户看到的就是「点两次」。这里记「刚给谁点过哪一行、点完头部
+# 长什么样」，同一目标在 row_click_dedup_s 秒内再次进入 open_chat 时不再点击。
+_CLICK_MEMO = {}
+
+
+def _note_click(target, point, header_texts=None, why=""):
+    """Record a row click (and log it) so repeated attempts cannot click twice."""
+    rec = {"point": (int(point[0]), int(point[1])), "ts": time.time(),
+           "header_texts": list(header_texts or [])}
+    _CLICK_MEMO[target] = rec
+    try:
+        log_dir = os.path.join(ROOT, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "wxui-clicks.log"), "a", encoding="utf-8") as fh:
+            fh.write("%s target=%s point=%s why=%s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), target, rec["point"], why or "-"))
+    except Exception:
+        pass
+    return rec
+
+def _pixel_rgb(png_path: str, x: int, y: int):
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            im = im.convert("RGB")
+            if 0 <= x < im.width and 0 <= y < im.height:
+                return im.getpixel((x, y))
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _row_selected(png_path: str, point, win_rect, offsets=(-110, -90, 70, 90)):
+    """侧栏这一行是不是「选中态」。
+
+    微信 4.x 的选中行是整行饱和绿底，比头部 OCR 稳得多：群里名字常被读成
+    「测 讠 胡 羊（3）」之类，名字比对必然失败，但绿底像素不会读错。
+    返回 True/False/None（None = 判断不了）。
+    """
+    if not png_path or not point or not win_rect:
+        return None
+    x = int(point[0]) - int(win_rect[0])
+    y = int(point[1]) - int(win_rect[1])
+    best = None
+    for dx in offsets:
+        rgb = _pixel_rgb(png_path, x + dx, y)
+        if rgb is None:
+            continue
+        r, g, b = rgb
+        score = g - max(r, b)
+        if best is None or score > best:
+            best = score
+    if best is None:
+        return None
+    return best >= 20
+
+
+
+def selected_row_text(cfg, rect):
+    """读出「侧栏里当前高亮选中的那一行」的名字（OCR 文本）。
+
+    为什么需要它：头部 OCR 对私聊短名并不可靠（「文件传输助手」常被拆开），于是
+    `header_looks_like` 的宽匹配会在**打开了别的会话**时误报「已经是目标」，
+    接着 mic/发送就点到错的会话上（2026-10-22 实测：目标 文件传输助手，实际停在
+    雾中人耍起，`open_chat` 却返回 `chat already on target`）。
+    侧栏绿底高亮是像素事实，用它复核头部判断，比再加名字规则稳。
+    """
+    left, top = rect[0], rect[1]
+    region = clamp_region(
+        [left + cfg["sidebar_capture_x_offset"], top + cfg["sidebar_capture_y_offset"],
+         left + cfg["sidebar_capture_x2_offset"], rect[3] - cfg["sidebar_capture_bottom_margin"]],
+        rect,
+    )
+    png = shot(None, region, os.path.join(ROOT, "logs", "wmcp"))
+    if not png:
+        return None
+    res = ocr_lines(_upscale_for_ocr(png, float(cfg.get("sidebar_ocr_scale", 2.0) or 1.0)))
+    if not res.get("ok"):
+        return None
+    size = image_size(png)
+    img_h = size[1] if size else (region[3] - region[1])
+    scale_y = (region[3] - region[1]) / float(img_h or 1)
+    for line in res.get("lines") or []:
+        box_h = max((w["y"] + w["h"] for w in line.get("words") or []), default=line["y"] + 18) - line["y"]
+        y = int(region[1] + (line["y"] + max(box_h, 18) / 2.0) * scale_y)
+        point = (int(region[0]) + 60, y)
+        if _row_selected(png, point, rect):
+            return {"text": line.get("text") or "", "y": y}
+    return None
+
+
+def _row_text_of(row):
+    """`selected_row_text` 返回 {"text","y"}；这里容忍直接传字符串的情况。"""
+    if isinstance(row, dict):
+        return row.get("text") or ""
+    return row or ""
+
+
+def _row_selected_live(cfg, rect, point):
+    """现拍一小条侧栏行判断选中态（不落大图，~30ms）。"""
+    if not point:
+        return None
+    try:
+        box = (int(point[0]) - 140, int(point[1]) - 14, int(point[0]) + 140, int(point[1]) + 14)
+        png = shot(None, box, os.path.join(ROOT, "logs", "wmcp"))
+        if not png:
+            return None
+        return _row_selected(png, point, rect)
+    except HumanBusy:
+        raise
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _note_scroll(notches, cfg):
+    if notches < 0:
+        _SCROLL_POS["at_top"] = False
+    elif notches > 0 and notches >= int(cfg.get("sidebar_reset_notches", 24) or 24) * 0.9:
+        _SCROLL_POS["at_top"] = True
+    _SCROLL_POS["ts"] = time.time()
+    _SCROLL_POS["serial"] += 1
+
+
+def _side_scroll(client, cfg, hover, notches, wait_s=None):
+    """滚侧栏：原生滚轮优先（一格 ~12ms），windows-mcp 的 Scroll 兜底（一次 4.6s）。
+
+    2026-10-21：旧路径「滚 12 次到顶 + 每页一次 Scroll」全靠 MCP，一次 4.5s，于是一次定位
+    要几十秒。SendInput 的 WHEEL 事件把同样的动作压到几十毫秒，翻页才可能进 2 秒预算。
+    `notches` 正数向上、负数向下。
+    """
+    notches = int(notches)
+    if notches == 0:
+        return "noop"
+    if _native_on(cfg, "native_input") and cfg.get("sidebar_native_wheel", True):
+        winio.wheel(notches, hover[0], hover[1])
+        time.sleep(float(cfg.get("sidebar_wheel_wait_s", 0.15) if wait_s is None else wait_s))
+        _note_scroll(notches, cfg)
+        return "native"
+    direction = "up" if notches > 0 else "down"
+    client.call("Move", {"loc": hover})
+    client.call("Scroll", {"loc": hover, "type": "vertical", "direction": direction,
+                           "wheel_times": abs(notches)})
+    time.sleep(float(cfg.get("sidebar_scroll_wait_s", 0.5) if wait_s is None else wait_s))
+    return "mcp"
+
+
+_PINNED_COLLAPSE_HINTS = ("折叠置顶", "展开置顶", "折叠的置顶", "查看更多", "查看全部")
+
+
+def _expand_pinned_section(client, cfg, rect):
+    """点开微信侧栏的「折叠置顶聊天」，让被折进去的置顶会话重新可见。
+
+    2026-10-22：置顶会话一多，微信会把整段折成一行「折叠置顶聊天 N 个」，
+    里面的会话（实测「文件传输助手」）在侧栏 OCR 里根本不存在，于是
+    open_chat 永远报 `could not locate target row by OCR`。这里先找这一行，
+    点一下展开，再让 find_row 重新扫一遍。
+    """
+    hwnd = find_wechat(cfg)
+    if not hwnd:
+        return False
+    r = restored_rect(hwnd)
+    if not rect_usable(r):
+        return False
+    left, top, right, bottom = r
+    region = clamp_region(
+        [left + cfg["sidebar_capture_x_offset"], top + cfg["sidebar_capture_y_offset"],
+         left + cfg["sidebar_capture_x2_offset"], bottom - cfg["sidebar_capture_bottom_margin"]],
+        r,
+    )
+    png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp"))
+    if not png:
+        log.info("[wxui] 展开置顶失败：截图拿不到（%s）", _brief(err))
+        return False
+    scale_up = float(cfg.get("sidebar_ocr_scale", 2.0) or 1.0)
+    ocr_png = _upscale_for_ocr(png, scale_up) if scale_up > 1.0 else png
+    size = image_size(ocr_png)
+    res = ocr_lines(ocr_png)
+    if not res.get("ok"):
+        return False
+    img_w, img_h = size if size else (region[2] - region[0], region[3] - region[1])
+    scale_y = (region[3] - region[1]) / float(img_h)
+    scale_x = (region[2] - region[0]) / float(img_w)
+    for line in res.get("lines") or []:
+        text = fit(line.get("text") or "")
+        if not text or not any(hint in text for hint in _PINNED_COLLAPSE_HINTS):
+            continue
+        box_h = max((w["y"] + w["h"] for w in (line.get("words") or [])),
+                    default=line.get("y", 0) + 18) - line.get("y", 0)
+        y_phys = region[1] + (line.get("y", 0) + max(box_h, 18) / 2.0) * scale_y
+        x_phys = region[0] + (line.get("x", 0) + 40) * scale_x
+        try:
+            ui_click(client, cfg, (int(x_phys), int(y_phys)))
+        except HumanBusy:
+            raise
+        except Exception as exc:                   # noqa: BLE001
+            log.info("[wxui] 展开置顶点不动：%s", _brief(exc))
+            return False
+        time.sleep(0.45)
+        _SCROLL_POS["at_top"] = True
+        _SCROLL_POS["ts"] = time.time()
+        log.info("[wxui] 🔓 已展开「%s」，重新扫描侧栏", line.get("text"))
+        return True
+    return False
+
+
 def find_row(client, cfg, rect, target):
     """Click point of `target`'s sidebar row, located by OCR. Returns ((x, y), debug).
 
@@ -661,43 +1093,269 @@ def find_row(client, cfg, rect, target):
     wait_s = float(cfg.get("sidebar_scroll_wait_s", 0.5))
     hover = [int(region[0] + 40), int((region[1] + region[3]) // 2)]
     debug: dict = {}
+    t_start = time.monotonic()
+    timing: dict = {}
+    # 先看当前视口：绝大多数发送是发给「最近聊过」的人，他们就停在列表顶部，直接认出来
+    # 只要一次 OCR（~0.6s）；先回顶部反而每次都多花 0.3~0.6s 的滚动。
+    at_top = bool(_SCROLL_POS["at_top"]) and (time.time() - _SCROLL_POS["ts"]) < 120
+    skip_page0 = False
+    if cfg.get("sidebar_scan_before_reset", True):
+        point, seen_dbg = _scan_sidebar(client, cfg, region, top, target)
+        timing["viewport_scan"] = int((time.monotonic() - t_start) * 1000)
+        if point:
+            seen_dbg["scanned_where"] = "current viewport"
+            seen_dbg["ms"] = timing
+            return point, seen_dbg
+        # 侧栏本来就在顶部时，下面的「回顶」是空操作，page0 扫的就是刚扫过的同一帧：
+        # 只要上一帧 OCR 正常读到了几行，就别再花 ~0.2s 重复 OCR 一次。
+        rows_seen = [c for c in (seen_dbg.get("candidates") or []) if c.get("text")]
+        skip_page0 = at_top and len(rows_seen) >= 5
+    # 侧边栏可能停在任意位置（上一次失败、重发队列的若干轮、或人手动滚过）：
+    # 直接在当前视口 OCR 就永远看不到列表顶部的会话（典型症状：新群/刚建的群
+    # 明明在第一屏却报 "could not locate target row by OCR"）。所以每次定位都
+    # 先滚回顶部，让扫描永远从同一个已知位置开始。原生滚轮下一趟到顶只要几十毫秒。
+    if cfg.get("sidebar_reset_to_top", True) and not at_top:
+        try:
+            top_ok, chunks = _scroll_to_top(client, cfg, region, hover,
+                                            os.path.join(ROOT, "logs", "wmcp"))
+            debug["reset_driver"] = "wheel-chunks"
+            debug["reset_chunks"] = chunks
+            debug["reset_at_top"] = top_ok
+            if not top_ok:
+                debug["reset_warn"] = "list may not have reached the top"
+        except HumanBusy:
+            raise
+        except Exception as exc:  # 滚不动就算了，扫描本身还会给出诊断
+            debug["reset_driver"] = "failed: %s" % (_brief(exc),)
+        timing["reset"] = int((time.monotonic() - t_start) * 1000)
+    else:
+        timing["reset"] = 0
+    prev_top = None
+    prev_frame_md5 = None
+    page_ms = []
     for page in range(pages):
-        point, debug = _scan_sidebar(client, cfg, region, top, target)
+        t_page = time.monotonic()
+        if page == 0 and skip_page0:
+            point, debug = None, (seen_dbg or {})
+            timing["page0_scan"] = 0
+            debug["page0_skipped"] = "same viewport as the scan above"
+        else:
+            point, debug = _scan_sidebar(client, cfg, region, top, target)
+            timing["page%d_scan" % page] = int((time.monotonic() - t_page) * 1000)
+        if not point and not (page == 0 and skip_page0) and \
+                float(cfg.get("sidebar_ocr_scale", 2.0) or 1.0) < 3.0:
+            # 这一屏还认不出来：再放大一档重扫一次（小字短名读错时通常这一步就成）。
+            # 准确性优先：翻页后的每一屏也做同样的放大重试，命中率不够就会漏会话。
+            bigger = dict(cfg)
+            bigger["sidebar_ocr_scale"] = 3.0
+            point, debug = _scan_sidebar(client, bigger, region, top, target)
+            debug["retry_scale"] = 3.0
         if point:
             if page:
                 debug["scrolled_pages"] = page
+            debug["ms"] = timing
             return point, debug
         if page + 1 >= pages:
             break
+        # 已经滚到底：最后一行不再变化时继续滚只是白花时间，还会把列表
+        # 留在奇怪的位置，让下一次定位又从中间开始。
+        rows = sorted((c for c in (debug.get("candidates") or []) if c.get("text")),
+                      key=lambda c: c["y"])
+        top_text = fit(rows[0]["text"]) if rows else None
+        if top_text and prev_top and top_text == prev_top:
+            debug["list_bottom"] = True
+            break
+        prev_top = top_text
         # 目标行在可视区之外：把鼠标移到侧边栏上，再滚一屏重新 OCR。
-        client.call("Move", {"loc": hover})
-        client.call("Scroll", {"loc": hover, "type": "vertical",
-                               "direction": "down", "wheel_times": wheel_times})
-        time.sleep(wait_s)
+        _side_scroll(client, cfg, hover, -wheel_times)
+        page_png, page_md5, page_changed = _settled_frame(
+            client, cfg, region, os.path.join(ROOT, "logs", "wmcp"), prev_frame_md5,
+            timeout=float(cfg.get("sidebar_settle_timeout_s", 0.25) or 0.25))
+        prev_frame_md5 = page_md5
+        if page_png and not page_changed:
+            # 画面和上一页完全一样：列表已经到底，再翻也没有新行，直接收工。
+            debug["list_bottom"] = True
+            break
+        if page_png:
+            point, debug = _scan_sidebar(client, cfg, region, top, target, page_png)
+            timing["page%d_scan" % (page + 1)] = int((time.monotonic() - t_page) * 1000)
+            if point:
+                debug["scrolled_pages"] = page + 1
+                debug["ms"] = timing
+                return point, debug
     if pages > 1:
         # 没找到也把列表滚回顶部，下一次探测不必从中间开始。
         try:
-            client.call("Move", {"loc": hover})
-            for _ in range(pages - 1):
-                client.call("Scroll", {"loc": hover, "type": "vertical",
-                                       "direction": "up", "wheel_times": wheel_times})
-                time.sleep(0.15)
+            _scroll_to_top(client, cfg, region, hover, os.path.join(ROOT, "logs", "wmcp"))
         except Exception:
             pass
-        client.call("Move", {"loc": hover})
+    # 第二遍：上面那次「滚到底 + 逐页 OCR」偶尔会踩到微信的滚动动画（一帧抓早/抓晚，
+    # 结果整页都对不上），失败前再从列表顶部完整确认一次，避免把「其实在列表里」的会话
+    # 判成找不到（群发失败会把消息塞进重发队列，代价远高于一次 0.4s 的复扫）。
+    if pages > 1 and cfg.get("locate_second_pass", True):
+        timing["second_pass"] = True
+        for page2 in range(pages):
+            point2, dbg2 = _scan_sidebar(client, cfg, region, top, target)
+            if point2:
+                dbg2["ms"] = timing
+                dbg2["scanned_where"] = "second pass"
+                if page2:
+                    dbg2["scrolled_pages"] = page2
+                return point2, dbg2
+            if page2 + 1 >= pages:
+                break
+            _side_scroll(client, cfg, hover, -wheel_times)
+        debug["second_pass_failed"] = True
+        try:
+            _scroll_to_top(client, cfg, region, hover, os.path.join(ROOT, "logs", "wmcp"))
+        except Exception:
+            pass
     debug["scrolled_pages"] = pages
+    debug["ms"] = timing
     return None, debug
 
 
-def _scan_sidebar(client, cfg, region, top, target):
-    """One OCR pass over the visible sidebar; ((x, y), debug) or (None, debug)."""
-    png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp"))
+def _upscale_for_ocr(png, scale):
+    """把侧边栏截图放大后再 OCR。
+
+    微信会话名是 12px 左右的小字，Windows OCR 对「测试群」这种短名会读成
+    「是测讠羊」——只要有一个字读错，整行匹配（exact/partial）就全废，于是明明
+    在第一屏也报 "could not locate target row by OCR"。放大 2 倍基本能救回来，
+    而坐标映射本来就用截图尺寸换算，放大不影响落点。
+    """
+    try:
+        from PIL import Image as _Image
+        with _Image.open(png) as im:
+            big = im.convert("RGB").resize(
+                (int(im.width * scale), int(im.height * scale)), _Image.LANCZOS)
+            out = os.path.splitext(png)[0] + "@%gx.png" % scale
+            big.save(out)
+        return out
+    except Exception:
+        return png
+
+
+_FRAME_GRID = (120, 240)  # 侧栏缩略图的宽高，用来比较「画面有没有动」
+_FRAME_DIFF_TOL = 0.004     # 允许 0.4% 的格子有差异：静止画面里仍有 1 级灰度的抖动
+
+
+def _frame_vec(png):
+    """把一帧缩成灰度缩略向量，用于判断侧栏画面有没有变化。
+
+    2026-10-22：原来是比文件 md5，实测同一静止画面连续 10 帧：最大级差 1、平均差 0.001、
+    差异超过 16 级的像素占 0.0000% —— 像素几乎完全相同，md5 却每帧都变，于是
+    `_sidebar_stable` 每次都等满 timeout 返回 False，回顶/翻页/点击前各白花 0.45s。
+    改成「缩略图 + 容差比较」：只有真正滚动（整页文字换位）才算变。
+    """
+    try:
+        from PIL import Image
+        with Image.open(png) as im:
+            return im.convert("L").resize(_FRAME_GRID).tobytes()
+    except Exception:
+        return None
+
+
+def _frames_same(a, b):
+    """两帧是否算同一画面（容忍静止画面里的 1 级灰度抖动）。"""
+    if not a or not b or len(a) != len(b):
+        return False
+    diff = 0
+    limit = int(len(a) * _FRAME_DIFF_TOL)
+    for i in range(len(a)):
+        if abs(a[i] - b[i]) > 8:
+            diff += 1
+            if diff > limit:
+                return False
+    return True
+
+
+def _scroll_to_top(client, cfg, region, hover, keep_dir, chunk=None, max_chunks=4):
+    """把会话列表滚到顶部，并返回 (是否到顶, 用了几趟)。
+
+    「滚固定格数」在列表长短/惯性不同的机器上不可靠：格数不够就停在中间，随后 page 扫描
+    从中间往下翻，比它更靠上的会话永远看不到 —— 表现为偶发「找不到目标」或退化成第二遍
+    全量扫描（实测 3.1s / 5.2s）。这里改成「滚一趟看画面还变不变」：不变就是到顶了。
+    """
+    chunk = int(chunk if chunk is not None else cfg.get("sidebar_reset_chunk_notches", 12))
+    prev = None
+    for i in range(max_chunks):
+        _side_scroll(client, cfg, hover, chunk)
+        png = shot(client, region, keep_dir, tries=1)
+        if not png:
+            return False, i
+        vec = _frame_vec(png)
+        if prev is not None and _frames_same(vec, prev):
+            return True, i + 1
+        prev = vec
+    return False, max_chunks
+
+
+def _sidebar_stable(client, cfg, region, keep_dir, timeout=0.45, step=0.05):
+    """侧栏是否已经停下来（连拍两帧像素一致）。
+
+    2026-10-21：点开一个会话时微信会把那一行往列表顶部做滚动动画。动画中间截的那一帧里，
+    别人的行位置还没定，OCR 读出来的 y 是过渡位置 —— 点下去就落到相邻一行（实测点「雾中人
+    耍起」打开了「文件传输助手」），头部复核失败，消息被塞进重发队列。滚完再截一次即可，
+    不必靠“补点一次”那种会乱动鼠标的补救。
+    """
+    prev = None
+    deadline = time.monotonic() + timeout
+    while True:
+        png = shot(client, region, keep_dir, tries=1)
+        if not png:
+            return False
+        cur = _frame_vec(png)
+        if cur is None:
+            return False
+        if prev is not None and _frames_same(cur, prev):
+            return True
+        prev = cur
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(step)
+
+
+def _settled_frame(client, cfg, region, keep_dir, prev_md5, timeout=0.25, step=0.04):
+    """滚一屏之后，返回「画面已经和上一页不同」的那一帧及其 md5。
+
+    原来是滚完先调 `_sidebar_stable` 连拍两帧验稳定，再截第三帧去 OCR —— 每页三次截图。
+    这里只截一帧：和上一页像素一致就说明列表还没动（动画起步/滚轮没吃到），隔 40ms 再截；
+    一旦不同就已经滚到位，这一帧直接拿去 OCR。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        png = shot(client, region, keep_dir, tries=1)
+        if not png:
+            return None, None, False
+        md5 = _frame_vec(png)
+        if prev_md5 is None or not _frames_same(md5, prev_md5):
+            return png, md5, True
+        if time.monotonic() >= deadline:
+            # 画面等满 timeout 还没变：多半已经滚到底了（再滚也没有新内容）。
+            return png, md5, False
+        time.sleep(step)
+
+
+def _scan_sidebar(client, cfg, region, top, target, png_path=None):
+    """One OCR pass over the visible sidebar; ((x, y), debug) or (None, debug).
+
+    `png_path` lets the caller hand in a frame it already grabbed while waiting for the
+    list to settle — one screenshot per page instead of two.
+    """
+    if png_path:
+        png, err = png_path, None
+    else:
+        png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp"))
     if not png:
         return None, {"error": "no image from Screenshot (%s)" % (_brief(err) or "region off screen?"),
                       "region": [int(v) for v in region],
                       "control_preempted": bool(preempted(err))}
-    size = image_size(png)
-    res = ocr_lines(png)
+    ocr_png = png
+    scale_up = float(cfg.get("sidebar_ocr_scale", 2.0) or 1.0)
+    if scale_up > 1.0:
+        ocr_png = _upscale_for_ocr(png, scale_up)
+    size = image_size(ocr_png)
+    res = ocr_lines(ocr_png)
     if not res.get("ok"):
         return None, {"error": "ocr failed", "region": [int(v) for v in region], "detail": res}
     img_w, img_h = size if size else (region[2] - region[0], region[3] - region[1])
@@ -706,7 +1364,7 @@ def _scan_sidebar(client, cfg, region, top, target):
     key = fit(target)
     # A renamed chat keeps its old API name, so an alias is accepted — but only as a
     # whole-line match: a partial hit on an alias would also match a *preview* line such
-    # as "用户B别名：嗯" inside a group row, and clicking that opens the wrong chat.
+    # as "陈铭坚：嗯" inside a group row, and clicking that opens the wrong chat.
     keys = target_keys(cfg, target)
     exact_keys = {fit(k) for k in keys}
     candidates = []
@@ -725,10 +1383,16 @@ def _scan_sidebar(client, cfg, region, top, target):
                            "fold": ocr_fold(line["text"]) == ocr_fold(target),
                            "score": round(name_match(target, line["text"]), 3)})
     exact = [c for c in candidates if c["exact"]]
-    partial = [c for c in candidates if c["partial"]]
+    # 2026-10-22 事故：目标「天文学家」在列表里已被删掉，但群「杏园6-508」的预览行是
+    # 「天文学家：我猜又断电了」，partial 命中它就去点那一行 → 打开错的会话，
+    # 头部复核失败后白白多一轮。预览行（带冒号）永远不是会话名，partial 里也剔掉。
+    partial = [c for c in candidates if c["partial"]
+               and not any(ch in c["text"] for ch in "：:")]
+
     pick = (exact or partial)
     fuzzy = False
     folded = False
+    lenient = False
     if not pick:
         # OCR 把 508 读成「巧08」这类：整串折一折再比。必须全屏唯一，否则宁可继续找。
         fold_hits = [c for c in candidates if c["fold"]]
@@ -737,21 +1401,27 @@ def _scan_sidebar(client, cfg, region, top, target):
     if not pick:
         # Emoji-laden or truncated names never satisfy exact/partial, so fall back to a
         # similarity match — but only when one row is clearly the best candidate, since a
-        # wrong pick would click the wrong chat.
-        scored = sorted((c for c in candidates if c["score"] > 0),
+        # wrong pick would click the wrong chat. 带冒号的是「某某：最后一句」预览行，永远
+        # 不是会话名，先剔掉（同长度首字相同的宽匹配最容易误吃这种行）。
+        scored = sorted((c for c in candidates
+                         if c["score"] > 0 and not any(ch in c["text"] for ch in "：:")
+                         and 2 <= len(fit(c["text"])) <= 24),
                         key=lambda c: (-c["score"], c["y"]))
         if scored:
             runner_up = scored[1]["score"] if len(scored) > 1 else 0.0
             if scored[0]["score"] - runner_up >= NAME_MATCH_UNIQUE_MARGIN:
                 pick, fuzzy = [scored[0]], True
+                if scored[0]["score"] < NAME_MATCH_CLEAR:
+                    lenient = True
     debug = {"png": png, "engine": res.get("engine"), "candidates": candidates[:40],
-             "key": key, "keys": [fit(k) for k in keys], "fuzzy": fuzzy, "folded": folded}
+             "key": key, "keys": [fit(k) for k in keys], "fuzzy": fuzzy, "folded": folded,
+             "lenient": lenient}
     if not pick:
         return None, debug
     pick.sort(key=lambda c: (not c["exact"], c["y"]))
     best = pick[0]
     debug["picked"] = {"text": best["text"], "score": best.get("score"), "fuzzy": fuzzy,
-                       "folded": folded, "alias": fit(best["text"]) != key}
+                       "folded": folded, "lenient": lenient, "alias": fit(best["text"]) != key}
     # Click on the matched name box, not a fixed offset from the window edge: after a
     # resize (or a different display scale) a fixed x can land in the chat pane, and a
     # fixed y can land on the row above. Small biases keep the point off the box border.
@@ -824,8 +1494,13 @@ def norm(text):
                   "", (text or "")).lower()
 
 
-def verify(cfg, talker, text, deadline, since_local_id=0):
-    """The outgoing text message read back from WeChat's DB, or None."""
+def verify(cfg, talker, text, deadline, since_local_id=0, since_time=None):
+    """The outgoing text message read back from WeChat's DB, or None.
+
+    since_time (epoch 秒) 是兜底：WeFlow 的 localId 偶尔不严格递增，或者同一条
+    长文本被拆成两条落库，只看 localId 会把「其实已经送到」判成没送到，然后无限重发
+    （2026-10-22 实测同一条消息重发 8 次）。所以 localId 不够新时再比 createTime。
+    """
     key = norm(text)
     if not key:
         return None
@@ -834,9 +1509,17 @@ def verify(cfg, talker, text, deadline, since_local_id=0):
         for m in reversed(msgs):
             if m.get("isSend") != 1:
                 continue
+            if since_time and (m.get("createTime") or 0) < since_time:
+                continue
             if since_local_id and (m.get("localId") or 0) <= since_local_id:
                 continue
-            if key in norm(m.get("content")):
+            body = norm(m.get("content"))
+            if key in body:
+                return m
+            # 2026-10-22：带 emoji 的长文本（例如插件发的「…已发送。\n\n📊 本次配置…」）
+            # 落库时 emoji 的变体选择符常被微信改写，整串 norm 之后就对不上了，于是
+            # 「明明已经送达」被反复判成失败、消息被重发好几次。退化到「前 40 字一致」。
+            if len(key) >= 16 and key[:40] in body:
                 return m
         # 2026-10-16: 回读轮询间隔可配（默认 1.0s）。分段发送时每条消息都要等一轮回读，
         # 0.6s 的轮询让「消息已到库」的平均等待少 0.2~0.4s，而回读是只读的、代价极低。
@@ -900,15 +1583,28 @@ def classify_outgoing(m, expect_name=None, expect_md5=None):
     return "file"
 
 
-def verify_image(cfg, talker, deadline, since_local_id, expect_name=None, expect_md5=None):
-    """A new outgoing image/emoji/file message read back from WeChat's DB, or None."""
+def verify_image(cfg, talker, deadline, since_local_id, expect_name=None, expect_md5=None,
+                 since_time=None):
+    """A new outgoing image/emoji/file message read back from WeChat's DB, or None.
+
+    since_time 与 verify() 同理：文件卡片落库用的常是哈希名 / 显示名，只看 localId
+    或文件名会把已送达判成失败。带 since_time 时额外接受「同一时间窗内、扩展名一致」
+    的出站文件消息。
+    """
+    ext = os.path.splitext(str(expect_name or ""))[1].lower()
     while time.time() < deadline:
         msgs = api(cfg, "/api/v1/messages", talker=talker, limit=10).get("messages", [])
         for m in reversed(msgs):
+            fresh = True
             if since_local_id and (m.get("localId") or 0) <= since_local_id:
+                fresh = bool(since_time and (m.get("createTime") or 0) >= since_time)
+            if not fresh:
                 continue
             if classify_outgoing(m, expect_name, expect_md5):
                 return m
+            if since_time and ext and (m.get("createTime") or 0) >= since_time:
+                if m.get("isSend") == 1 and ext in (m.get("content") or "").lower():
+                    return m
         time.sleep(1.0)
     return None
 
@@ -974,11 +1670,35 @@ def chat_header_matches(client, cfg, rect, target):
     png = shot(client, region, os.path.join(ROOT, "logs", "wmcp"))
     if not png:
         return False, {"error": "no header image"}
-    res = ocr_lines(png)
-    texts = [ln["text"] for ln in res.get("lines", [])] if res.get("ok") else []
+    # 2026-10-21 实测：Windows OCR 对同一行字并不稳定，而且**放大不一定更好**——
+    # 「陈奥琦」1x 返回空、2x 才读得出来；「严正阳」1x 读得对、2x 反而变空。所以这里按
+    # 档位依次试，取第一个非空的：空结果绝不能被当成“不是目标”（那会把明明已经打开的会话
+    # 判失败、还多挨一次点击）。三档都空才补抓新帧。
+    scales = [float(s) for s in (cfg.get("header_ocr_scales") or [1.0, 2.0, 3.0])]
+    retries = max(1, int(cfg.get("header_empty_retries", 3)))
+    wait_s = float(cfg.get("header_empty_wait_s", 0.22))
+    tries = 0
+    texts = []
+    res = {}
+    while tries < retries:
+        for scale in scales:
+            ocr_png = _upscale_for_ocr(png, scale) if scale > 1.0 else png
+            res = ocr_lines(ocr_png)
+            texts = [ln["text"] for ln in res.get("lines", [])] if res.get("ok") else []
+            if texts:
+                break
+        tries += 1
+        if texts:
+            break
+        time.sleep(wait_s)
+        new_png = shot(client, region, os.path.join(ROOT, "logs", "wmcp"))
+        if not new_png:
+            break
+        png = new_png
     key = fit(target)
     matched = header_names_target(target_keys(cfg, target), texts)
-    return matched, {"png": png, "texts": texts[:6], "key": key, "matched": matched}
+    return matched, {"png": png, "texts": texts[:6], "key": key, "matched": matched,
+                     "ocr_tries": tries}
 
 
 # 2026-10-16（用户要求：分段回复不要每次重新验证窗口位置和名字）：
@@ -1086,6 +1806,290 @@ def _chat_ready_to_type(cfg, plan, target):
     return True
 
 
+_SEARCH_BLOCKED_SECTIONS = ("公众号", "文章", "视频号", "小程序", "朋友圈", "搜一搜", "网络结果")
+# 搜索面板里会出现的分区标题（用来判断「当前这一行的归属」）。顺序不敏感，按 OCR 文本包含判定。
+_SEARCH_SECTION_WORDS = ("聊天记录", "搜索网络结果", "公众号", "文章", "视频号", "小程序",
+                         "朋友圈", "搜一搜", "联系人", "群聊", "功能")
+
+
+def _strip_icon_noise(text):
+    """去掉搜索行前面被 OCR 当成文字的图标噪声（「0 文件传输助手」「．测试群」「八…」）。
+
+    只剥掉开头 1~3 个「不像名字开头」的字符：数字/标点/单个字母，且剥完还剩至少 2 个字。
+    目标本身以数字开头的会话（如「12306」）不受影响 —— 剥完对不上目标名时调用方也不会采纳。
+    """
+    t = (text or "").strip()
+    for _ in range(3):
+        if len(t) < 3:
+            break
+        head = t[0]
+        if head.isdigit() or not (head.isalpha() and "\u4e00" <= head <= "\u9fff"):
+            stripped = t[1:].lstrip()
+            if len(stripped) >= 2:
+                t = stripped
+                continue
+        break
+    return t
+
+
+def _collapse_repeats(text):
+    """把 OCR 把同一行文字重复读出的结果压回一份（群聊结果行特别容易这样）。
+
+    实测：「雾中人耍起」的搜索结果行被读成
+        `雾中人耍起雾中人耍起雾中人耍起雾中，`
+    —— 行里既有群名又有成员名/标签，Windows OCR 把几段拼成一串重复文字，长度远超名字，
+    精确比对和 2..24 长度过滤都过不去，长名字群因此永远找不到。这里检测「整串是某个前缀
+    的重复（末尾允许截断）」并只留一份前缀。
+    """
+    t = (text or "").replace(" ", "")
+    n = len(t)
+    for p in range(2, n // 2 + 1):
+        if (t[:p] * ((n + p - 1) // p))[:n] == t:
+            return t[:p]
+    return t
+
+
+def _search_result_pick(client, cfg, rect, target):
+    """OCR 微信搜索面板，返回「确实叫这个名字」的结果行坐标和诊断。
+
+    搜索面板里除了会话还列出公众号、文章、视频号……用户实测过：直接按 Enter 会选中默认
+    高亮的第一条，那条可能是个公众号（消息就此发进公众号会话）。所以这里先 OCR 结果列表，
+    跳过「公众号/文章/…」分区下的行，只在名字能对上目标时才返回坐标；调用方点完仍要由
+    聊天头部 OCR 复核。
+    """
+    left, top, right, bottom = rect
+    region = [left + int(cfg.get("sidebar_capture_x_offset", 90)),
+              top + int(cfg.get("search_results_y_offset_px", 100)),
+              left + int(cfg.get("sidebar_capture_x2_offset", 560)),
+              bottom - int(cfg.get("sidebar_capture_bottom_margin", 30))]
+    png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp"))
+    dbg = {"png": png, "region": [int(v) for v in region]}
+    if not png:
+        dbg["error"] = "no image from Screenshot (%s)" % (_brief(err) or "region off screen?")
+        return None, dbg
+    ocr_png = png
+    scale_up = float(cfg.get("sidebar_ocr_scale", 2.0) or 1.0)
+    if scale_up > 1.0:
+        ocr_png = _upscale_for_ocr(png, scale_up)
+    size = image_size(ocr_png)
+    res = ocr_lines(ocr_png)
+    if not res.get("ok"):
+        dbg["error"] = "ocr failed"
+        return None, dbg
+    img_w, img_h = size if size else (region[2] - region[0], region[3] - region[1])
+    scale_y = (region[3] - region[1]) / float(img_h)
+    scale_x = (region[2] - region[0]) / float(img_w)
+    keys = [k for k in target_keys(cfg, target) if k]
+    lines = []
+    for line in res["lines"]:
+        text = fit(line["text"])
+        if not text:
+            continue
+        box_h = max((w["y"] + w["h"] for w in line["words"]), default=line["y"] + 18) - line["y"]
+        lines.append({"text": text, "raw": line["text"],
+                      "x": int(region[0] + line["x"] * scale_x),
+                      "y": int(region[1] + (line["y"] + max(box_h, 18) / 2.0) * scale_y)})
+    lines.sort(key=lambda c: c["y"])
+    dbg["lines"] = [c["raw"] for c in lines][:30]
+    target_fold = ocr_fold(target)
+    # 2026-10-21 实测的面板结构（从上到下）：
+    #   ①第一条就是命中的会话（头像被读成「0」「．」「八」这类噪声前缀）
+    #   ②「聊天记录」分区（同名会话的消息预览）
+    #   ③「搜索网络结果」分区（一堆同名的网络条目，点进去是网页/公众号，绝不能点）
+    #   ④搜索词下面的普通侧栏列表
+    # 以前的做法是「见到公众号/网络结果这类词之后一行都不许点」，结果把 ① 之后的真会话也
+    # 一起毙掉了。现在改成按 y 顺序跟踪「当前处于哪个分区」：只有顶部（还没遇到分区标题）和
+    # 「聊天记录/联系人/群聊」分区里的行才允许点，网络结果/公众号/文章里的行一律跳过。
+    section = ""
+    scored = []
+    for c in lines:
+        text = c["text"]
+        head_hit = next((w for w in _SEARCH_SECTION_WORDS if w in text and len(text) <= len(w) + 2), None)
+        if head_hit:
+            section = head_hit
+            continue
+        blocked_section = any(w in section for w in _SEARCH_BLOCKED_SECTIONS)
+        if blocked_section:
+            continue
+        name = _collapse_repeats(_strip_icon_noise(text))
+        score = name_match_keys(keys, name)
+        if score >= NAME_MATCH_CLEAR or (target_fold and ocr_fold(name) == target_fold):
+            scored.append(dict(c, text=name, score=max(score, 1.0), exact=True, section=section))
+            continue
+        if score > 0 and not blocked_section and not any(ch in name for ch in "：:") \
+                and 2 <= len(name) <= 24:
+            scored.append(dict(c, text=name, score=score, exact=False, section=section))
+    if not scored:
+        dbg["error"] = "no search result row names the target"
+        return None, dbg
+    exact = [c for c in scored if c["exact"]]
+    pick = exact[0] if exact else None
+    if pick is None:
+        best = max(scored, key=lambda c: c["score"])
+        runner_up = max([c["score"] for c in scored if c is not best], default=0.0)
+        if best["score"] - runner_up >= NAME_MATCH_UNIQUE_MARGIN:
+            pick = best
+    if pick is None:
+        dbg["error"] = "search results are ambiguous"
+        dbg["scored"] = [{"text": c["raw"], "score": c["score"], "section": c.get("section")}
+                         for c in scored][:10]
+        return None, dbg
+    dbg["picked"] = {"text": pick["raw"], "score": pick["score"], "exact": pick["exact"],
+                     "section": pick.get("section")}
+    return (int(pick["x"] + int(cfg.get("row_click_x_bias_px", 12))),
+            int(pick["y"])), dbg
+
+
+def _search_box_point(cfg, rect):
+    """点在微信「搜索」输入框里的坐标（窗口相对偏移，默认对准那块输入框的中间）。
+
+    2026-10-21 实测：`ctrl+f` 在微信 4.x 里打不开可用搜索面板（粘贴落不进去），而**直接点
+    搜索框 → 粘贴 → OCR 结果列表**是能用的（结果第一行就是目标会话）。所以搜索兜底改成点。
+    """
+    return [int(rect[0] + cfg.get("search_box_x_px", 300)),
+            int(rect[1] + cfg.get("search_box_y_px", 105))]
+
+
+def header_looks_like(cfg, target, texts):
+    """聊天头部这一行是不是目标会话（含 OCR 把字读歪的宽匹配）。
+
+    严格判定优先（名字/别名/折串）。再退一档：**同长度 + 首字相同**的宽匹配——微信头部把
+    「测试群」读成「测讠胡羊（3）」就是这种「部首/形近替身」，严格判定永远不中。宽度只给
+    同长度同首字的串，误判面很小；而且这条只用来决定「不要再点一次侧栏」，真正发出去之后
+    仍有 WeFlow 回读校验兜底。
+    """
+    if header_names_target(target_keys(cfg, target), texts):
+        return True, "strict"
+    want = fit(target)
+    if not want:
+        return False, ""
+    for text in texts or []:
+        got = fit(_header_group_clean(text))
+        if not got or len(got) != len(want) or got[0] != want[0]:
+            continue
+        if name_match(target, got) >= NAME_MATCH_LENIENT:
+            return True, "lenient"
+    return False, ""
+
+
+def _clear_search_box(client, cfg, rect):
+    """点搜索框 → ctrl+a → 删除，清掉上一次搜索残留的词。
+
+    实测：上一次搜索被打断（或发送失败）会让搜索框里留着「群，我，开始以为看错了」这种旧
+    文字，再粘贴就成了「旧词+新词」，微信搜出来的东西完全不对（于是「找不到目标会话」）。
+    每次搜索都从空框开始，是搜索兜底可靠的前提。
+    """
+    x, y = _search_box_point(cfg, rect)
+    if _native_on(cfg, "native_input"):
+        winio.click(x, y)
+        time.sleep(float(cfg.get("search_focus_wait_s", 0.12)))
+        winio.chord(winio.VK_CTRL, winio.VK_A)
+        time.sleep(0.03)
+        winio.chord(winio.VK_BACK)
+        time.sleep(0.05)
+        return "native"
+    client.call("Click", {"loc": [x, y], "clicks": 1})
+    time.sleep(0.3)
+    client.call("Shortcut", {"shortcut": "ctrl+a"})
+    time.sleep(0.06)
+    client.call("Shortcut", {"shortcut": "delete"})
+    time.sleep(0.1)
+    return "mcp"
+
+
+def open_chat_by_search(client, cfg, rect, target):
+    """点搜索框 → 粘贴会话名 → 点「确实叫这个名字」的结果行。
+
+    `ctrl+f` 在微信 4.x 里不可用（打不开结果面板），改成点搜索框（`_search_box_point`）。
+
+    侧边栏 OCR 对短名、生僻字、被 emoji 挤压的名字并不可靠（实测「测试群」在侧边栏和聊天
+    标题里都被读成「测讠羊」），而微信自带的搜索是精确匹配，因此它比逐行 OCR 可靠得多；
+    顺带还省掉了「滚 12 次到顶 + 翻 6 页」那 40 秒。但**绝不按 Enter**：Enter 会选中默认
+    高亮的第一条，那条可能是公众号；这里先 OCR 结果列表、跳过公众号/文章等分区、点名对上
+    才点，点完还要由聊天头部 OCR 复核，绝不盲发。
+    """
+    dbg: dict = {"target": target}
+    started = time.time()
+    try:
+        hwnd = find_wechat(cfg)
+        if not hwnd or not focus(hwnd):
+            dbg["error"] = "WeChat main window not focusable"
+            return False, dbg
+        if cfg.get("search_use_ctrl_f", False):
+            client.call("Shortcut", {"shortcut": "ctrl+f"})
+            time.sleep(float(cfg.get("search_focus_wait_s", 0.35)))
+            client.call("Clipboard", {"mode": "set", "text": target})
+            client.call("Shortcut", {"shortcut": "ctrl+v"})
+            time.sleep(float(cfg.get("search_paste_wait_s", 0.7)))
+        else:
+            dbg["driver"] = ui_paste(client, cfg, _search_box_point(cfg, rect), target)
+    except HumanBusy as e:  # 人为在用鼠标键盘：不抢
+        dbg["error"] = "%s: %s" % (CONTROL_PREEMPTED, e)
+        return False, dbg
+    except Exception as e:
+        dbg["error"] = "search jump failed: %s" % e
+        return False, dbg
+    point, pdbg = _search_result_pick(client, cfg, rect, target)
+    dbg["results"] = pdbg
+    dbg["search_ms"] = int((time.time() - started) * 1000)
+    if not point:
+        try:
+            ui_escape(client, cfg)
+        except Exception:
+            pass
+        dbg["error"] = "search fallback: %s" % pdbg.get("error", "no safe result row")
+        return False, dbg
+    try:
+        ui_click(client, cfg, point)
+        time.sleep(float(cfg.get("search_open_wait_s", 1.4)))
+    except HumanBusy as e:  # 人为在用鼠标键盘：不抢
+        dbg["error"] = "%s: %s" % (CONTROL_PREEMPTED, e)
+        return False, dbg
+    except Exception as e:
+        dbg["error"] = "click on search result failed: %s" % e
+        return False, dbg
+    matched, header = chat_header_matches(client, cfg, rect, target)
+    if not matched:
+        matched = header_matches_surface(header.get("texts", []),
+                                         (pdbg.get("picked") or {}).get("text"))
+    # 点完结果行，微信要先收起搜索面板再切换会话：0.3s 时抓到的那一帧很可能还是**上一个**
+    # 会话的头部（实测点「严正阳」时读到「杨志贺」，于是明明切过去了却判失败）。所以这一
+    # 步按「等它变成目标」轮询，只在最后仍不匹配时才认输。
+    polls = max(1, int(cfg.get("header_verify_polls", 4)))
+    poll_wait = float(cfg.get("header_verify_wait_s", 0.3))
+    tried = 1
+    while not matched and tried < polls:
+        time.sleep(poll_wait)
+        tried += 1
+        matched, header = chat_header_matches(client, cfg, rect, target)
+        if not matched:
+            matched = header_matches_surface(header.get("texts", []),
+                                             (pdbg.get("picked") or {}).get("text"))
+    header["polls"] = tried
+    dbg["header"] = header
+    if not matched:
+        dbg["error"] = "search result header does not show the target"
+        try:
+            ui_escape(client, cfg)
+        except Exception:
+            pass
+        return False, dbg
+    # 2026-10-21 实测：点中搜索结果之后微信自己就收起搜索面板、头部已经显示目标会话，再补一个
+    # Escape 反而会多按一下（曾经把面板的动画文字读成 "movlng tne mo.."，于是刚复核通过的会话
+    # 又被判成失败——白跑一趟、还要重试）。所以这里只留头部复核通过的结论，只有配置显式要求
+    # 时才去做「清搜索词 + 二次复核」。
+    if cfg.get("search_escape_after_open", False):
+        try:
+            client.call("Shortcut", {"shortcut": "escape"})
+            time.sleep(float(cfg.get("search_escape_wait_s", 0.4)))
+        except Exception:
+            pass
+        still, header2 = chat_header_matches(client, cfg, rect, target)
+        dbg["header_after_escape"] = header2
+        return bool(still or header_matches_surface(header2.get("texts", []), target)), dbg
+    return True, dbg
+
+
 def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
     """Focus WeChat, click the target's sidebar row, and make sure its chat owns the keyboard.
 
@@ -1098,12 +2102,18 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
     """
     hwnd = find_wechat(cfg)
     if not hwnd:
-        return fail(plan, "WeChat window not found")
+        return fail(plan, "WeChat window not found (closed to tray and no window to restore)")
     plan["window_rect"] = list(window_rect(hwnd))
     # Windows refuses SetForegroundWindow from a background process; without this the
     # click lands on whatever is on top and the text is typed into the wrong app.
+    # 用户不会把微信置顶 → 这里主动从最小化/托盘把它唤起（含 AttachThreadInput 与 ALT 轻推），
+    # 唤不起来就放弃，绝不把点击打到别的窗口上。
     if not focus(hwnd):
-        return fail(plan, "could not bring WeChat to the foreground")
+        raised = bool(winio is not None and winio.raise_window(hwnd))
+        plan["raised_by"] = "winio.raise_window" if raised else "failed"
+        if not raised or not focus(hwnd):
+            return fail(plan, "could not bring WeChat to the foreground "
+                              "(window is minimized or behind another window)")
     rect = restored_rect(hwnd)
     plan["window_rect"] = list(rect)
     if not rect_usable(rect):
@@ -1112,15 +2122,32 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
     if do_ocr and not find_window(cfg, target, fuzzy=True):
         reuse, header_recent = _warm_get(cfg, target, rect)
         if reuse and header_recent:
-            # 常驻 worker 刚给这个人发过消息：窗口没动过、头部名字也是近期确认过的。
-            # 这一步就是用户要的「直接往对话框粘贴发送」——不扫侧边栏、不点行、不 OCR。
-            # header_at 不刷新，所以超过 warm_header_recheck_s 后下一条会自动再确认一次名字。
-            plan["claimed"] = "chat already on target (warm session: no OCR)"
-            plan["warm_header_verified"] = False
-            plan["assume_current"] = {"matched": True, "warm": True}
-            plan["row_point"] = []
-            plan["open_attempts"] = 0
-            return _chat_ready_to_type(cfg, plan, target)
+            # 常驻 worker 刚给这个人发过消息，但**绝不能因此就跳过确认**：2026-10-22 实测
+            # 一次「暖会话直接粘贴」把给天文学家的翻唱 mp3 发进了杏园6-508（中间有别的
+            # 发送把会话切走了）。这里只花 ~120ms 看一眼聊天头部，命中了才敢粘贴。
+            _warm_ok, _warm_hd = chat_header_matches(client, cfg, rect, target)
+            _warm_row = None
+            if not _warm_ok:
+                try:
+                    _warm_row = selected_row_text(cfg, rect)
+                except Exception:
+                    _warm_row = None
+                if _warm_row and name_match(target, _row_text_of(_warm_row)) >= NAME_MATCH_LENIENT:
+                    _warm_ok = True
+            if _warm_ok:
+                plan["claimed"] = "chat already on target (warm session: header verified)"
+                plan["warm_header_verified"] = True
+                plan["assume_current"] = {"matched": True, "warm": True,
+                                          "header_texts": _warm_hd.get("texts", [])[:6]}
+                plan["row_point"] = []
+                plan["open_attempts"] = 0
+                plan["chat_header"] = _warm_hd
+                return _chat_ready_to_type(cfg, plan, target)
+            plan["warm_rejected"] = {"header_texts": _warm_hd.get("texts", [])[:4],
+                                     "selected_row": _warm_row}
+            # 暖状态已失效：清掉，让后面的常规扫描重新定位并点击。
+            _WARM["target"] = ""
+            _WARM["clean"] = ""
     if do_ocr and assume_current and not find_window(cfg, target, fuzzy=True):
         # 同一联系人的连发：上一条消息已经把他的会话开在当前窗口上。这里只截「聊天头部」
         # 那一小块做 OCR 确认（比扫整个侧边栏便宜得多），命中就直接进入输入校验，省掉一次
@@ -1137,9 +2164,66 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
             plan["chat_header"] = header0
             return _chat_ready_to_type(cfg, plan, target)
     if do_ocr:
+        # 2026-10-21（用户目标：OCR 两秒内定位任意聊天，优先判断当前会话是不是目标）：
+        # 顺序彻底改掉 —— 以前是「先滚到侧栏顶部再翻 6 页 OCR」（实测 Scroll 一次 3.3s、
+        # 12 次归位就是 40s，而且侧栏根本不跟着滚），现在改成：
+        #   ① 先看**当前已经打开的会话**是不是目标（一次小区域截图 + OCR，约 0.3s）；
+        #   ② 不是就点搜索框、粘贴名字、OCR 结果列表、点名对上才点（约 1.5s，精确）；
+        #   ③ 侧栏逐行 OCR 只当最后兜底（`locate_sidebar_fallback`，默认关闭）。
+        already, header0 = chat_header_matches(client, cfg, rect, target)
+        looks, how = header_looks_like(cfg, target, header0.get("texts", []))
+        plan["current_chat_check"] = {"matched": bool(already or looks),
+                                      "by": how or ("strict" if already else ""),
+                                      "header_texts": header0.get("texts", [])[:6],
+                                      "png": header0.get("png")}
+        if already or looks:
+            # 2026-10-22 事故：目标 文件传输助手，界面实际停在 雾中人耍起，头部 OCR 走了
+            # 宽匹配就宣称「已经在目标会话」，结果 mic/发送点到错的会话上。这里用侧栏绿底
+            # 高亮复核：选中行读得出来但不是目标 → 绝不认「已打开」，老老实实去定位。
+            sel = None
+            try:
+                sel = selected_row_text(cfg, rect)
+            except HumanBusy:
+                raise
+            except Exception:  # noqa: BLE001
+                sel = None
+            if sel and fit(sel.get("text") or ""):
+                if name_match(target, sel["text"]) < NAME_MATCH_LENIENT:
+                    plan["header_rejected_by_row"] = {"header": (header0.get("texts") or [])[:4],
+                                                      "row": sel["text"], "by": how or "strict"}
+                    already = looks = False
+            if already or looks:
+                plan["claimed"] = "chat already on target (header check: no click)"
+                plan["selected_row"] = sel["text"] if sel else None
+                plan["warm_header_verified"] = True
+                plan["row_point"] = []
+                plan["open_attempts"] = 0
+                plan["chat_header"] = header0
+                return _chat_ready_to_type(cfg, plan, target)
+        if cfg.get("locate_search_first", False):
+            searched, sdbg = open_chat_by_search(client, cfg, rect, target)
+            plan["search_fallback"] = sdbg
+            if searched:
+                plan["claimed"] = "opened by search box (click + paste + pick)"
+                plan["row_point"] = []
+                plan["open_attempts"] = 0
+                return _chat_ready_to_type(cfg, plan, target)
+        if not cfg.get("locate_sidebar_fallback", False):
+            # 目标可能被折进「折叠置顶聊天」里（侧栏 OCR 完全看不到）：
+            # 展开一次再决定要不要放弃。
+            if _expand_pinned_section(client, cfg, rect):
+                plan["pinned_expanded"] = True
+            else:
+                    return fail(plan, "could not locate target chat (target=%s; header=%s; search: %s)"
+                            % (target,
+                               " / ".join(header0.get("texts", [])[:4]) or "nothing",
+                               (plan.get("search_fallback") or {}).get("error") or "not tried"))
         point, dbg = find_row(client, cfg, rect, target)
         plan["ocr"] = {"png": dbg.get("png"), "engine": dbg.get("engine"),
                        "error": dbg.get("error"), "region": dbg.get("region"),
+                       "ms": dbg.get("ms") or {},
+                       "scanned_where": dbg.get("scanned_where"),
+                       "scrolled_pages": dbg.get("scrolled_pages"),
                        "picked": dbg.get("picked") if point else None}
         if not point:
             plan["ocr_candidates"] = dbg.get("candidates", [])[:20]
@@ -1148,64 +2232,193 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                 return fail(plan, "desktop control preempted: windows-mcp refused Screenshot "
                                   "with CONTROL_PREEMPTED (a fresh windows-mcp client is required)")
             seen = [c.get("text") for c in (dbg.get("candidates") or []) if c.get("text")][:8]
+            # OCR 读不出这一行（短名/生僻字/被 emoji 挤压）时，改用微信搜索精确跳转。
+            # 目标身份仍由聊天头部 OCR 复核，复核不过就当没开，绝不盲发。
+            if cfg.get("sidebar_search_fallback", False):
+                searched, sdbg = open_chat_by_search(client, cfg, rect, target)
+                plan["search_fallback"] = sdbg
+                if searched:
+                    plan["claimed"] = "opened by Ctrl+F search"
+                    plan["row_point"] = []
+                    plan["open_attempts"] = 0
+                    plan["ocr_failed_sidebar"] = " / ".join(seen) or "nothing"
+                    return _chat_ready_to_type(cfg, plan, target)
             return fail(plan, "could not locate target row by OCR (target=%s, aliases=%s; "
-                              "sidebar shows: %s)"
+                              "sidebar shows: %s; search fallback: %s)"
                         % (target, alias_names(cfg, target) or "none",
-                           " / ".join(seen) or "nothing"))
+                           " / ".join(seen) or "nothing",
+                           (plan.get("search_fallback") or {}).get("error") or "not tried"))
         x, y = point
     else:
         x, y = row_point(cfg, rect, int(cfg.get("assume_row_index", 0)))
-    # The chat may already be the open one (a retry, or the contact opened by hand): a
-    # click is then unnecessary, and an unnecessary click on an already-open row is what
-    # turns into a double click — WeChat pops the conversation out into its own window.
+    # 2026-10-21（用户实测：打开聊天窗口后又被点了一次）：点之前先确认「当前显示的
+    # 就是这个会话」。名字 OCR 读不准的群（如「测试群」被读成「测讠羊」）名字改写命不中，
+    # 于是每次都去点侧栏同一行——这一下就是用户看到的「双击」。这里除了名字，再拿刚扫到的
+    # 那一行 OCR 文本跟聊天头部做「同源」比较，命中就完全跳过点击。
+    picked_text = ((plan.get("ocr") or {}).get("picked") or {}).get("text")
     if do_ocr and not find_window(cfg, target, fuzzy=True):
         already, header0 = chat_header_matches(client, cfg, rect, target)
-        if already:
-            plan["claimed"] = "chat already open"
+        surface_ok = bool(picked_text) and header_matches_surface(header0.get("texts", []), picked_text)
+        if already or surface_ok:
+            plan["claimed"] = "chat already open" if already else "chat already open (surface match)"
             plan["warm_header_verified"] = True
             plan["row_point"] = [x, y]
             plan["open_attempts"] = 0
             plan["chat_header"] = header0
             return _chat_ready_to_type(cfg, plan, target)
 
+    # 同一个目标刚刚点过（多为 send 的重试），就别再点：只要头部画面跟点完那一刻一致，
+    # 就认为会话还开着，直接进入打字环节。
+    _dedup_s = float(cfg.get("row_click_dedup_s", 20.0))
+    _memo = _CLICK_MEMO.get(target)
+    if _memo and (time.time() - _memo["ts"]) < _dedup_s:
+        _probe_until = time.time() + float(cfg.get("row_click_dedup_probe_s", 2.0))
+        while True:
+            _matched, _hd = chat_header_matches(client, cfg, rect, target)
+            _same = bool(_memo.get("header_texts")) and header_matches_surface(
+                _hd.get("texts", []), " ".join(_memo["header_texts"]))
+            _texts_now = [t for t in (_hd.get("texts") or []) if fit(t)]
+            if not _matched and not _same and _texts_now:
+                # 头部读得出字、但压根不是这个会话 —— 说明点完这一行之后会话被切走了
+                # （实测：先点「测试群」再点别的聊天，回到「测试群」时会误判成「已打开」，
+                # 消息就发进了上一个会话）。这种情况必须重新点。
+                plan["click_dedup"] = {"age_s": round(time.time() - _memo["ts"], 1),
+                                       "stale_header": _texts_now[:4]}
+                break
+            if _matched or _same:
+                plan["claimed"] = "chat already open (click dedup)"
+                plan["warm_header_verified"] = True
+                plan["row_point"] = list(_memo["point"])
+                plan["click_dedup"] = {"age_s": round(time.time() - _memo["ts"], 1)}
+                plan.update(open_attempts=0, chat_header=_hd)
+                return _chat_ready_to_type(cfg, plan, target)
+            if time.time() >= _probe_until:
+                # 认不出来也绝不补第二下（用户看到的「点两次」就是这么来的）。但「认不出来」
+                # 不等于「就是这个会话」：2026-10-22 一次文件发送就是这样落进了别的群。
+                # 侧栏选中行的绿底高亮能读出名字时以它为准，读不出就直接走常规定位。
+                _row_now = None
+                try:
+                    _row_now = selected_row_text(cfg, rect)
+                except Exception:
+                    _row_now = None
+                if _row_now and name_match(target, _row_text_of(_row_now)) >= NAME_MATCH_LENIENT:
+                    plan["claimed"] = "chat already open (click dedup: selected row match)"
+                    plan["warm_header_verified"] = False
+                    plan["row_point"] = list(_memo["point"])
+                    plan["click_dedup"] = {"age_s": round(time.time() - _memo["ts"], 1),
+                                           "clicked": False, "selected_row": _row_now}
+                    plan.update(open_attempts=0, chat_header=_hd)
+                    return _chat_ready_to_type(cfg, plan, target)
+                plan["click_dedup"] = {"age_s": round(time.time() - _memo["ts"], 1),
+                                       "clicked": False, "selected_row": _row_now,
+                                       "give_up_shortcut": True}
+                break
+            time.sleep(float(cfg.get("after_click_poll_s", 0.12)))
+
+    if do_ocr:
+        _sidebar_stable(client, cfg, clamp_region([rect[0] + cfg["sidebar_capture_x_offset"],
+                                                   rect[1] + cfg["sidebar_capture_y_offset"],
+                                                   rect[0] + cfg["sidebar_capture_x2_offset"],
+                                                   rect[3] - cfg["sidebar_capture_bottom_margin"]],
+                                                  rect),
+                        os.path.join(ROOT, "logs", "wmcp"), timeout=0.4)
     plan.update(row_point=[x, y])
     # A window restored from minimized swallows the first click (it only activates), so
     # keep clicking until the chat header really shows the target — that is the signal the
     # conversation is open, not that a click was sent. Repeat clicks are deliberately rare
     # (max_row_clicks, at least repeat_click_min_interval_s apart): two clicks in quick
     # succession are a double click, which opens the chat in a separate window.
-    max_clicks = max(1, int(cfg.get("max_row_clicks", 2)))
-    min_gap = float(cfg.get("repeat_click_min_interval_s", 1.6))
+    # 2026-10-21（用户实测）：点开群聊之后聊天头部的 OCR 要等一会儿才出字，过去「1.4s
+    # 没认出名字就再点一次同一行」会被微信当成第二次点击——刚打开的会话又被收起/弹出，
+    # 于是永远复核不过。现在只点一次，然后**轮询**头部（默认 4 次 × 0.7s），认不出就
+    # 失败返回，绝不重复点击；确实需要重复点击时把 max_row_clicks 显式调大。
+    max_clicks = max(1, int(cfg.get("max_row_clicks", 1)))
+    min_gap = float(cfg.get("repeat_click_min_interval_s", 2.0))
+    click_wait = float(cfg.get("after_click_wait", 1.6))
+    # 点完不要盲等：微信切换会话通常 150~400ms 就出标题，等到 `click_wait` 才复核等于每条
+    # 消息白付 1.2s。改成「短间隔轮询、命中就返回、最多等到 after_click_wait」。
+    poll_step = float(cfg.get("after_click_poll_s", 0.12))
     attempts, header, last_click = 0, {}, 0.0
-    for attempts in range(1, max_clicks + 1):
+    confirmed = False
+    while True:
+        attempts += 1
         if last_click:
             gap = min_gap - (time.time() - last_click)
             if gap > 0:
                 time.sleep(gap)
-        client.call("Click", {"loc": [x, y], "clicks": 1})
+        try:
+            plan["click_driver"] = ui_click(client, cfg, (x, y))
+        except HumanBusy:
+            raise
         last_click = time.time()
-        time.sleep(cfg.get("after_click_wait", 1.4))
-        if find_window(cfg, target, fuzzy=True):
+        deadline = last_click + click_wait
+        time.sleep(poll_step)
+        while True:
+            if find_window(cfg, target, fuzzy=True) or not do_ocr:
+                confirmed = True
+                break
+            _sel = _row_selected_live(cfg, rect, (x, y))
+            if _sel:
+                # 绿底选中 = 微信自己确认了会话已切换，比头部 OCR 快也更稳（群名常被读错）。
+                plan["row_selected_verified"] = True
+                confirmed = True
+                break
+            matched, header = chat_header_matches(client, cfg, rect, target)
+            if matched or header_matches_surface(header.get("texts", []), picked_text):
+                confirmed = True
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(poll_step)
+        if confirmed or attempts >= max_clicks:
             break
-        if not do_ocr:
-            break
-        matched, header = chat_header_matches(client, cfg, rect, target)
-        if matched:
-            break
+    _note_click(target, (x, y), (header or {}).get("texts"), why="open_chat")
+    # 点出来的会话不对（典型：刚点开 A 之后侧栏正把它往顶部做滚动动画，我们在动画中间截的
+    # 那一帧里 B 的位置还没定，于是点下去落在 A 下面一行）。这时列表已经静止，重新扫描一次、
+    # 按新的行位置补点一下——是**另一行**，不会被系统合成双击，比把消息塞进重发队列划算。
+    if (not confirmed and do_ocr and cfg.get("locate_reclick_on_mismatch", True)):
+        retry = {}
+        rpoint, rdbg = find_row(client, cfg, rect, target)
+        if rpoint and abs(rpoint[1] - y) > 8:
+            plan["reclick"] = {"from": [x, y], "to": list(rpoint)}
+            plan["reclick_ocr"] = {"picked": rdbg.get("picked"), "ms": rdbg.get("ms")}
+            x, y = rpoint
+            attempts += 1
+            try:
+                plan["click_driver"] = ui_click(client, cfg, (x, y))
+            except HumanBusy:
+                raise
+            last_click = time.time()
+            deadline = last_click + click_wait
+            time.sleep(poll_step)
+            while True:
+                if find_window(cfg, target, fuzzy=True):
+                    confirmed = True
+                    break
+                matched, header = chat_header_matches(client, cfg, rect, target)
+                if matched or header_matches_surface(header.get("texts", []), picked_text):
+                    confirmed = True
+                    break
+                if time.time() >= deadline:
+                    break
+                time.sleep(poll_step)
+            _note_click(target, (x, y), (header or {}).get("texts"), why="open_chat-reclick")
     plan["open_attempts"] = attempts
     plan["chat_header"] = header
-    if do_ocr and not find_window(cfg, target, fuzzy=True) and not header_names_target(
-            target_keys(cfg, target), header.get("texts", [])):
+    header_ok = bool(header_names_target(target_keys(cfg, target), header.get("texts", []))) or         bool(header_matches_surface(header.get("texts", []), picked_text))
+    if not header_ok and plan.get("row_selected_verified"):
+        header_ok = True
+    plan["header_surface_check"] = {"picked": picked_text, "ok": header_ok}
+    if do_ocr and not find_window(cfg, target, fuzzy=True) and not header_ok:
         return fail(plan, "open chat header does not show the target")
     # 这一条路径确认过「头部名字/独立会话窗口标题」的，才算把 warm 状态置为「名字已确认」。
-    plan["warm_header_verified"] = bool(find_window(cfg, target, fuzzy=True)) or bool(
-        header_names_target(target_keys(cfg, target), header.get("texts", [])))
+    plan["warm_header_verified"] = bool(find_window(cfg, target, fuzzy=True)) or header_ok
     # WeChat 4.x puts the chat in its own Qt window titled with the contact name.
     # Type only once that window (or the main window) really owns the keyboard.
     return _chat_ready_to_type(cfg, plan, target)
 
 
-def _assemble(plan, attempt_log, found, kind, cfg, talker):
+def _assemble(plan, attempt_log, found, kind, cfg, talker, text=None):
     """Turn the attempt log into the final plan (shared by send and send_image)."""
     plan["attempts"] = len(attempt_log)
     plan["attempt_log"] = attempt_log
@@ -1219,9 +2432,25 @@ def _assemble(plan, attempt_log, found, kind, cfg, talker):
         if kind == "image":
             plan["localType"] = found.get("localType")
         return plan
+    # 最后一搏：WeFlow 的回读经常比输入慢 10–30s。以前这里直接判失败，bridge 就
+    # 重发 → 同一条消息刷屏 12 次（2026-10-22）。再给 25 秒的宽容窗口，按内容找一次。
+    if text:
+        try:
+            late = verify(cfg, talker, text, time.time() + 25, 0, time.time() - 150)
+        except Exception:                      # noqa: BLE001
+            late = None
+        if late:
+            plan.update(verified=True, ok=True, localId=late.get("localId"),
+                        createTime=late.get("createTime"), late_verified=True)
+            plan.pop("error", None)
+            plan.pop("retryable", None)
+            if kind == "image":
+                plan["localType"] = late.get("localType")
+            log.info("[wxui] ✅ 补验证成功（晚到回读）%s localId=%s", talker, late.get("localId"))
+            return plan
     if not plan.get("error"):
         plan["error"] = ("%s not read back from WeChat DB within timeout"
-                         % ("message" if kind == "text" else "image"))
+                         % ("message" if kind == "text" else kind))
     plan["retryable"] = True
     tail = api(cfg, "/api/v1/messages", talker=talker, limit=5).get("messages", [])
     plan["recent"] = [{"isSend": m.get("isSend"), "content": (m.get("content") or "")[:60]}
@@ -1242,6 +2471,17 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
     rows = api(cfg, "/api/v1/sessions", limit=200).get("sessions", [])
     talker = talker_for(cfg, target, rows)
     plan = {"target": target, "talker": talker, "kind": "text"}
+    # 防御：bridge 偶尔会把 None 当文本传进来（实测报错
+    # `desktop input refused: object of type 'NoneType' has no len()`），
+    # 直接拒绝比让它一路走到 set_clipboard 再炸更清楚。
+    if not isinstance(text, str):
+        if text is None:
+            plan.update(ok=False, error="empty text: caller passed None", retryable=False)
+            return plan
+        text = str(text)
+    if not text.strip():
+        plan.update(ok=False, error="empty text: nothing to send", retryable=False)
+        return plan
     if not talker:
         plan.update(ok=False, error="target not found in WeFlow session list / contacts",
                     retryable=False, known=[s.get("displayName") for s in rows[:20]])
@@ -1271,12 +2511,23 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
 
         before = last_message(cfg, talker)
         since = (before or {}).get("localId") or 0
+        t_start = time.time()
+        # 2026-10-22 刷屏事故：回读判断如果失败，每条消息会被重发 3 次再进队列，
+        # 队列每 20s 再补一遍，同一条「翻唱完成」在群里连发 12 条。
+        # 发之前先看 180s 内是不是已经有同样的文本 —— 有就不发。
+        _recent = verify(cfg, talker, text, time.time() + 2, 0, time.time() - 180)
+        if _recent:
+            plan.update(ok=True, verified=True, localId=_recent.get("localId"),
+                        dedup_recent=True)
+            log.info("[wxui] ↺ 跳过重复发送 %s（180s 内已有同样文本 localId=%s）",
+                     target, _recent.get("localId"))
+            return plan
         for attempt in range(1, attempts_max + 1):
             if attempt > 1:
                 # The previous attempt may have arrived after its read-back window: confirm
                 # before re-sending, otherwise the contact gets the same message twice.
                 already = verify(cfg, talker, text, time.time() + cfg.get("precheck_timeout_s", 3),
-                                 since)
+                                 since, t_start - 3)
                 if already:
                     found = already
                     attempt_log.append({"attempt": attempt, "stage": "precheck_delivered",
@@ -1303,11 +2554,29 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
             try:
                 plan["input_clear"] = clear_input(client, cfg, plan.get("window_rect"),
                                                   focused_clean=fresh_input and attempt == 1)
-                client.call("Clipboard", {"mode": "set", "text": text})
-                client.call("Shortcut", {"shortcut": "ctrl+v"})
-                # 分段回复提速：正文粘贴几乎是瞬时的，0.5s 是白等；0.3s 足够微信接收粘贴内容
-                time.sleep(float(cfg.get("after_paste_wait_text", 0.3)))
-                client.call("Shortcut", {"shortcut": "enter"})
+                # 2026-10-21（用户实测：听到系统提示音、键鼠自己乱动）：键盘事件会打到**当前
+                # 前台窗口**。用户从不把微信置顶，所以打字前必须再确认一次前台就是微信，
+                # 不在前台就放弃本次尝试（宁可重发，也不能把内容敲进别人正在用的窗口）。
+                if _native_on(cfg, "native_input"):
+                    fg_hwnd, fg_title, _fg_cls = winio.foreground_info()
+                    main_hwnd = find_wechat(cfg)
+                    if not main_hwnd or fg_hwnd != main_hwnd:
+                        raise RuntimeError("foreground is not the WeChat main window "
+                                           "(fg=%r title=%r); refusing to type"
+                                           % (fg_hwnd, fg_title))
+                if _native_on(cfg, "native_input"):
+                    # 原生粘贴：写剪贴板 + Ctrl+V + Enter ≈ 20ms，而三次 windows-mcp 输入调用
+                    # 要 ~1.7s（每条消息都付一遍，这是“发一条要好几秒”的主要来源）。
+                    winio.set_clipboard(text)
+                    winio.chord(winio.VK_CTRL, winio.VK_V)
+                    time.sleep(float(cfg.get("after_paste_wait_text", 0.3)))
+                    winio.chord(winio.VK_RETURN)
+                else:
+                    client.call("Clipboard", {"mode": "set", "text": text})
+                    client.call("Shortcut", {"shortcut": "ctrl+v"})
+                    # 分段回复提速：正文粘贴几乎是瞬时的，0.5s 是白等；0.3s 足够微信接收粘贴内容
+                    time.sleep(float(cfg.get("after_paste_wait_text", 0.3)))
+                    client.call("Shortcut", {"shortcut": "enter"})
             except Exception as e:
                 # Desktop handed back to the human mid-send (USER_CONTROL / TAKEOVER_PENDING).
                 # Leave nothing behind: the next attempt clears the box before pasting.
@@ -1316,7 +2585,7 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                 plan.update(error="desktop input refused: %s" % e, retryable=True)
                 time.sleep(retry_wait)
                 continue
-            found = verify(cfg, talker, text, time.time() + verify_timeout, since)
+            found = verify(cfg, talker, text, time.time() + verify_timeout, since, t_start - 3)
             attempt_log.append({"attempt": attempt, "verified": bool(found),
                                 "localId": (found or {}).get("localId"),
                                 "open_attempts": plan.get("open_attempts")})
@@ -1333,25 +2602,32 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
             client.close()
 
     plan["before_local_id"] = since
-    return _assemble(plan, attempt_log, found, "text", cfg, talker)
+    return _assemble(plan, attempt_log, found, "text", cfg, talker, text=text)
 
 
 def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_current=False,
-               client=None):
+               client=None, as_file=False):
     """Send a picture/sticker: click the chat, put the file on the clipboard, Ctrl+V, Enter.
 
     Same retry/verify contract as send(): an image only counts as sent once it is read
     back out of WeChat's own database.
+
+    2026-10-20: `as_file=True` 复用同一条通道发**任意文件**（AI 点歌的翻唱 mp3 走这里）。
+    微信对「剪贴板里的文件路径」Ctrl+V 的落法：图片走图片消息，非图片扩展名走 appmsg
+    文件卡片（localType 低字节 49 + <type>6</type> + title=文件名）—— `classify_outgoing`
+    已经认得这种形态，所以发送/回读验证逻辑可以完全共用。
     """
     rows = api(cfg, "/api/v1/sessions", limit=200).get("sessions", [])
     talker = talker_for(cfg, target, rows)
-    plan = {"target": target, "talker": talker, "image": image_path, "kind": "image"}
+    plan = {"target": target, "talker": talker, "kind": "file" if as_file else "image"}
+    plan["image" if not as_file else "file"] = image_path
     if not os.path.exists(image_path or ""):
-        plan.update(ok=False, error="image file not found", retryable=False)
+        plan.update(ok=False, error=("file not found" if as_file else "image file not found"),
+                    retryable=False)
         return plan
-    animated = is_animated_image(image_path)
+    animated = False if as_file else is_animated_image(image_path)
     plan["image_animated"] = animated
-    plan["clipboard_mode"] = "file_drop" if animated else "bitmap"
+    plan["clipboard_mode"] = "file_drop" if (animated or as_file) else "bitmap"
     expect_name = os.path.basename(image_path)
     expect_md5 = file_md5(image_path)
     plan["image_md5"] = expect_md5
@@ -1387,11 +2663,13 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
 
         before = last_message(cfg, talker)
         since = (before or {}).get("localId") or 0
+        t_start = time.time()
         for attempt in range(1, attempts_max + 1):
             if attempt > 1 and since:
                 already = verify_image(cfg, talker,
                                        time.time() + cfg.get("precheck_timeout_s", 3), since,
-                                       expect_name=expect_name, expect_md5=expect_md5)
+                                       expect_name=expect_name, expect_md5=expect_md5,
+                                       since_time=t_start - 3)
                 if already:
                     found = already
                     attempt_log.append({"attempt": attempt, "stage": "precheck_delivered",
@@ -1418,7 +2696,8 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
             try:
                 plan["input_clear"] = clear_input(client, cfg, plan.get("window_rect"),
                                                   focused_clean=fresh_input and attempt == 1)
-                ok, err = set_clipboard_image(image_path, plan.get("image_animated"))
+                ok, err = set_clipboard_image(image_path,
+                                              plan.get("clipboard_mode") == "file_drop")
                 if not ok:
                     plan.update(ok=False,
                                 error="could not put image on the clipboard: %s" % err,
@@ -1434,7 +2713,8 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                 time.sleep(retry_wait)
                 continue
             found = verify_image(cfg, talker, time.time() + verify_timeout, since,
-                                 expect_name=expect_name, expect_md5=expect_md5)
+                                 expect_name=expect_name, expect_md5=expect_md5,
+                                 since_time=t_start - 3)
             attempt_log.append({"attempt": attempt, "verified": bool(found),
                                 "localId": (found or {}).get("localId"),
                                 "delivered_as": classify_outgoing(found, expect_name, expect_md5) if found else None})
@@ -1452,7 +2732,19 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
     plan["before_local_id"] = since
     plan["delivered_as"] = (classify_outgoing(found, expect_name, expect_md5)
                             if found else None)
-    return _assemble(plan, attempt_log, found, "image", cfg, talker)
+    return _assemble(plan, attempt_log, found, plan.get("kind") or "image", cfg, talker)
+
+
+def send_file(cfg, target, file_path, commit=False, do_ocr=True, assume_current=False,
+              client=None):
+    """Send any file (e.g. the AI点歌 cover mp3) as a WeChat file message.
+
+    WeChat PC turns 「剪贴板里的文件」+ Ctrl+V into an appmsg file card (or an image, when
+    the extension is an image); `classify_outgoing` recognises both, so this reuses the
+    verified send_image pipeline instead of inventing a second delivery path.
+    """
+    return send_image(cfg, target, file_path, commit, do_ocr=do_ocr,
+                      assume_current=assume_current, client=client, as_file=True)
 
 
 def verify_delivered(cfg, spec):
@@ -1468,16 +2760,18 @@ def verify_delivered(cfg, spec):
     if not talker:
         return {**plan, "ok": False, "error": "target not found in WeFlow session list / contacts"}
     since = int(spec.get("since_local_id") or 0)
+    since_time = float(spec.get("since_time") or 0) or None
     deadline = time.time() + float(spec.get("timeout", 3))
     if spec.get("text"):
-        m = verify(cfg, talker, spec["text"], deadline, since)
+        m = verify(cfg, talker, spec["text"], deadline, since, since_time)
     elif spec.get("path"):
-        if not since:
+        if not since and not since_time:
             return {**plan, "error": "since_local_id is required to check an image"}
         _p = str(spec.get("path") or "")
         m = verify_image(cfg, talker, deadline, since,
                          expect_name=os.path.basename(_p),
-                         expect_md5=file_md5(_p) if os.path.exists(_p) else None)
+                         expect_md5=file_md5(_p) if os.path.exists(_p) else None,
+                         since_time=since_time)
     else:
         return {**plan, "ok": False, "error": "spec needs text or path"}
     return {**plan, "verified": bool(m), "localId": (m or {}).get("localId"),
@@ -1521,6 +2815,11 @@ def worker_dispatch(cfg, client, subcmd, spec):
                           bool(spec.get("commit")),
                           do_ocr=bool(spec.get("do_ocr", True)),
                           assume_current=bool(spec.get("assume_current")), client=client)
+    if subcmd == "send-file":
+        return send_file(cfg, spec.get("target"), spec.get("path"),
+                         bool(spec.get("commit")),
+                         do_ocr=bool(spec.get("do_ocr", True)),
+                         assume_current=bool(spec.get("assume_current")), client=client)
     if subcmd == "verify":
         return verify_delivered(cfg, spec)
     if subcmd == "info":
@@ -1639,6 +2938,13 @@ def main():
     pi.add_argument("--commit", action="store_true")
     pi.add_argument("--no-ocr", action="store_true")
     pi.add_argument("--assume-current", action="store_true")
+    pf = sub.add_parser("send-file", help="send any file (mp3 etc.) as a WeChat file card")
+    pf.add_argument("--target")
+    pf.add_argument("--path")
+    pf.add_argument("--spec", help="UTF-8 JSON file {target,path,commit}")
+    pf.add_argument("--commit", action="store_true")
+    pf.add_argument("--no-ocr", action="store_true")
+    pf.add_argument("--assume-current", action="store_true")
     pv = sub.add_parser("verify", help="read-only check that a message is already delivered "
                                        "(used before a resend so nothing is sent twice)")
     pv.add_argument("--spec", help="UTF-8 JSON file {target,text|path,since_local_id,timeout}")
@@ -1691,7 +2997,7 @@ def main():
             return 2
         out = send(cfg, target, text, commit, do_ocr=not args.no_ocr,
                    assume_current=assume_current)
-    else:  # send-image
+    else:  # send-image / send-file
         target, path, commit = args.target, args.path, args.commit
         assume_current = bool(args.assume_current)
         if args.spec:
@@ -1704,8 +3010,9 @@ def main():
             print(json.dumps({"ok": False, "error": "--target/--path or --spec required"},
                              ensure_ascii=False))
             return 2
-        out = send_image(cfg, target, path, commit, do_ocr=not args.no_ocr,
-                         assume_current=assume_current)
+        fn = send_file if args.cmd == "send-file" else send_image
+        out = fn(cfg, target, path, commit, do_ocr=not args.no_ocr,
+                 assume_current=assume_current)
 
     print(json.dumps(out, ensure_ascii=False, indent=2))
     ok = out.get("ok") or out.get("dry_run") if isinstance(out, dict) else True

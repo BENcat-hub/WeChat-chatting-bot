@@ -1,7 +1,7 @@
 # 一键启动 wechat-ai-stack（顺序：微信 → WeFlow → AstrBot → bridge）
 #
 # 用法（在任意终端里执行，无需管理员）：
-#     pwsh -File <REPO_ROOT>\scripts\start-all.ps1
+#     pwsh -File C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack\scripts\start-all.ps1
 # 常用变体：
 #     ... start-all.ps1 -FixWeFlowAnchor      # WeFlow 起不来（5031 不监听）时先把 -105 anchor 修一遍
 #     ... start-all.ps1 -SkipWeChat           # 微信已经开着
@@ -39,7 +39,7 @@ $pids = @{}
 $WECHAT_EXE = 'C:\Program Files\Tencent\Weixin\Weixin.exe'
 $WEFLOW_EXE = 'C:\Program Files\WeFlow\WeFlow.exe'          # 6.3.2：组件已到期，仅用于识别/清理
 $WEFLOW_LAUNCHER = Join-Path $PSScriptRoot 'start-weflow50.cmd'
-$WEFLOW50_ROOT = '<WEFLOW_ROOT>'
+$WEFLOW50_ROOT = 'C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\weflow-old\WeFlow-main'
 
 function Test-Port([int]$port) {
     try { return [bool](Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) }
@@ -168,14 +168,34 @@ $jimengScript = Join-Path $PSScriptRoot 'jimeng_image_server.py'
 $jimengPy = Join-Path $root 'astrbot\.venv\Scripts\python.exe'
 if (Test-Port 8790) {
     Write-Host '  已在监听 8790'
-} elseif ((Test-Path $jimengScript) -and (Test-Path $jimengPy) -and (Test-Path (Join-Path $root 'secrets\volcengine_ak_sk.txt'))) {
+} elseif ((Test-Path $jimengScript) -and (Test-Path $jimengPy) -and (
+        (Test-Path (Join-Path $root 'secrets\siliconflow_api_key.txt')) -or
+        (Test-Path (Join-Path $root 'secrets\volcengine_ak_sk.txt')))) {
     $env:PYTHONIOENCODING = 'utf-8'
     $env:PYTHONUTF8 = '1'
+    # 2026-10-22：火山图生图 req_key `jimeng_seedream46_cvtob` 在本账号被
+    # HTTP 401 / code 50400 Access Denied 拒绝，带参考图的通道整条不可用。
+    # 所以默认后端改成 SiliconFlow（文生图 Qwen/Qwen-Image，图生图
+    # Qwen/Qwen-Image-Edit-2509，实测 13s / 26-63s）。要回火山就把下面这行
+    # 改成 'volc'（或启动前自己设 $env:JIMENG_BACKEND）。
+    if (-not $env:JIMENG_BACKEND) { $env:JIMENG_BACKEND = 'sf' }
     Start-Svc 'jimeng' $jimengPy $root @('-X', 'utf8', $jimengScript, '--port', '8790')
     if (Wait-Port 8790 20) { Write-Host '  8790 已监听' }
     else { Write-Host '  ✗ 20 秒内 8790 未监听，查看 logs\jimeng-*.err.log' -ForegroundColor Yellow }
 } else {
-    Write-Host '  ⚠ 缺少 jimeng_image_server.py / python 或 secrets\volcengine_ak_sk.txt，跳过（生图会失败）' -ForegroundColor Yellow
+    Write-Host '  ⚠ 缺少 jimeng_image_server.py / python 或 secrets 下的 volcengine_ak_sk.txt / siliconflow_api_key.txt，跳过（生图会失败）' -ForegroundColor Yellow
+}
+
+# ---------------------------------------------------------------- 3.7 AI点歌后端
+Write-Host "`n[+] AI点歌后端（so-vits-svc + Demucs，Gradio 端口 3333）" -ForegroundColor Cyan
+$coverScript = Join-Path $PSScriptRoot 'start-cover-backend.ps1'
+$coverPy = Join-Path $root 'rvc-backend\.venv\Scripts\python.exe'
+if ((Test-Path $coverScript) -and (Test-Path $coverPy)) {
+    # 不再只判「端口在听」就跳过：卡死的旧进程会占着 3333 但不再响应，
+    # 判断与清理都交给 start-cover-backend.ps1（它带 HTTP 探活 + 自动清理）。
+    & $coverScript -Port 3333 | ForEach-Object { Write-Host ("  " + $_) -ForegroundColor DarkGray }
+} else {
+    Write-Host '  ⚠ 缺少 rvc-backend\.venv 或 start-cover-backend.ps1，跳过（AI点歌会失败）' -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------- 4. bridge
@@ -213,9 +233,9 @@ if (-not $NoPreflight) {
 }
 
 Write-Host "`n=== 端口一览 ===" -ForegroundColor Cyan
-foreach ($pair in @(@(5031, 'WeFlow 读消息'), @(6185, 'AstrBot 面板'), @(11229, 'AstrBot OneBot WS'), @(8766, 'bridge 面板'), @(8790, '即梦生图本地服务'))) {
+foreach ($pair in @(@(5031, 'WeFlow 读消息'), @(6185, 'AstrBot 面板'), @(11229, 'AstrBot OneBot WS'), @(8766, 'bridge 面板'), @(8790, '即梦生图本地服务'), @(3333, 'AI点歌后端'))) {
     $ok = Test-Port $pair[0]
     Write-Host ("  {0,-6} {1,-20} {2}" -f $pair[0], $pair[1], $(if ($ok) { '在听' } else { '未监听' })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Yellow' })
 }
 Write-Host '  9877   WeeMessenger         未启动（设计如此：文字/图片走 wxui）' -ForegroundColor DarkGray
-Write-Host "`n下一步：确认微信已扫码登录 → 发消息给用户E 验证被动回复/表情包；停止用 stop-all.ps1。" -ForegroundColor Green
+Write-Host "`n下一步：确认微信已扫码登录 → 发消息给鱼宝🐳 验证被动回复/表情包；停止用 stop-all.ps1。" -ForegroundColor Green

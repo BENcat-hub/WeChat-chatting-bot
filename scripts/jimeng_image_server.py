@@ -31,6 +31,7 @@ import argparse
 import base64
 import json
 import mimetypes
+import os
 import re
 import sys
 import threading
@@ -54,6 +55,17 @@ from volc_sign import (  # noqa: E402
 SECRETS = REPO / "secrets" / "volcengine_ak_sk.txt"
 FILES_DIR = REPO / "logs" / "jimeng-out"
 REQ_LOG = REPO / "logs" / "jimeng-server-requests.jsonl"
+
+SF_SECRETS = REPO / "secrets" / "siliconflow_api_key.txt"
+
+# 上游后端：`volc`（即梦/火山，默认）或 `sf`（SiliconFlow）。
+# 为什么要 sf：火山图生图的 req_key `jimeng_seedream46_cvtob` 在本账号被
+# `HTTP 401 / code 50400 Access Denied` 拒绝，参考图通道整条不可用；
+# SiliconFlow 的 `Qwen/Qwen-Image-Edit-2509` 实测能带参考图出图（约 26s）。
+BACKEND = (os.environ.get("JIMENG_BACKEND") or "volc").strip().lower()
+SF_API_BASE = (os.environ.get("SILICONFLOW_API_BASE") or "https://api.siliconflow.cn/v1").rstrip("/")
+SF_MODEL_T2I = os.environ.get("SF_MODEL_T2I") or "Qwen/Qwen-Image"
+SF_MODEL_EDIT = os.environ.get("SF_MODEL_EDIT") or "Qwen/Qwen-Image-Edit-2509"
 
 # 提示词下传长度上限。即梦上游是硬限制，超过会直接报
 # `invalid param: prompt can not be more than 800 chars`（实测 801 字符就 400），
@@ -212,6 +224,89 @@ def load_creds() -> tuple[str, str]:
     if len(lines) < 2:
         raise RuntimeError(f"{SECRETS} 需要两行：AccessKeyID / SecretAccessKey")
     return lines[0], lines[1]
+
+
+def load_sf_key() -> str:
+    env = (os.environ.get("SILICONFLOW_API_KEY") or "").strip()
+    if env:
+        return env
+    if SF_SECRETS.exists():
+        key = SF_SECRETS.read_text(encoding="utf-8").strip()
+        if key:
+            return key
+    raise RuntimeError(f"缺少 SiliconFlow API Key：设置 SILICONFLOW_API_KEY 或写入 {SF_SECRETS}")
+
+
+SF_SIZE_MIN = 256
+SF_SIZE_MAX = 2048
+
+
+def sf_image_size(size_params: dict) -> str:
+    """火山参数（width/height 或面积）→ SiliconFlow 的 `image_size: "WxH"`。"""
+    width = int(size_params.get("width") or 0)
+    height = int(size_params.get("height") or 0)
+    if not width or not height:
+        area = int(size_params.get("size") or 0)
+        if area:
+            side = max(SF_SIZE_MIN, min(SF_SIZE_MAX, int(round(area ** 0.5))))
+            side = int(round(side / 16)) * 16
+            return f"{side}x{side}"
+        return "1024x1024"
+    width = max(SF_SIZE_MIN, min(SF_SIZE_MAX, int(round(width / 16)) * 16))
+    height = max(SF_SIZE_MIN, min(SF_SIZE_MAX, int(round(height / 16)) * 16))
+    return f"{width}x{height}"
+
+
+def _sf_images(refs: list[str]) -> list[str]:
+    """把 refs 规整成 SiliconFlow 认的「URL 或 data URI」列表。"""
+    url_refs, blob_refs = split_refs(refs)
+    images: list[str] = [u for u in url_refs if u]
+    for blob in blob_refs:
+        try:
+            data = base64.b64decode(blob + "=" * (-len(blob) % 4))
+            mime = sniff_image_mime(data)
+            images.append(f"data:{mime};base64," + base64.b64encode(data).decode("ascii"))
+        except Exception:  # noqa: BLE001
+            images.append("data:image/png;base64," + str(blob))
+    return images
+
+
+def sf_generate(prompt: str, refs: list[str], size_params: dict, count: int = 1,
+                timeout: float = 300.0) -> dict:
+    """SiliconFlow 同步出图。带参考图走 Qwen-Image-Edit，否则 Qwen-Image。"""
+    api_key = load_sf_key()
+    images = _sf_images(refs)
+    model = SF_MODEL_EDIT if images else SF_MODEL_T2I
+    body: dict = {"model": model, "prompt": prompt,
+                  "image_size": sf_image_size(size_params),
+                  "n": max(1, min(4, int(count or 1)))}
+    if images:
+        # SiliconFlow 的 `image` 字段：单图必须是**字符串**，传成 list 会 400
+        # `{"code":20015,"message":"image should be a string"}`（实测）。
+        picked = images[:4]
+        body["image"] = picked[0] if len(picked) == 1 else picked
+    request = urllib.request.Request(
+        f"{SF_API_BASE}/images/generations",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:  # noqa: PERF203
+        detail = exc.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"SiliconFlow HTTP {exc.code}: {detail}") from exc
+    urls = [item.get("url") for item in (payload.get("images") or [])
+            if isinstance(item, dict) and item.get("url")]
+    if not urls:
+        raise RuntimeError(f"SiliconFlow 未返回图片：{json.dumps(payload, ensure_ascii=False)[:400]}")
+    log_event({"stage": "sf_done", "model": model, "refs": len(images), "n": len(urls),
+               "seconds": round(time.monotonic() - started, 1),
+               "image_size": body["image_size"]})
+    return {"image_urls": urls,
+            "task_id": str(payload.get("shared_id") or payload.get("id") or ""),
+            "raw": {"model": model, "timings": payload.get("timings")}}
 
 
 SIZE_MIN_AREA = 1024 * 1024
@@ -688,6 +783,36 @@ class Handler(BaseHTTPRequestHandler):
 
         if not prompt:
             self._send(400, {"error": {"message": "prompt is required"}})
+            return
+
+        if BACKEND == "sf":
+            # SiliconFlow 是同步接口（没有「提交 + 轮询」），但对外仍保持 OpenAI 形状，
+            # 插件侧完全无感知。带参考图（edits / image 字段）时自动切到 Edit 模型。
+            try:
+                result = sf_generate(clamp_prompt(prompt), refs, size_params, count)
+                data_items: list[dict] = []
+                for url in result["image_urls"][: max(1, count)]:
+                    saved = save_image(url, "sf")
+                    item: dict = {"url": f"http://{self.headers.get('Host') or '127.0.0.1'}"
+                                         f"/files/{saved.name}",
+                                  "revised_prompt": prompt[:200]}
+                    try:
+                        item["b64_json"] = base64.b64encode(saved.read_bytes()).decode("ascii")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    data_items.append(item)
+                log_event({"stage": "done", "backend": "sf", "task_id": result.get("task_id"),
+                           "model": result["raw"].get("model"),
+                           "images": [it["url"] for it in data_items]})
+                self._send(200, {"created": int(time.time()), "data": data_items,
+                                 "model": model, "backend": "sf",
+                                 "req_key": result["raw"].get("model"),
+                                 "task_id": result.get("task_id")})
+            except Exception as exc:  # noqa: BLE001
+                detail = f"{type(exc).__name__}: {exc}"
+                log_event({"stage": "error", "backend": "sf", "error": detail[:600]})
+                self._send(502, {"error": {"message": f"siliconflow upstream error: {detail[:400]}",
+                                           "type": "upstream_error"}})
             return
 
         params = dict(size_params)

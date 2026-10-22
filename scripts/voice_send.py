@@ -1,0 +1,473 @@
+r"""End-to-end: text -> TTS -> so-vits-svc voice -> WeChat voice bubble.
+
+Usage:
+  python voice_send.py --target "测试群" --text "你好啊" [--model 孙燕姿] [--transpose 0]
+  python voice_send.py --target "测试群" --wav logs\foo48.wav   (skip TTS+SVC)
+
+Flow: TTS (mimo) -> svc infer (rvc-backend\models\<model>) -> ffmpeg 48k mono
+      -> default capture = CABLE Output -> wxui.open_chat(target)
+      -> click mic -> play into CABLE In -> click send -> restore capture device.
+"""
+import argparse
+import ctypes
+import ctypes.wintypes as w
+import json
+import os
+import subprocess
+import sys
+import time
+import wave
+
+import numpy as np
+
+ROOT = r"C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack"
+sys.path.insert(0, ROOT + r"\scripts")
+
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    pass
+
+import winio  # noqa: E402
+import wxui  # noqa: E402
+
+PY_RVC = os.path.join(ROOT, "rvc-backend", ".venv", "Scripts", "python.exe")
+PY_AKA = os.path.join(ROOT, "astrbot", ".venv", "Scripts", "python.exe")  # httpx available here
+PY_BV2 = os.path.join(ROOT, "bertvits2", ".venv", "Scripts", "python.exe")
+BV2_V1_SAY = os.path.join(ROOT, "bertvits2", "bv2_v1_say.py")
+BV2_SAY = os.path.join(ROOT, "bertvits2", "bv2_say.py")
+SVC_EXE = os.path.join(ROOT, "rvc-backend", ".venv", "Scripts", "svc.exe")
+FFMPEG = os.path.join(ROOT, "tools", "ffmpeg", "ffmpeg.exe")
+PLAY_DEV = 24  # CABLE In 16 Ch (render)
+DEFAULT_CAPTURE = '麦克风 (REDMI 电脑音箱 2 Pro)'
+
+
+def tts(text, out_wav):
+    cmd = [PY_AKA, "-X", "utf8", os.path.join(ROOT, "scripts", "_tts_mimo.py"), text, out_wav]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError("tts failed: " + (r.stderr or r.stdout)[-400:])
+    return out_wav
+
+
+def svc_convert(in_wav, model, out_wav, transpose=0):
+    mdir = os.path.join(ROOT, "rvc-backend", "models", model)
+    pth = os.path.join(mdir, "G_latest.pth")
+    if not os.path.exists(pth):
+        cands = sorted([f for f in os.listdir(mdir) if f.startswith("G_") and f.endswith(".pth")],
+                       key=lambda n: int("".join(ch for ch in n if ch.isdigit()) or 0))
+        if not cands:
+            raise RuntimeError(f"no G_*.pth in {mdir}")
+        pth = os.path.join(mdir, cands[-1])
+    cfg = os.path.join(mdir, "config.json")
+    cluster = os.path.join(mdir, "kmeans_10000.pt")
+    cmd = [SVC_EXE, "infer", in_wav, "-m", pth, "-c", cfg, "-fm", "crepe", "-t", str(transpose),
+           "-o", out_wav]
+    # NOTE: no cluster (-k/-r): torch 2.6+ refuses the numpy-pickled kmeans with weights_only=True.
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=900, cwd=os.path.join(ROOT, "rvc-backend"))
+    if r.returncode != 0 or not os.path.exists(out_wav):
+        raise RuntimeError("svc failed: " + (r.stderr or r.stdout)[-600:])
+    return pth
+
+
+def bv2_say(text, out_wav, sdp=0.2, noise=0.6, noise_w=0.8, length=1.0, dereverb=0.35):
+    """知更鸟 Bert-VITS2（网上公开权重 G_5800）直接文本转语音，跳过 mimo TTS + SVC。"""
+    cmd = [PY_BV2, "-X", "utf8", "-W", "ignore", BV2_SAY,
+           "--text", text, "--out", out_wav,
+           "--sdp", str(sdp), "--noise", str(noise), "--noise-w", str(noise_w),
+           "--length", str(length), "--dereverb", str(dereverb), "--max-chars", "60", "--no-clause-split"]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=900, cwd=ROOT)
+    line = ""
+    for ln in (r.stdout or "").splitlines():
+        if ln.strip().startswith("{"):
+            line = ln.strip()
+    if r.returncode != 0 or not line:
+        raise RuntimeError("bv2 failed: " + ((r.stderr or r.stdout or "")[-600:]))
+    info = json.loads(line)
+    if not info.get("ok"):
+        raise RuntimeError("bv2 failed: " + line[:400])
+    return info
+
+
+def gl_say(text, out_wav, sid="纳西妲", sdp=0.2, noise=0.6, noise_w=0.8, length=1.0):
+    """原神 16 角色 Bert-VITS2（G_114000，v1.1.0）直接文本转语音。"""
+    cmd = [PY_BV2, "-X", "utf8", "-W", "ignore", BV2_V1_SAY,
+           "--text", text, "--out", out_wav, "--sid", sid,
+           "--sdp", str(sdp), "--noise", str(noise), "--noise-w", str(noise_w),
+           "--length", str(length)]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=900, cwd=ROOT)
+    line = ""
+    for ln in (r.stdout or "").splitlines():
+        if ln.strip().startswith("{"):
+            line = ln.strip()
+    if r.returncode != 0 or not line:
+        raise RuntimeError("gl_tts failed: " + ((r.stderr or r.stdout or "")[-600:]))
+    info = json.loads(line)
+    if not info.get("dur"):
+        raise RuntimeError("gl_tts failed: " + line[:400])
+    return info
+
+def to_48k(in_wav, out_wav):
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", in_wav,
+           "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", out_wav]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+    if r.returncode != 0 or not os.path.exists(out_wav):
+        raise RuntimeError("ffmpeg failed: " + (r.stderr or "")[-300:])
+    return out_wav
+
+
+def audio_default(kind):
+    ps = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+          os.path.join(ROOT, "scripts", "set-default-audio.ps1"), "-Get"]
+    r = subprocess.run(ps, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    for line in (r.stdout or "").splitlines():
+        if line.startswith(kind + "="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def audio_set(name, kind):
+    ps = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+          os.path.join(ROOT, "scripts", "set-default-audio.ps1"), "-Name", name, "-Kind", kind]
+    r = subprocess.run(ps, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    return r.returncode == 0 and "OK:" in (r.stdout or "")
+
+
+def play_device():
+    """按名字解析「CABLE In」的输出设备索引。
+
+    2026-10-22 实测踩坑：切换默认录音设备（CABLE Output ↔ 真实麦克风）之后，
+    WASAPI 设备表的顺序会变 —— CABLE In 的索引从 24 变成 8，硬编码 24 时
+    声音打到了别的设备，微信录到的是一条 45 秒全静音的气泡。
+    """
+    try:
+        import sounddevice as sd
+        for idx, dev in enumerate(sd.query_devices()):
+            name = (dev.get("name") or "")
+            if dev.get("max_output_channels", 0) > 0 and "cable in" in name.lower():
+                return idx
+    except Exception:  # noqa: BLE001
+        pass
+    return PLAY_DEV
+
+
+def play_wav(path, device=None):
+    if device is None:
+        device = play_device()
+    with wave.open(path, "rb") as f:
+        sr, ch = f.getframerate(), f.getnchannels()
+        data = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
+    if ch > 1:
+        data = data.reshape(-1, ch)
+    audio = data.astype(np.float32) / 32768.0
+    out_ch = 2
+    if audio.ndim == 1:
+        audio = np.repeat(audio[:, None], out_ch, axis=1)
+    elif audio.shape[1] == 1:
+        audio = np.repeat(audio, out_ch, axis=1)
+    else:
+        out_ch = audio.shape[1]
+    import sounddevice as sd
+    state = {"pos": 0, "done": False}
+
+    def cb(outdata, frames, time_info, status):
+        pos = state["pos"]
+        chunk = audio[pos:pos + frames]
+        n = len(chunk)
+        outdata[:n] = chunk
+        if n < frames:
+            outdata[n:] = 0
+            state["done"] = True
+            raise sd.CallbackStop
+        state["pos"] = pos + frames
+
+    with sd.OutputStream(samplerate=sr, channels=out_ch, dtype="float32", device=device, callback=cb):
+        t0 = time.time()
+        while not state["done"] and time.time() - t0 < 30:
+            time.sleep(0.05)
+    return len(audio) / sr
+
+
+
+def _region_sig(box, tag):
+    """取一块屏幕区域的像素指纹，用来判断「点了按钮之后界面到底变了没有」。
+
+    2026-10-22：语音气泡失败过一次纯粹是因为 mic 没点中（微信当时又不吃合成点击），
+    结果把音频播到了真的扬声器上、还顺手点了「发送」。所以点完必须验一下。
+    """
+    from PIL import Image
+    path = os.path.join(ROOT, "logs", f"voice-ui-{tag}.png")
+    winio.grab(box, path)
+    with Image.open(path) as im:
+        small = im.convert("L").resize((160, 40))
+        return small.tobytes()
+
+
+def click_mic(win_rect, tries=2):
+    """点开微信输入栏的「语音」胶囊，并确认界面真的切过去了。"""
+    l, t, R, B = win_rect
+    W, H = R - l, B - t
+    mic = (l + int(0.889 * W), t + int(0.942 * H))
+    # 只取输入栏这一条高度做比较：胶囊出现会把这一行整块换掉
+    box = (l + int(0.60 * W), t + int(0.86 * H), R - 8, B - 8)
+    before = _region_sig(box, "before")
+    for attempt in range(tries):
+        winio.click(*mic)
+        time.sleep(0.26)
+        if _region_sig(box, f"after{attempt}") != before:
+            return mic, attempt + 1
+        time.sleep(0.25)
+    raise RuntimeError("mic button click had no visible effect: "
+                       "WeChat 输入栏没有切换到语音胶囊（注入点击可能被忽略，或窗口不在前台）")
+
+
+class PrePlayer:
+    """先建好输出流（回调先吐静音），等微信录音胶囊出现再 start()。
+
+    目的：把「建流 + 打开设备」的几百毫秒挪到点麦克风**之前**，
+    这样气泡开口前的静音只剩点击到状态切换的那点延迟。
+    """
+
+    def __init__(self, path, device=None):
+        import sounddevice as sd
+        self._sd = sd
+        if device is None:
+            device = play_device()
+        with wave.open(path, "rb") as f:
+            sr, ch = f.getframerate(), f.getnchannels()
+            raw = np.frombuffer(f.readframes(f.getnframes()), dtype=np.int16)
+        if ch > 1:
+            raw = raw.reshape(-1, ch)
+        audio = raw.astype(np.float32) / 32768.0
+        out_ch = 2
+        if audio.ndim == 1:
+            audio = np.repeat(audio[:, None], out_ch, axis=1)
+        elif audio.shape[1] == 1:
+            audio = np.repeat(audio, out_ch, axis=1)
+        else:
+            out_ch = audio.shape[1]
+        self.audio = audio
+        self.sr = sr
+        self.device = device
+        self.pos = 0
+        self.started = False
+        self.done = False
+        self.stream = sd.OutputStream(samplerate=sr, channels=out_ch, dtype="float32",
+                                      device=device, callback=self._cb)
+
+    def _cb(self, outdata, frames, time_info, status):
+        if not self.started:
+            outdata.fill(0)
+            return
+        chunk = self.audio[self.pos:self.pos + frames]
+        n = len(chunk)
+        outdata[:n] = chunk
+        if n < frames:
+            outdata[n:] = 0
+            self.done = True
+            raise self._sd.CallbackStop
+        self.pos += frames
+
+    def start(self):
+        self.started = True
+
+    def wait(self, timeout=40):
+        t0 = time.time()
+        while not self.done and time.time() - t0 < timeout:
+            time.sleep(0.02)
+
+    def close(self):
+        for fn in (self.stream.stop, self.stream.close):
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @property
+    def dur(self):
+        return len(self.audio) / self.sr
+
+
+def send_voice(target, wav48):
+    cfg = wxui.config()
+    hwnd = wxui.find_wechat(cfg)
+    if not hwnd:
+        raise RuntimeError("WeChat window not found")
+    rows = wxui.api(cfg, "/api/v1/sessions", limit=200).get("sessions", [])
+    talker = wxui.talker_for(cfg, target, rows)
+    if not talker:
+        raise RuntimeError("target not found in WeFlow session list / contacts")
+    plan = {"target": target, "talker": talker, "kind": "voice"}
+    client = wxui.Client()
+    opened = wxui.open_chat(client, cfg, target, plan)
+    if not opened:
+        claimed = str(plan.get("claimed") or "").lower()
+        # 「本来就在这个会话里」也算可用：open_chat 在这种情况下会返回 False，
+        # 但界面确实停在目标会话上（早前这里直接抛异常，把气泡判成失败）。
+        if "already on target" not in claimed and "click dedup" not in claimed:
+            raise RuntimeError("open_chat failed: " + str(plan.get("error"))[:300])
+    winio.raise_window(hwnd)
+    r = w.RECT()
+    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r))
+    l, t, R, B = r.left, r.top, r.right, r.bottom
+    W, H = R - l, B - t
+    send = (l + int(0.946 * W), t + int(0.929 * H))
+    mic, mic_tries = click_mic((l, t, R, B))
+    time.sleep(0.05)
+    dur = play_wav(wav48)
+    time.sleep(0.35)
+    winio.click(*send)
+    time.sleep(0.9)
+    shot = os.path.join(ROOT, "logs", "voice_send.png")
+    winio.grab((l, t, R, B), shot)
+    return {"dur": round(dur, 2), "shot": shot, "talker": talker, "mic_tries": mic_tries,
+            "open": {k: plan.get(k) for k in ("open_attempts", "claimed") if plan.get(k) is not None}}
+
+
+def latest_outgoing_voice(talker):
+    cfg = wxui.config()
+    msgs = wxui.api(cfg, "/api/v1/messages", talker=talker, limit=6, media="true", voice="true").get("messages", [])
+    ids = [int(m.get("localId") or 0) for m in msgs
+           if int(m.get("localType") or 0) == 34 and int(m.get("isSend") or 0) == 1]
+    return max(ids) if ids else 0
+
+
+def verify_delivery(talker, baseline=0, timeout=15.0, min_ms=800):
+    """Poll WeFlow until a NEW outgoing voice message (localId > baseline) shows up."""
+    import re
+    cfg = wxui.config()
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        msgs = wxui.api(cfg, "/api/v1/messages", talker=talker, limit=6, media="true", voice="true").get("messages", [])
+        for m in msgs:
+            if int(m.get("localType") or 0) != 34 or int(m.get("isSend") or 0) != 1:
+                continue
+            if int(m.get("localId") or 0) <= baseline:
+                continue
+            mm = re.search(r'voicelength="(\d+)"', m.get("rawContent") or "")
+            ms = int(mm.group(1)) if mm else 0
+            return {"ok": ms >= min_ms, "localId": m.get("localId"), "voicelength_ms": ms,
+                    "media": m.get("mediaLocalPath")}
+        time.sleep(0.8)
+    return {"ok": False, "error": f"no new outgoing voice within {timeout}s (baseline {baseline})"}
+
+
+def analyze_voice(path):
+    """客观指标：总长/相关电平/最响处，以及「开口前静音」与「结尾静音」。
+
+    2026-10-22 的教训：气泡时长 ≈ 音频时长才是对的。出现过 41 秒气泡里只有 7 秒声音
+    （发送点击太晚，录音条一直录到 60 秒上限附近），光看 verify.ok 会当成成功，
+    所以这里把实测指标带进结果，并据此判定 overrun。
+    """
+    with wave.open(path, "rb") as f:
+        sr, n, ch = f.getframerate(), f.getnframes(), f.getnchannels()
+        data = np.frombuffer(f.readframes(n), dtype=np.int16).astype(np.float32) / 32768.0
+    if ch > 1:
+        data = data.reshape(-1, ch).mean(axis=1)
+    if not len(data):
+        return {"dur": 0.0}
+    win = max(1, int(0.02 * sr))
+    fr = [float(np.sqrt((data[i:i + win] ** 2).mean())) for i in range(0, len(data) - win, win)]
+    if not fr:
+        return {"dur": round(len(data) / sr, 2)}
+    thr = float(np.percentile(fr, 90)) * 0.12
+    on = [i for i, v in enumerate(fr) if v > thr]
+    first = round(on[0] * 0.02, 2) if on else None
+    last = round(on[-1] * 0.02, 2) if on else None
+    return {"dur": round(len(data) / sr, 2),
+            "rms": round(float(np.sqrt((data ** 2).mean())), 4),
+            "peak": round(float(np.abs(data).max()), 3),
+            "first_sound_s": first, "last_sound_s": last}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--engine", default="svc", choices=["svc", "bv2", "gl"],
+                    help="svc = mimo TTS + so-vits-svc；bv2 = 知更鸟 Bert-VITS2（网上公开权重）")
+    ap.add_argument("--target", required=True)
+    ap.add_argument("--text", default="")
+    ap.add_argument("--model", default="knowbird")
+    ap.add_argument("--transpose", type=int, default=0)
+    ap.add_argument("--wav", default="")
+    ap.add_argument("--tag", default="")
+    args = ap.parse_args()
+    tag = args.tag or time.strftime("%H%M%S")
+    tmp_dir = os.path.join(ROOT, "logs", "voice")
+    os.makedirs(tmp_dir, exist_ok=True)
+    src = args.wav
+    info = {}
+    if src:
+        wav48 = os.path.join(tmp_dir, f"voice_{tag}_48.wav")
+        to_48k(src, wav48)
+    elif args.engine == "bv2":
+        bv2_wav = os.path.join(tmp_dir, f"bv2_{tag}.wav")
+        bv2_info = bv2_say(args.text, bv2_wav)
+        wav48 = os.path.join(tmp_dir, f"voice_{tag}_48.wav")
+        to_48k(bv2_wav, wav48)
+        info["engine"] = "bv2"
+        info["bv2"] = {k: bv2_info.get(k) for k in ("sampling_rate", "dur", "peak", "bytes", "elapsed_s")}
+    elif args.engine == "gl":
+        gl_wav = os.path.join(tmp_dir, f"gl_{tag}.wav")
+        gl_info = gl_say(args.text, gl_wav)
+        wav48 = os.path.join(tmp_dir, f"voice_{tag}_48.wav")
+        to_48k(gl_wav, wav48)
+        info["engine"] = "gl"
+        info["gl"] = {k: gl_info.get(k) for k in ("sid", "sr", "dur")}
+    else:
+        tts_wav = os.path.join(tmp_dir, f"tts_{tag}.wav")
+        tts(args.text, tts_wav)
+        svc_wav = os.path.join(tmp_dir, f"svc_{tag}.wav")
+        pth = svc_convert(tts_wav, args.model, svc_wav, args.transpose)
+        wav48 = os.path.join(tmp_dir, f"voice_{tag}_48.wav")
+        to_48k(svc_wav, wav48)
+        info["model_ckpt"] = os.path.basename(pth)
+    prev_cap = audio_default("capture")
+    rows = wxui.api(wxui.config(), "/api/v1/sessions", limit=200).get("sessions", [])
+    base_talker = wxui.talker_for(wxui.config(), args.target, rows)
+    baseline = latest_outgoing_voice(base_talker) if base_talker else 0
+    ok_set = audio_set("CABLE Output", "capture")
+    # 若上一次运行把默认麦克风留在了虚拟声卡上，这里回落的不是「上一个设备」而是真麦克风
+    restore_to = prev_cap if (prev_cap and "CABLE Output" not in prev_cap) else DEFAULT_CAPTURE
+    try:
+        res = send_voice(args.target, wav48)
+    finally:
+        if restore_to:
+            got = audio_set(restore_to, "capture")
+            if not got and DEFAULT_CAPTURE != restore_to:
+                audio_set(DEFAULT_CAPTURE, "capture")
+            prev_cap = restore_to
+    ver = verify_delivery(res.get("talker") or base_talker or "", baseline)
+    heard = {}
+    media = ver.get("media") if isinstance(ver, dict) else None
+    if ver.get("ok") and media and os.path.exists(media):
+        try:
+            heard = analyze_voice(media)
+        except Exception as exc:  # noqa: BLE001
+            heard = {"error": str(exc)[:120]}
+    # 录音条是从点麦克风一直录到点发送，所以「气泡时长 - 音频时长」就是开口前静音 +
+    # 收尾延迟。超过 4 秒说明发送点击太晚，这种气泡不能当成功交给用户。
+    overrun_ms = None
+    src_dur = float(res.get("dur") or 0.0)
+    if src_dur and ver.get("voicelength_ms"):
+        # 必须与「源音频长度」比：和回读到的气泡长度比会恒等，永远算出 0
+        overrun_ms = int(ver["voicelength_ms"] - src_dur * 1000)
+    ok = bool(ver.get("ok"))
+    if ok and overrun_ms is not None and overrun_ms > 4000:
+        ok = False
+        ver = dict(ver)
+        ver["error"] = ("recording overrun: bubble %.2fs for %.2fs audio "
+                        "(send click landed too late)" % (ver["voicelength_ms"] / 1000.0, src_dur))
+    info.update({"ok": ok, "target": args.target, "wav48": wav48, "capture_switched": ok_set,
+                 "capture_restored": prev_cap, "verify": ver, "heard": heard,
+                 "overrun_ms": overrun_ms, **res})
+    print(json.dumps(info, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+
+
+

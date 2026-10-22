@@ -35,6 +35,12 @@ $ErrorActionPreference = 'Stop'
 
 # Windows 控制台默认 GBK，AstrBot 启动横幅含 emoji，会让 loguru 的流 handler 抛
 # UnicodeEncodeError（"--- Logging error in Loguru Handler ---"）。强制 UTF-8 规避。
+# 点歌插件把 mp3 转成语音气泡需要 ffmpeg；AstrBot 进程的 PATH 里默认没有它，
+# 于是每次都报 "QQ语音发送失败... ffmpeg not found" 再回落文件卡片（2026-10-22 实测）。
+$ffmpegDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'tools\ffmpeg'
+if (Test-Path (Join-Path $ffmpegDir 'ffmpeg.exe')) {
+    $env:PATH = $ffmpegDir + ';' + $env:PATH
+}
 $env:PYTHONIOENCODING = 'utf-8'
 if ($PSVersionTable.PSVersion.Major -ge 6) { $OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 }
 
