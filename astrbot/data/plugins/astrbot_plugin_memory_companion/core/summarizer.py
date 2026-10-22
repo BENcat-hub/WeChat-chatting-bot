@@ -176,6 +176,14 @@ class MemorySummarizer:
         except Exception:
             importance_ok = False
         generic_terms = ("某用户", "某人", "有人", "用户说", "对方说", "群成员", "某群成员")
+        # 2026-10-22 事故：总结里写「这个时间窗口里没有其他群成员接话」，
+        # 命中了泛称词「群成员」→ 被判 low → 证据门禁拒绝 → 同一批次反复重试
+        # （retry_count=20）。泛称词只在「把话归因给不确定的人」时才算问题，
+        # 所以按分句判断：否定句（没有/无/不是/除了…）直接跳过。
+        generic_negations = (
+            "没有", "没", "无", "并非", "不是", "除了", "除", "不包括", "未",
+            "其他", "其它",
+        )
         if (
             len(summary) < 10
             or not key_facts
@@ -183,8 +191,14 @@ class MemorySummarizer:
             or not importance_ok
         ):
             return "low"
-        if any(term in summary for term in generic_terms):
-            return "low"
+        for clause in re.split(r"[。！？；\n]", summary):
+            clause = clause.strip()
+            if not clause:
+                continue
+            if any(negation in clause for negation in generic_negations):
+                continue
+            if any(term in clause for term in generic_terms):
+                return "low"
         return "normal"
 
     def _transcript_lines_and_rows(
