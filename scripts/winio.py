@@ -13,6 +13,7 @@ synthetic events, which is the part MCP cannot do (its latch is what used to sti
 "state=user" forever after an interrupted run).
 """
 import ctypes
+import json
 import ctypes.wintypes as wt
 import os
 import time
@@ -146,6 +147,27 @@ def grab(region, path):
 def move(x, y):
     user32.SetCursorPos(int(x), int(y))
     _touch()
+
+
+_CLICK_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "wxui-clickstate.json")
+
+
+def _shared_last_click():
+    try:
+        with open(_CLICK_STATE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return float(data.get("x")), float(data.get("y")), float(data.get("t") or 0.0)
+    except Exception:
+        return None, None, 0.0
+
+
+def _store_shared_click(x, y):
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(_CLICK_STATE)), exist_ok=True)
+        with open(_CLICK_STATE, "w", encoding="utf-8") as fh:
+            json.dump({"x": int(x), "y": int(y), "t": time.time()}, fh)
+    except Exception:
+        pass
 
 
 def click(x, y, settle=0.02):
@@ -351,6 +373,46 @@ if __name__ == "__main__":
     grab([0, 0, w, h], out)
     print("grab %dx%d in %.0f ms -> %s" % (w, h, (time.perf_counter() - t0) * 1000, out))
     print("idle=%.2fs human_busy=%s" % (_idle_seconds(), human_busy()))
+
+def close_detached_chat(title=None, main_title="微信"):
+    """关掉微信「独立会话窗口」。
+
+    微信 4.x 里双击 / 拖拽会话行会把它弹成一个独立窗口（ClassName 同为
+    Qt51514QWindowIcon，标题是联系人名）。这种窗口会让定位与打字落到错误的
+    窗口上，所以在定位前把「标题等于目标」的那类窗口关掉；title=None 时关掉
+    除主窗口以外的全部微信会话窗口。
+    """
+    closed = []
+    try:
+        u = ctypes.windll.user32
+    except Exception:
+        return closed
+    EnumWindows = u.EnumWindows
+    CB = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+
+    def _cb(hwnd, lparam):
+        if not u.IsWindowVisible(hwnd):
+            return True
+        name_len = u.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(name_len + 1)
+        u.GetWindowTextW(hwnd, buf, name_len + 1)
+        cls = ctypes.create_unicode_buffer(256)
+        u.GetClassNameW(hwnd, cls, 256)
+        if not cls.value.startswith("Qt51514"):
+            return True
+        name = (buf.value or "").strip()
+        if not name or name == main_title:
+            return True
+        if title is not None:
+            if name != str(title).strip():
+                return True
+        u.PostMessageW(hwnd, 0x0010, 0, 0)      # WM_CLOSE
+        closed.append(name)
+        return True
+
+    EnumWindows(CB(_cb), 0)
+    return closed
+
 
 def press_down(x, y, settle=0.02):
     """Hold the left button down at (x, y) without releasing (for 按住说话)."""
