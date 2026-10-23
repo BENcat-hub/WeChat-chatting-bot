@@ -385,12 +385,15 @@ from .segmented_message import (
     component_order_from_owner,
     component_strategies_from_owner,
     flatten_component_chunks,
+    fit_segments_to_budget,
     has_fenced_llm_segment_marker,
+    limit_planned_segments,
     LLM_SEGMENT_MARKER,
     normalize_component_strategy,
     parse_llm_segment_control,
     plan_component_chunks,
     sanitize_llm_segment_control_tokens,
+    segment_exceeds_granularity,
     split_llm_controlled_text,
     strip_llm_segment_marker_lines,
 )
@@ -466,6 +469,7 @@ except ModuleNotFoundError as exc:
 from .event_dispatch import EventDispatchMixin, _ON_WAITING_LLM_REQUEST
 from .reading_archive import ReadingArchiveMixin
 from .news_exploration import NewsExplorationMixin
+from .meme_lookup import MemeLookupMixin
 try:
     from .self_timeline import SelfTimelineMixin
 except ModuleNotFoundError as exc:
@@ -1789,6 +1793,7 @@ class PrivateCompanionPlugin(
     EventDispatchMixin,
     ReadingArchiveMixin,
     NewsExplorationMixin,
+    MemeLookupMixin,
     SelfTimelineMixin,
     AtRelayMixin,
     Star,
@@ -11323,6 +11328,15 @@ class PrivateCompanionPlugin(
         chunks, changed, text = self._segment_llm_reply_chain(event, chain)
         if not chunks or not text:
             return
+        chunks, dropped_recitals = self._drop_schedule_recital_chunks(event, chunks)
+        if dropped_recitals:
+            changed = True
+            try:
+                filtered_texts = self._plain_text_segments_from_chunks(chunks)
+            except Exception:
+                filtered_texts = []
+            if filtered_texts and len(filtered_texts) == len(chunks):
+                text = "\n".join(str(item or "") for item in filtered_texts) or text
         chunks = self._limit_private_routine_check_segments(
             str(getattr(event, "message_str", "") or ""),
             chunks,
@@ -11429,6 +11443,88 @@ class PrivateCompanionPlugin(
         if not body or any(not isinstance(comp, Plain) for comp in body):
             return ""
         return "".join(str(getattr(comp, "text", "") or "") for comp in body).strip()
+
+    # 后置过滤：把「当前计划时段」当成刚发生的事复述出来的分段直接丢弃。
+    # 阈值与长度上限都是经验值：正常回复几乎不会命中日程里的二字词组合，
+    # 逐句复述行程的分段则会出现大面积重合。
+    _SCHEDULE_RECITAL_OVERLAP_THRESHOLD = 0.30
+    _SCHEDULE_RECITAL_MAX_CHARS = 60
+    _SCHEDULE_RECITAL_QUESTION_PATTERN = re.compile(
+        r"(干嘛|干什么|做什么|在忙|忙啥|忙什么|干吗|干啥|去哪|哪儿|哪里|怎么样|过得|"
+        r"干了啥|做了什么|什么安排|计划|日程|安排|行程)"
+    )
+
+    @staticmethod
+    def _cjk_bigram_set(text: str) -> set[str]:
+        cleaned = re.sub(r"[^\u4e00-\u9fff]", "", str(text or ""))
+        if len(cleaned) < 2:
+            return set()
+        return {cleaned[index : index + 2] for index in range(len(cleaned) - 1)}
+
+    def _drop_schedule_recital_chunks(
+        self,
+        event: AstrMessageEvent,
+        chunks: list[Any],
+    ) -> tuple[list[Any], int]:
+        """丢弃与「当前计划时段」文本高度重合的分段。
+
+        用户没有在问 Bot 近况时，日程只允许作为语气背景；某一段与计划文本的
+        汉字二元组重合度超过阈值，说明模型把行程写成了回复正文，直接丢弃。
+        用户主动问行程/近况时不过滤。
+        """
+        if not bool(getattr(self, "enable_schedule_recital_filter", True)):
+            # 2026-10-23 用户要求关闭：编号清单会被判成「复述日程」而丢掉大半段。
+            return chunks, 0
+        if len(chunks) < 2:
+            return chunks, 0
+        inbound = str(getattr(event, "message_str", "") or "")
+        if self._SCHEDULE_RECITAL_QUESTION_PATTERN.search(inbound):
+            return chunks, 0
+        try:
+            verified_schedule, planned_schedule = self._private_passive_schedule_material(None)
+        except Exception:
+            return chunks, 0
+        plan_text = planned_schedule or verified_schedule or ""
+        plan_bigrams = self._cjk_bigram_set(plan_text)
+        if not plan_bigrams:
+            return chunks, 0
+        plain_texts = self._plain_text_segments_from_chunks(chunks)
+        if len(plain_texts) != len(chunks):
+            plain_texts = [self._segmented_chunk_log_text(chunk) for chunk in chunks]
+        scored: list[tuple[int, Any, float, str]] = []
+        for index, chunk in enumerate(chunks):
+            seg_text = str(plain_texts[index] or "").strip()
+            seg_bigrams = self._cjk_bigram_set(seg_text)
+            if not seg_bigrams:
+                scored.append((index, chunk, 0.0, seg_text))
+                continue
+            ratio = len(plan_bigrams & seg_bigrams) / len(seg_bigrams)
+            scored.append((index, chunk, ratio, seg_text))
+        dropped = [
+            item
+            for item in scored
+            if item[2] >= self._SCHEDULE_RECITAL_OVERLAP_THRESHOLD
+            and len(item[3]) <= self._SCHEDULE_RECITAL_MAX_CHARS
+        ]
+        if not dropped:
+            return chunks, 0
+        dropped_indexes = {item[0] for item in dropped}
+        keep = [item[1] for item in scored if item[0] not in dropped_indexes]
+        if not keep:
+            # 整条回复都在复述日程时保留重合度最低的一段，避免完全不回应。
+            survivor = min(scored, key=lambda item: item[2])
+            keep = [survivor[1]]
+            dropped_indexes.discard(survivor[0])
+            dropped = [item for item in scored if item[0] in dropped_indexes]
+        for index, _chunk, ratio, seg_text in dropped:
+            logger.info(
+                "已丢弃与当前计划时段高度重合的分段: session=%s seg_index=%s overlap=%.2f text=%s",
+                _single_line(getattr(event, "unified_msg_origin", ""), 120) or "unknown",
+                index,
+                ratio,
+                _single_line(seg_text, 120),
+            )
+        return keep, len(dropped)
 
     def _segmented_result_from_chain(
         self,
@@ -11885,14 +11981,31 @@ class PrivateCompanionPlugin(
         if not plugin_rules_enabled or any(
             item.suppress_plugin_rule_split for item in parse_results
         ):
-            planned = [
-                [
-                    cleaned
-                    for segment in segments
-                    if (cleaned := apply_common_transforms(segment))
-                ]
-                for segments in parsed_buffers
-            ]
+            planned = []
+            for segments in parsed_buffers:
+                buffer_parts: list[str] = []
+                for segment in segments:
+                    cleaned = apply_common_transforms(segment)
+                    if not cleaned:
+                        continue
+                    # 模型自己用标记切了段，但每段里还挤着好几句（逗号串成长句）：
+                    # 这种情况仍然按规则再切一次，否则「一条消息只说一句」形同虚设。
+                    if plugin_rules_enabled and self._segment_exceeds_granularity(
+                        cleaned, event=event, umo=umo
+                    ):
+                        parts = [
+                            str(part).strip()
+                            for part in self._split_proactive_text(
+                                cleaned, event=event, umo=umo
+                            )
+                            if str(part).strip()
+                        ]
+                        if len(parts) >= 2:
+                            buffer_parts.extend(parts)
+                            continue
+                    buffer_parts.append(cleaned)
+                planned.append(buffer_parts)
+            planned = self._limit_planned_segments(planned, event=event, umo=umo)
             if event is not None and len(planned) == 1 and len(planned[0]) >= 2:
                 setattr(
                     event,
@@ -11953,6 +12066,11 @@ class PrivateCompanionPlugin(
                 max_segments_override=remaining + 1,
             )
             additions = max(0, len(candidate) - 1)
+            if additions > remaining > 0:
+                # 段里有好几句，但剩余名额不够整段切完：按名额切，尾巴并回最后一段，
+                # 不要整段放弃（否则模型自己切出来的长段会原样发出去）。
+                candidate = fit_segments_to_budget(candidate, remaining)
+                additions = max(0, len(candidate) - 1)
             if additions <= 0 or additions > remaining:
                 continue
             result[buffer_index][segment_index] = candidate
@@ -11993,6 +12111,48 @@ class PrivateCompanionPlugin(
                 tuple(flattened_ids_by_buffer[0]),
             )
         return flattened_buffers
+
+    _SEGMENT_GRANULARITY_CHARS = 20
+
+    def _segment_granularity_chars(self) -> int:
+        """一条微信消息「一句话」的字数上限，与分段提示词里的 20 字对齐。"""
+
+        return max(
+            8,
+            _safe_int(
+                runtime_persona_setting(
+                    self, "segmented_proactive_granularity_chars", self._SEGMENT_GRANULARITY_CHARS
+                ),
+                self._SEGMENT_GRANULARITY_CHARS,
+                8,
+                60,
+            ),
+        )
+
+    def _segment_exceeds_granularity(self, text: str, *, event: Any = None, umo: str = "") -> bool:
+        """这段是不是「一句塞了好几句」的长段（值得再用规则切一次）。"""
+
+        return segment_exceeds_granularity(text, self._segment_granularity_chars())
+
+    def _limit_planned_segments(
+        self,
+        planned: list[list[str]],
+        *,
+        event: Any = None,
+        umo: str = "",
+    ) -> list[list[str]]:
+        """把再切之后的分段压回 max_segments，超出部分并进最后一段。"""
+
+        max_segments = max(
+            1,
+            _safe_int(
+                self._segmented_setting("max_segments", event=event, umo=umo, default=3),
+                3,
+                1,
+                8,
+            ),
+        )
+        return limit_planned_segments(planned, max_segments)
 
     def _segment_llm_reply_chain(self, event: AstrMessageEvent, chain: list[Any]) -> tuple[list[list[Any]], bool, str]:
         working_chain = list(chain or [])
@@ -16075,6 +16235,8 @@ class PrivateCompanionPlugin(
                 "只用于语气、长短、节奏和轻微接话；不要把它改写成用户做过的事或现实已经发生的事件。"
                 "更重要的是：这些日程/氛围素材只是背景，不是本轮要说的话——用户没问时不要主动复述、不要逐句描述行程，"
                 "顶多用一个短句顺带一提，绝不允许把日程内容单独写成一条消息发出去；"
+                "素材里的具体动作、地点、物品（买了什么、路上看到了什么）也不得当成刚发生的事写进回复正文，"
+                "这类内容只能用来调节语气和情绪，不能成为回复里陈述的事实；"
                 "用户问的若是别的话题，就只回答那个话题。"
             )
         )
@@ -19413,6 +19575,19 @@ class PrivateCompanionPlugin(
                 resp.completion_text = ""
             except Exception:
                 pass
+
+    @filter.on_llm_response(priority=110000)
+    @_multi_persona_event_context
+    async def repair_unknown_meme_response(
+        self,
+        event: AstrMessageEvent,
+        resp: LLMResponse,
+        *args,
+        **kwargs,
+    ):
+        """回复里出现「不知道 XX 是什么意思」时：截断 → 联网速查 → 带着释义重写。"""
+
+        await self._repair_unknown_meme_response(event, resp)
 
     @filter.on_llm_response()
     @_multi_persona_event_context

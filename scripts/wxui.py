@@ -2859,12 +2859,13 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
         # 2026-10-22 刷屏事故：回读判断如果失败，每条消息会被重发 3 次再进队列，
         # 队列每 20s 再补一遍，同一条「翻唱完成」在群里连发 12 条。
         # 发之前先看 180s 内是不是已经有同样的文本 —— 有就不发。
-        _recent = verify(cfg, talker, text, time.time() + 2, 0, time.time() - 180)
+        _dedupe_window = float(cfg.get("dedupe_window_s", 600))
+        _recent = verify(cfg, talker, text, time.time() + 2, 0, time.time() - _dedupe_window)
         if _recent:
             plan.update(ok=True, verified=True, localId=_recent.get("localId"),
                         dedup_recent=True)
-            log.info("[wxui] ↺ 跳过重复发送 %s（180s 内已有同样文本 localId=%s）",
-                     target, _recent.get("localId"))
+            log.info("[wxui] ↺ 跳过重复发送 %s（%.0fs 内已有同样文本 localId=%s）",
+                     target, _dedupe_window, _recent.get("localId"))
             return plan
         for attempt in range(1, attempts_max + 1):
             if attempt > 1:

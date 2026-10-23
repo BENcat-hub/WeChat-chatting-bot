@@ -286,6 +286,11 @@ def initialize_plugin_config(self: Any, config: Any) -> None:
         "enable_p4_b_legacy_score_isolation",
         False,
     )
+    self.enable_schedule_recital_filter = self._cfg_bool(
+        c,
+        "enable_schedule_recital_filter",
+        True,
+    )
 
 def _initialize_core_and_relationship_config(self: Any, c: Any) -> None:
     self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)
@@ -2021,6 +2026,11 @@ def _initialize_group_and_provider_config(self: Any, c: Any) -> None:
     self.enable_group_slang_web_search = self._cfg_bool(c, "enable_group_slang_web_search", False)
     self.group_slang_web_search_terms = self._cfg_int(c, "group_slang_web_search_terms", 4, 1, 12)
     self.group_slang_web_search_results = self._cfg_int(c, "group_slang_web_search_results", 2, 1, 5)
+    self.enable_meme_web_lookup = self._cfg_bool(c, "enable_meme_web_lookup", True)
+    self.meme_lookup_sites = self._cfg_str(c, "meme_lookup_sites", "bilibili,cnmeme,gengbaike")
+    self.meme_lookup_summary_chars = self._cfg_int(c, "meme_lookup_summary_chars", 260, 80, 800)
+    self.enable_meme_reply_repair = self._cfg_bool(c, "enable_meme_reply_repair", True)
+    self.meme_reply_repair_max_terms = self._cfg_int(c, "meme_reply_repair_max_terms", 2, 1, 3)
     self.enable_group_relationship_graph = self._cfg_bool(c, "enable_group_relationship_graph", True)
     self.enable_group_privacy_guard = self._cfg_bool(c, "enable_group_privacy_guard", True)
     self.enable_group_third_party_portrait_guard = self._cfg_bool(
