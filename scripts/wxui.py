@@ -504,7 +504,10 @@ def name_match(key, text):
     # "could not locate target row by OCR"。同长度 + 首字相同是这种"部首/形近替身"的
     # 典型特征；但 0.55 远低于 NAME_MATCH_CLEAR，因此它**只能**通过需要"同一屏里唯一
     # 最佳"的 fuzzy 分支（find_row / 标题复核）生效，凡是要求精确的闸门都不认它。
-    if len(a) == len(b) >= 2 and a[0] == b[0]:
+    # 2026-10-23：「桃桃真可爱」的旧备注「陈铭坚」靠这条宽匹配认领了「陈奥琦」，
+    # 身份闸因此放行，发给桃桃的消息全敲进了陈奥琦。收紧成首尾都相同：
+    # OCR 形近改写通常两端都对得上，而不同人的名字极少首尾同时撞车。
+    if len(a) == len(b) >= 3 and a[0] == b[0] and a[-1] == b[-1]:
         return NAME_MATCH_LENIENT
     return 0.0
 
@@ -805,8 +808,14 @@ def header_names_target(key, texts):
     lines = [t for t in (texts or []) if t]
     if not keys:
         return False
-    if any(name_matches_any(k, lines) for k in keys):
+    # 第一个是真实名称，后面是备注/历史别名。别名只接受**高置信**命中：
+    # 事故里别名「陈铭坚」用 0.55 的宽匹配认领了「陈奥琦」。
+    if name_matches_any(keys[0], lines):
         return True
+    for k in keys[1:]:
+        for t in lines:
+            if k == t or k in t or t in k:
+                return True
     # OCR 把数字读歪（6-508 → 6巧08）时，整串折一折再比；允许前缀命中，因为群标题后面
     # 常跟着成员数「(7)」。这一关只在前一行已由侧边栏选中该目标时才可能通过。
     fold_keys = {ocr_fold(k) for k in keys if ocr_fold(k)}
@@ -2392,6 +2401,16 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
             gap = min_gap - (time.time() - last_click)
             if gap > 0:
                 time.sleep(gap)
+        # 2026-10-23：同一行在几秒内被点两次，微信会当成双击 → 会话弹成独立窗口。
+        # 这里给「同一个目标、同一个落点」加 2.5s 冷却：重试路径不会再把同一行点第二下，
+        # 需要真正重开时上层会重新扫描拿到新的落点。
+        _prev = _CLICK_MEMO.get(target)
+        if _prev and (time.time() - _prev["ts"]) < float(cfg.get("row_click_cooldown_s", 2.5)):
+            _pp = _prev.get("point") or (0, 0)
+            if abs(x - _pp[0]) <= 8 and abs(y - _pp[1]) <= 8:
+                plan["click_cooldown_skip"] = {"age_s": round(time.time() - _prev["ts"], 2),
+                                               "point": list(_pp)}
+                break
         try:
             plan["click_driver"] = ui_click(client, cfg, (x, y))
         except HumanBusy:
