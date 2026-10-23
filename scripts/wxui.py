@@ -1010,6 +1010,11 @@ def _side_scroll(client, cfg, hover, notches, wait_s=None):
     要几十秒。SendInput 的 WHEEL 事件把同样的动作压到几十毫秒，翻页才可能进 2 秒预算。
     `notches` 正数向上、负数向下。
     """
+    # 滚轮事件只送到前台窗口：微信不在最上层时滚它等于滚别人的窗口，
+    # 于是「翻页了但列表没动」。先确认窗口在最上层，抢不到就直接放弃滚动。
+    _ready = ensure_wechat_ready(cfg)
+    if not _ready.get("ok"):
+        return "not-foreground"
     notches = int(notches)
     if notches == 0:
         return "noop"
@@ -1084,6 +1089,24 @@ def _expand_pinned_section(client, cfg, rect):
         log.info("[wxui] 🔓 已展开「%s」，重新扫描侧栏", line.get("text"))
         return True
     return False
+
+
+def session_exists_in_weflow(cfg, target):
+    """目标会话在 WeFlow 的会话列表里存在吗？用来区分「聊天列表里没有」和「根本没这个人」。"""
+    try:
+        res = api(cfg, "/api/v1/sessions", limit=300)
+        sessions = res.get("sessions") or res.get("data") or []
+        if not isinstance(sessions, list):
+            return None
+        keys = {fit(k) for k in target_keys(cfg, target)}
+        for sess in sessions:
+            names = [sess.get("displayName"), sess.get("nickname"), sess.get("username"), sess.get("name")]
+            if any(fit(n) in keys for n in names if n):
+                return {"displayName": sess.get("displayName") or sess.get("nickname"),
+                        "username": sess.get("username")}
+        return {}
+    except Exception as exc:                                   # noqa: BLE001
+        return {"error": str(exc)}
 
 
 def _pixels_belong_to(hwnd, rect, probes=((0.35, 0.5), (0.5, 0.3), (0.5, 0.5), (0.5, 0.7), (0.7, 0.5))):
@@ -2134,31 +2157,6 @@ def header_looks_like(cfg, target, texts):
     return False, ""
 
 
-def _clear_search_box(client, cfg, rect):
-    """点搜索框 → ctrl+a → 删除，清掉上一次搜索残留的词。
-
-    实测：上一次搜索被打断（或发送失败）会让搜索框里留着「群，我，开始以为看错了」这种旧
-    文字，再粘贴就成了「旧词+新词」，微信搜出来的东西完全不对（于是「找不到目标会话」）。
-    每次搜索都从空框开始，是搜索兜底可靠的前提。
-    """
-    x, y = _search_box_point(cfg, rect)
-    if _native_on(cfg, "native_input"):
-        winio.click(x, y)
-        time.sleep(float(cfg.get("search_focus_wait_s", 0.12)))
-        winio.chord(winio.VK_CTRL, winio.VK_A)
-        time.sleep(0.03)
-        winio.chord(winio.VK_BACK)
-        time.sleep(0.05)
-        return "native"
-    client.call("Click", {"loc": [x, y], "clicks": 1})
-    time.sleep(0.3)
-    client.call("Shortcut", {"shortcut": "ctrl+a"})
-    time.sleep(0.06)
-    client.call("Shortcut", {"shortcut": "delete"})
-    time.sleep(0.1)
-    return "mcp"
-
-
 def open_chat_by_search(client, cfg, rect, target):
     """点搜索框 → 粘贴会话名 → 点「确实叫这个名字」的结果行。
 
@@ -2377,11 +2375,26 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
             # 展开一次再决定要不要放弃。
             if _expand_pinned_section(client, cfg, rect):
                 plan["pinned_expanded"] = True
+                # 展开后列表多出一堆置顶行，原先“已在顶部”的缓存不再成立，
+                # 且目标会被挤到更下面：复位滚动状态，并临时放宽翻页上限。
+                _SCROLL_POS["at_top"] = False
+                _SCROLL_POS["ts"] = 0.0
+                cfg = dict(cfg)
+                cfg["sidebar_scroll_pages"] = int(cfg.get("sidebar_scroll_pages", 6)) + 4
             else:
-                    return fail(plan, "could not locate target chat (target=%s; header=%s; search: %s)"
+                    _hint = session_exists_in_weflow(cfg, target)
+                    plan["weflow_session"] = _hint
+                    _note = ""
+                    if _hint:
+                        _note = "；WeFlow 里有这个会话（%s），但它不在当前聊天列表里（被删/被归档/需要滚动）" % (
+                            _hint.get("displayName") or _hint.get("username"))
+                    elif _hint == {}:
+                        _note = "；WeFlow 会话列表里也没有它"
+                    return fail(plan, "could not locate target chat (target=%s; header=%s; search: %s)%s"
                             % (target,
                                " / ".join(header0.get("texts", [])[:4]) or "nothing",
-                               (plan.get("search_fallback") or {}).get("error") or "not tried"))
+                               (plan.get("search_fallback") or {}).get("error") or "not tried",
+                               _note))
         point, dbg = find_row(client, cfg, rect, target)
         plan["ocr"] = {"png": dbg.get("png"), "engine": dbg.get("engine"),
                        "error": dbg.get("error"), "region": dbg.get("region"),
