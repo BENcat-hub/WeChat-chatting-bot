@@ -91,5 +91,8 @@
   "sidebar_settle_timeout_s": 0.25,
   "sidebar_reset_chunk_notches": 12,
   "locate_settle_note": "翻页后只截一帧：画面和上一页不同即认为已滚到位；最多等 0.25s（原来 0.5s + 额外稳定检测）",
-  "search_disabled_note": "用户明确要求：定位只用侧栏 OCR + 原生滚轮 + 聊天头部校验，绝不用搜索框（会把待发送正文打进搜索框，还会点到聊天记录预览）"
+  "search_disabled_note": "用户明确要求：定位只用侧栏 OCR + 原生滚轮 + 聊天头部校验，绝不用搜索框（会把待发送正文打进搜索框，还会点到聊天记录预览）",
+  "defer_to_human": false,
+  "identity_recheck_before_enter": true,
+  "identity_recheck_note": "2026-10-23：给桃桃的消息被连发三份到陈奥琦——校验时是桃桃，Ctrl+V 时会话已被用户切走。现在粘贴后回车前会再确认一次会话身份，不符就 Ctrl+A/Del 清空并放弃；用户正在用键鼠时（human_busy）直接让路，不抢输入。"
 }

@@ -2504,7 +2504,55 @@ def _assemble(plan, attempt_log, found, kind, cfg, talker, text=None):
     return plan
 
 
+def _identity_recheck(cfg, target):
+    """打字中途再确认一次「现在开着的还是不是目标会话」。
+
+    2026-10-23 事故：给「桃桃真可爱」的消息被连发三份到「陈奥琦」——校验那一刻还是
+    桃桃，真正 Ctrl+V 的时候会话已经被用户切到陈奥琦。这里只做一件事：**只有明确
+    认出「另一个像人名的会话名」才否决**；OCR 读不出、读到界面噪声（`楼 上 6 巧 08`
+    这种）一律放行，否则会把正常发送全部误拦（实测第一版就误拦了文件传输助手）。
+    """
+    def _plausible(text):
+        t = "".join(str(text or "").split())
+        if not (2 <= len(t) <= 12):
+            return False
+        if re.search(r"[0-9（）()\[\]/\|:：、,，]", t):
+            return False
+        return bool(re.fullmatch(r"[一-鿿A-Za-z_]+", t))
+
+    verdict_other = 0
+    reason = ""
+    for _ in range(2):
+        try:
+            hwnd = find_wechat(cfg)
+            if not hwnd:
+                return True, "wechat window gone (allow)"
+            rect = restored_rect(hwnd)
+            ok, hd = chat_header_matches(None, cfg, rect, target)
+            if ok:
+                return True, "header"
+            texts = [t for t in (hd.get("texts") or []) if fit(t)]
+            other = None
+            for t in texts:
+                if _plausible(t) and name_match(target, t) < 0.3:
+                    other = t
+                    break
+            if other:
+                verdict_other += 1
+                reason = "header=%s" % other
+            else:
+                verdict_other = 0
+                reason = "header unreadable"
+        except Exception as e:
+            return True, "recheck error (allow): %s" % e
+        time.sleep(0.12)
+    if verdict_other >= 2:
+        return False, reason
+    return True, reason or "header unreadable (allow)"
+
+
 def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, client=None):
+
     """Send text, retrying with a fresh read-back check until it is verified delivered.
 
     Every attempt is: wait for a usable session → open the chat → clear the input box →
@@ -2610,11 +2658,29 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                         raise RuntimeError("foreground is not the WeChat main window "
                                            "(fg=%r title=%r); refusing to type"
                                            % (fg_hwnd, fg_title))
+                if _native_on(cfg, "native_input") and cfg.get("defer_to_human", True) and winio.human_busy():
+                    # 人正在用键鼠时不抢输入：此刻敲的每个键都算在用户头上，
+                    # 会话也可能正被用户切来切去（2026-10-23 连发三份到别人的事故）。
+                    plan.update(error="deferred: user is using the computer", retryable=False,
+                                no_requeue=True)
+                    attempt_log.append({"attempt": attempt, "stage": "defer_to_human"})
+                    break
                 if _native_on(cfg, "native_input"):
                     # 原生粘贴：写剪贴板 + Ctrl+V + Enter ≈ 20ms，而三次 windows-mcp 输入调用
                     # 要 ~1.7s（每条消息都付一遍，这是“发一条要好几秒”的主要来源）。
                     winio.set_clipboard(text)
                     winio.chord(winio.VK_CTRL, winio.VK_V)
+                    if cfg.get("identity_recheck_before_enter", True):
+                        _id_ok, _id_why = _identity_recheck(cfg, target)
+                        if not _id_ok:
+                            # 粘贴之后会话被切走了：删掉刚粘进去的内容，绝不回车。
+                            winio.chord(winio.VK_CTRL, winio.VK_A)
+                            winio.chord(winio.VK_BACK)
+                            plan.update(error="chat switched mid-send (%s); input cleared" % _id_why,
+                                        retryable=False, no_requeue=True)
+                            attempt_log.append({"attempt": attempt, "stage": "identity_recheck",
+                                                "why": _id_why})
+                            break
                     time.sleep(float(cfg.get("after_paste_wait_text", 0.3)))
                     winio.chord(winio.VK_RETURN)
                 else:
@@ -2635,6 +2701,17 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
             attempt_log.append({"attempt": attempt, "verified": bool(found),
                                 "localId": (found or {}).get("localId"),
                                 "open_attempts": plan.get("open_attempts")})
+            if not found and cfg.get("identity_recheck_before_enter", True):
+                # 回读失败时先看会话是不是被切走了：如果文字其实敲进了别人的窗口，
+                # 再「重试」只会让那个人收到第二份、第三份（2026-10-23 连发三份事故）。
+                _id2_ok, _id2_why = _identity_recheck(cfg, target)
+                if not _id2_ok:
+                    plan.update(error=("sent into a different chat (%s); not retrying "
+                                       "to avoid duplicate delivery" % _id2_why),
+                                retryable=False, no_requeue=True)
+                    attempt_log.append({"attempt": attempt, "stage": "identity_after_send",
+                                        "why": _id2_why})
+                    break
             if found:
                 # 只有拿到回读确认才算「输入框已空、窗口仍在原位」，下一条才敢走热路径
                 _warm_mark(target, plan.get("window_rect"), header_verified=True, clean=True)
