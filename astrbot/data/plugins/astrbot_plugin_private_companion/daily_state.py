@@ -9552,6 +9552,43 @@ class DailyStateMixin(DailyStateTickMixin):
                 waits.append(0.0)
         return min(waits) if waits else None
 
+    def _memo_reminder_users(self) -> list[tuple[str, dict[str, Any]]]:
+        """便签提醒只发给「主人」，绝不群发。
+
+        2026-10-23 事故：`memo_notes` 是全局单例，而收件人取的是
+        `_personal_goal_owner_users()`——一个把所有私聊对象都算成 owner 的列表，
+        结果一条「作业清单（周五提醒）」在 19:00 同时发给了 13 个联系人，
+        内容还是同一份编号清单（分段发送时又被丢弃几段，只剩 3/4/6/8）。
+        现在：优先用配置 `memo_reminder_user_ids`（list）；没配就只发第一个 owner。
+        """
+        targets = self._personal_goal_owner_users()
+        if not targets:
+            return []
+        configured = getattr(self, "memo_reminder_user_ids", None)
+        wanted: list[str] = []
+        if isinstance(configured, (list, tuple)):
+            wanted = [str(item).strip() for item in configured if str(item or "").strip()]
+        elif isinstance(configured, str) and configured.strip():
+            wanted = [
+                part.strip()
+                for part in configured.replace("，", ",").split(",")
+                if part.strip()
+            ]
+        if wanted:
+            picked = [item for item in targets if item[0] in wanted]
+            if picked:
+                return picked
+            logger.warning(
+                "[便签提醒] memo_reminder_user_ids 里没有可用的收件人（%s），本次不发送",
+                ",".join(wanted),
+            )
+            return []
+        logger.info(
+            "[便签提醒] 未配置 memo_reminder_user_ids，本次不发送（可选收件人：%s）",
+            ",".join(item[0] for item in targets[:6]),
+        )
+        return []
+
     async def _maybe_process_memo_notes(self, *, force: bool = False) -> None:
         now = _now_ts()
         async with self._data_lock:
@@ -9587,7 +9624,7 @@ class DailyStateMixin(DailyStateTickMixin):
                 offered = 0
                 note["last_reminder_attempt_at"] = now
                 changed = True
-                for user_id, user in self._personal_goal_owner_users():
+                for user_id, user in self._memo_reminder_users():
                     scheduled = now + random.uniform(8, 35)
                     candidate = {
                         "source": "memo_note",
