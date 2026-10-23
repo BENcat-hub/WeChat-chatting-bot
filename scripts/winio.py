@@ -272,7 +272,7 @@ def press_escape():
     chord(VK_ESCAPE)
 
 
-def raise_window(hwnd, timeout=0.8):
+def raise_window(hwnd, timeout=1.6):
     """把窗口从最小化/后台带到前台，返回是否成功。
 
     用户 2026-10-21 明确要求：他不会把微信置顶，我们不能假设它已经在前台，必须自己唤起。
@@ -310,6 +310,12 @@ def raise_window(hwnd, timeout=0.8):
         finally:
             if attached:
                 user32.AttachThreadInput(cur, tgt, False)
+        try:
+            # SwitchToThisWindow 走的是「用户切换」语义，比 SetForegroundWindow 更容易被允许
+            user32.SwitchToThisWindow(hwnd, True)
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)  # NOSIZE|NOMOVE|SHOWWINDOW
+        except Exception:
+            pass
         time.sleep(0.04)
         if user32.GetForegroundWindow() == hwnd:
             return True

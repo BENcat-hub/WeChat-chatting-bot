@@ -50,6 +50,13 @@ try:  # noqa: E402  - must match Windows-MCP's physical-pixel space
 except Exception:
     pass
 
+import logging                                                      # noqa: E402
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("wxui")
+
 CONFIG_PATH = os.path.join(HERE, "wxui-config.json")
 
 
@@ -1019,7 +1026,8 @@ def _side_scroll(client, cfg, hover, notches, wait_s=None):
     return "mcp"
 
 
-_PINNED_COLLAPSE_HINTS = ("折叠置顶", "展开置顶", "折叠的置顶", "查看更多", "查看全部")
+_PINNED_COLLAPSE_HINTS = ("折叠置顶", "展开置顶", "折叠的置顶", "查看更多", "查看全部",
+                         "个置顶聊天", "置顶聊天", "个置顶")
 
 
 def _expand_pinned_section(client, cfg, rect):
@@ -1076,6 +1084,103 @@ def _expand_pinned_section(client, cfg, rect):
         log.info("[wxui] 🔓 已展开「%s」，重新扫描侧栏", line.get("text"))
         return True
     return False
+
+
+def _pixels_belong_to(hwnd, rect, probes=((0.35, 0.5), (0.5, 0.3), (0.5, 0.5), (0.5, 0.7), (0.7, 0.5))):
+    """窗口矩形内抽样几个点，看屏幕上真正显示的是不是这个进程的窗口。
+
+    仅靠 GetForegroundWindow 判断「微信在最上层」太严：有置顶小工具、输入法候选框或
+    RDP/远程会话时前台句柄可能不是微信，但微信的像素仍然好好地摆在那儿，OCR 完全可用。
+    真正会让 OCR 读错的是「微信被别的窗口盖住」，那用 WindowFromPoint 就能问出来。
+    """
+    user32 = ctypes.windll.user32
+    try:
+        target_pid = int(user32.GetWindowThreadProcessId(hwnd, None))
+    except Exception:                                          # noqa: BLE001
+        return None
+    left, top, right, bottom = [int(v) for v in rect]
+    ok = 0
+    hits = []
+    for fx, fy in probes:
+        x = left + int((right - left) * fx)
+        y = top + int((bottom - top) * fy)
+        try:
+            hwnd_at = int(user32.WindowFromPoint(ctypes.wintypes.POINT(x, y)) or 0)
+            pid_at = int(user32.GetWindowThreadProcessId(hwnd_at, None)) if hwnd_at else 0
+        except Exception:                                      # noqa: BLE001
+            return None
+        hits.append((x, y, hwnd_at, pid_at))
+        if pid_at and pid_at == target_pid:
+            ok += 1
+    return {"ok": ok >= max(1, int(len(probes) * 0.6)), "hits": hits, "pid": target_pid,
+            "covered": [h for h in hits if h[3] != target_pid]}
+
+
+def ensure_wechat_ready(cfg, raise_it=True):
+    """OCR / 点击之前的前置检查：微信窗口是否开着、是否在最上层。
+
+    OCR 读的是屏幕像素（GDI BitBlt），被别的窗口盖住就会读到别人家 UI，于是出现
+    「侧栏找不到会话」「头部认错人」「点到别的窗口」。所以每轮扫描/复核之前先确认：
+      ① 窗口存在 ② 可见且未最小化 ③ 不是被遮挡（前台是它，或抽样点都落在它自己身上）
+    不满足就先尝试唤起（SetForegroundWindow / AttachThreadInput / 最小化再还原 / 临时置顶），
+    仍然被遮挡才返回 ok=False，让调用方跳过 OCR 而不是读脏数据。
+    """
+    info = {"ok": False, "raised": False}
+    user32 = ctypes.windll.user32
+    try:
+        hwnd = find_wechat(cfg)
+    except Exception as exc:                                   # noqa: BLE001
+        info["reason"] = "find_wechat failed: %s" % exc
+        return info
+    if not hwnd:
+        info["reason"] = "wechat main window not found"
+        return info
+    info["hwnd"] = int(hwnd)
+    try:
+        info["visible"] = bool(user32.IsWindowVisible(hwnd))
+        info["iconic"] = bool(user32.IsIconic(hwnd))
+    except Exception:                                          # noqa: BLE001
+        info["visible"], info["iconic"] = True, False
+    try:
+        info["foreground"] = int(user32.GetForegroundWindow() or 0) == int(hwnd)
+    except Exception:                                          # noqa: BLE001
+        info["foreground"] = False
+
+    if raise_it and winio is not None and (not info["visible"] or info["iconic"] or not info["foreground"]):
+        for attempt in ("raise", "restore", "topmost"):
+            try:
+                if attempt == "raise":
+                    info["raised"] = bool(winio.raise_window(hwnd))
+                elif attempt == "restore":
+                    user32.ShowWindow(hwnd, 6)          # SW_MINIMIZE
+                    time.sleep(0.12)
+                    user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+                else:
+                    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)   # HWND_TOPMOST
+                    user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, 0x0001 | 0x0002)   # HWND_NOTOPMOST
+            except Exception as exc:                           # noqa: BLE001
+                info["%s_error" % attempt] = str(exc)
+            try:
+                info["foreground"] = int(user32.GetForegroundWindow() or 0) == int(hwnd)
+            except Exception:                                  # noqa: BLE001
+                pass
+            if info["foreground"]:
+                break
+            time.sleep(float(cfg.get("ensure_foreground_wait_s", 0.12)))
+
+    try:
+        info["rect"] = list(restored_rect(hwnd))
+    except Exception:                                          # noqa: BLE001
+        info["rect"] = []
+    on_top = None
+    if info["rect"]:
+        on_top = _pixels_belong_to(hwnd, info["rect"])
+    info["on_top"] = on_top
+    info["ok"] = bool(info["rect"]) and (info["foreground"] or bool(on_top and on_top.get("ok")))
+    if not info["ok"]:
+        info["reason"] = ("wechat window is covered by another window"
+                          if info["visible"] else "wechat window is hidden or minimized")
+    return info
 
 
 def find_row(client, cfg, rect, target):
@@ -1351,6 +1456,9 @@ def _scan_sidebar(client, cfg, region, top, target, png_path=None):
     `png_path` lets the caller hand in a frame it already grabbed while waiting for the
     list to settle — one screenshot per page instead of two.
     """
+    _ready = ensure_wechat_ready(cfg)
+    if not _ready.get("ok"):
+        return None, {"error": "wechat window is not in the foreground", "window": _ready}
     if png_path:
         png, err = png_path, None
     else:
@@ -1670,6 +1778,10 @@ def chat_header_matches(client, cfg, rect, target):
     the main window, so the header text (not a window title) is what proves the right
     chat is open — and that is what stops a wrong-recipient send.
     """
+    _ready = ensure_wechat_ready(cfg)
+    if not _ready.get("ok"):
+        return False, {"error": "wechat window is not in the foreground", "window": _ready,
+                       "texts": [], "ocr_tries": 0}
     left, top, right, bottom = rect
     region = clamp_region(
         [left + cfg["chat_header_x_offset_px"], top + cfg["chat_header_y_offset_px"],
