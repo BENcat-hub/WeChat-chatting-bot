@@ -2474,6 +2474,16 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                 plan["row_point"] = []
                 plan["open_attempts"] = 0
                 return _chat_ready_to_type(cfg, plan, target)
+        try:
+            _closed = winio.close_detached_chat(target) if winio else []
+            if _closed:
+                plan["closed_detached"] = _closed
+                log.info("[wxui] 🪟 已关闭独立会话窗口: %s", ", ".join(_closed))
+                time.sleep(0.2)
+        except HumanBusy:
+            raise
+        except Exception as _exc:                              # noqa: BLE001
+            log.info("[wxui] 关闭独立窗口失败: %s", _brief(_exc))
         _pin = ensure_pinned_expanded(client, cfg, rect)
         plan["pinned"] = {k: _pin.get(k) for k in ("found", "expanded", "row", "rows_before", "rows_after")}
         if not cfg.get("locate_sidebar_fallback", False):
