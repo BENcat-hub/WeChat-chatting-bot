@@ -1035,6 +1035,110 @@ _PINNED_COLLAPSE_HINTS = ("折叠置顶", "展开置顶", "折叠的置顶", "�
                          "个置顶聊天", "置顶聊天", "个置顶")
 
 
+def _sidebar_rows(client, cfg, rect):
+    """OCR 一遍侧栏，返回 [(fit_text, phys_x, phys_y, raw_text)]，按 y 排序。"""
+    hwnd = find_wechat(cfg)
+    if not hwnd:
+        return []
+    r = restored_rect(hwnd) if not rect else rect
+    if not rect_usable(r):
+        return []
+    left, top, right, bottom = r
+    region = clamp_region(
+        [left + cfg["sidebar_capture_x_offset"], top + cfg["sidebar_capture_y_offset"],
+         left + cfg["sidebar_capture_x2_offset"], bottom - cfg["sidebar_capture_bottom_margin"]],
+        r,
+    )
+    png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp"))
+    if not png:
+        return []
+    scale_up = float(cfg.get("sidebar_ocr_scale", 2.0) or 1.0)
+    ocr_png = _upscale_for_ocr(png, scale_up) if scale_up > 1.0 else png
+    size = image_size(ocr_png)
+    res = ocr_lines(ocr_png)
+    if not res.get("ok"):
+        return []
+    img_w, img_h = size if size else (region[2] - region[0], region[3] - region[1])
+    scale_y = (region[3] - region[1]) / float(img_h)
+    scale_x = (region[2] - region[0]) / float(img_w)
+    rows = []
+    for line in res.get("lines") or []:
+        raw = line.get("text") or ""
+        text = fit(raw)
+        if not text:
+            continue
+        box_h = max((w["y"] + w["h"] for w in (line.get("words") or [])),
+                    default=line.get("y", 0) + 18) - line.get("y", 0)
+        y_phys = region[1] + (line.get("y", 0) + max(box_h, 18) / 2.0) * scale_y
+        x_phys = region[0] + (line.get("x", 0) + 40) * scale_x
+        rows.append((text, int(x_phys), int(y_phys), raw))
+    rows.sort(key=lambda item: item[2])
+    return rows
+
+
+_PINNED_STATE = {"expanded": False, "ts": 0.0}
+
+
+def ensure_pinned_expanded(client, cfg, rect=None):
+    """微信侧栏把置顶会话折成一行时，先点开它，否则里面的会话在 OCR 里完全不存在。
+
+    2026-10-23 用户指正：定位失败的「陈奥琦 / 桃桃真可爱 / 海蛇」都是**置顶**会话，
+    被折进「N 个置顶聊天」这一行里，扫描自然找不到。以前只在彻底失败后才试着展开，
+    而且展开成功与否没有校验。现在改为：扫描前先看有没有这一行 → 点开 → 再 OCR 一次
+    确认置顶会话确实出现了（行数变多或那一行本身消失），确认后把滚动状态复位。
+    """
+    rows = _sidebar_rows(client, cfg, rect)
+    if not rows:
+        return {"found": False, "expanded": False, "reason": "sidebar unreadable"}
+    hit = None
+    for text, x, y, raw in rows:
+        if any(h in text for h in _PINNED_COLLAPSE_HINTS):
+            hit = (text, x, y, raw)
+            break
+    if not hit:
+        _PINNED_STATE["expanded"] = False
+        return {"found": False, "expanded": False, "reason": "no collapse row"}
+    # 这一行是「展开/收起」开关：已经展开时再点会把它折回去（2026-10-23 实测，
+    # 结果就是下一个目标又找不到人）。所以记住刚展开过，短时间内直接复用。
+    if _PINNED_STATE["expanded"] and (time.time() - _PINNED_STATE["ts"]) < float(
+            cfg.get("pinned_state_ttl_s", 180)):
+        return {"found": True, "expanded": True, "reason": "already expanded (cached)",
+                "row": hit[3], "rows_before": len(rows), "rows_after": len(rows)}
+    before_n = len(rows)
+    try:
+        ui_click(client, cfg, (hit[1], hit[2]))
+    except HumanBusy:
+        raise
+    except Exception as exc:                                   # noqa: BLE001
+        return {"found": True, "expanded": False, "reason": "click failed: %s" % _brief(exc),
+                "row": hit[3]}
+    time.sleep(float(cfg.get("pinned_expand_wait_s", 0.55)))
+    after = _sidebar_rows(client, cfg, rect)
+    still_there = any(any(h in t for h in _PINNED_COLLAPSE_HINTS) for t, _x, _y, _r in after)
+    grew = len(after) > before_n + 1
+    expanded = bool(after) and (grew or not still_there)
+    if after and not expanded and len(after) < before_n:
+        # 刚才那一击其实是「收起」——再点一次展开回去，并重新计数
+        try:
+            ui_click(client, cfg, (hit[1], hit[2]))
+            time.sleep(float(cfg.get("pinned_expand_wait_s", 0.55)))
+            after = _sidebar_rows(client, cfg, rect)
+            still_there = any(any(h in t for h in _PINNED_COLLAPSE_HINTS) for t, _x, _y, _r in after)
+            expanded = bool(after) and (len(after) > before_n - 1 or not still_there)
+        except Exception:                                      # noqa: BLE001
+            pass
+    if expanded:
+        _PINNED_STATE["expanded"] = True
+        _PINNED_STATE["ts"] = time.time()
+        _SCROLL_POS["at_top"] = True
+        _SCROLL_POS["ts"] = time.time()
+        log.info("[wxui] 🔓 已展开置顶会话（%s）：%d 行 → %d 行",
+                 hit[3], before_n, len(after))
+    return {"found": True, "expanded": expanded, "row": hit[3],
+            "rows_before": before_n, "rows_after": len(after),
+            "names_after": [t for t, _x, _y, _r in after][:14]}
+
+
 def _expand_pinned_section(client, cfg, rect):
     """点开微信侧栏的「折叠置顶聊天」，让被折进去的置顶会话重新可见。
 
@@ -2370,6 +2474,8 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                 plan["row_point"] = []
                 plan["open_attempts"] = 0
                 return _chat_ready_to_type(cfg, plan, target)
+        _pin = ensure_pinned_expanded(client, cfg, rect)
+        plan["pinned"] = {k: _pin.get(k) for k in ("found", "expanded", "row", "rows_before", "rows_after")}
         if not cfg.get("locate_sidebar_fallback", False):
             # 目标可能被折进「折叠置顶聊天」里（侧栏 OCR 完全看不到）：
             # 展开一次再决定要不要放弃。
