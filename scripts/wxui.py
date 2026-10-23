@@ -2825,6 +2825,16 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
     rows = api(cfg, "/api/v1/sessions", limit=200).get("sessions", [])
     talker = talker_for(cfg, target, rows)
     plan = {"target": target, "talker": talker, "kind": "text"}
+    # 每次发送前先清掉微信的「独立会话窗口」：它们会占住前台，让打字闸门直接失败，
+    # 也会让 Ctrl+V 落进另一个窗口（2026-10-23 21:08 的实测报错就是标题为联系人名的窗口）。
+    try:
+        if winio and _native_on(cfg, "native_input"):
+            _pre_closed = winio.close_detached_chat()
+            if _pre_closed:
+                plan["closed_detached_pre"] = _pre_closed
+                log.info("[wxui] 🪟 发送前关闭独立会话窗口: %s", ", ".join(_pre_closed))
+    except Exception:  # noqa: BLE001
+        pass
     # 防御：bridge 偶尔会把 None 当文本传进来（实测报错
     # `desktop input refused: object of type 'NoneType' has no len()`），
     # 直接拒绝比让它一路走到 set_clipboard 再炸更清楚。
@@ -2915,6 +2925,22 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                 if _native_on(cfg, "native_input"):
                     fg_hwnd, fg_title, _fg_cls = winio.foreground_info()
                     main_hwnd = find_wechat(cfg)
+                    if not main_hwnd or fg_hwnd != main_hwnd:
+                        # 微信 4.x 里双击/拖拽会话行会弹「独立会话窗口」（ClassName 同
+                        # Qt51514QWindowIcon、标题=联系人名）。前台是它时绝不能打字：
+                        # 先关掉它并把主窗口拉回前台，再复查一次。
+                        if str(_fg_cls or "").startswith(cfg.get("window_class_prefix") or "Qt51514"):
+                            _closed = winio.close_detached_chat()
+                            if _closed:
+                                log.info("[wxui] 🪟 打字前关闭独立会话窗口: %s", ", ".join(_closed))
+                                time.sleep(0.35)
+                                if main_hwnd:
+                                    try:
+                                        winio.raise_window(main_hwnd)
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    time.sleep(0.15)
+                                fg_hwnd, fg_title, _fg_cls = winio.foreground_info()
                     if not main_hwnd or fg_hwnd != main_hwnd:
                         raise RuntimeError("foreground is not the WeChat main window "
                                            "(fg=%r title=%r); refusing to type"
