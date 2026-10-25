@@ -1,4 +1,4 @@
-{
+﻿{
   "config_version": 5,
   "platform_settings": {
     "unique_session": false,
@@ -104,7 +104,7 @@
       "provider": "siliconflow",
       "type": "openai_chat_completion",
       "provider_type": "chat_completion",
-      "key": "<ROTATED_SILICONFLOW_KEY>",
+      "key": "sk-REPLACE_ME",
       "timeout": 120,
       "api_base": "https://api.siliconflow.cn/v1",
       "proxy": "",

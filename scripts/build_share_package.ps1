@@ -260,9 +260,39 @@ $scrubMap = [ordered]@{
     '鱼宝🐳'          = '用户E'
     '鱼宝'           = '用户E'
     '㊙️情🔞VIP💎508🉑👅🈲✈️' = '示例群聊B'
-    # 真实密钥
-    '<ROTATED_WEFLOW_TOKEN>' = '<FILL_ME_WEFLOW_TOKEN>'
-    '<ROTATED_DEEPSEEK_KEY>' = '<FILL_ME>'
+    # 真实密钥绝不写在这里：本脚本自己也会被复制进发布树并推到公开仓库，
+    # 写在这里 = 明文泄露（2026-10-25 已真实发生过一次）。改为运行时读取，见下。
+}
+
+# ── 真实密钥：运行时从本地配置读取，脚本正文里不留任何明文 ──────────────────
+# 事故记录：`sk-baf8…5efa`（DeepSeek）与 WeFlow 的 access_token 曾写死在上面的
+# 清理表里，于是被「清理」逻辑原样复制进发布树，随仓库公开了。
+$collectLocalSecrets = {
+    $found = New-Object System.Collections.Generic.List[string]
+    $sources = @(
+        (Join-Path $StackRoot 'astrbot\data\cmd_config.json'),
+        (Join-Path $StackRoot 'akasha-bridge\config.json')
+    )
+    foreach ($src in $sources) {
+        if (-not (Test-Path $src)) { continue }
+        try {
+            $raw = Get-Content $src -Raw -Encoding UTF8
+            foreach ($m in [regex]::Matches($raw, 'sk-[A-Za-z0-9]{20,}')) {
+                if (-not $found.Contains($m.Value)) { $found.Add($m.Value) }
+            }
+            foreach ($m in [regex]::Matches($raw, '"access_token"\s*:\s*"([0-9a-f]{24,})"')) {
+                $tok = $m.Groups[1].Value
+                if ($tok -and -not $found.Contains($tok)) { $found.Add($tok) }
+            }
+        } catch {
+            Write-Warning "读取本地密钥失败（跳过该文件）: $src"
+        }
+    }
+    return $found
+}
+foreach ($secret in (& $collectLocalSecrets)) {
+    $scrubMap[[string]$secret] = '<FILL_ME>'
+    Write-Host "已加入清理表：$($secret.Substring(0, 6))…$($secret.Substring($secret.Length - 4))"
 }
 
 $textExt = '.py', '.md', '.json', '.ps1', '.txt', '.cmd', '.bat', '.js', '.ts', '.yaml', '.yml',
