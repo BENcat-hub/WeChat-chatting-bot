@@ -14,13 +14,14 @@ from astrbot.api.star import Context, Star
 from .backend.auto_collect import AutoCollectManager
 from .backend.packs.categories import CategoryManager
 from .backend.packs.images import IMAGE_EXTENSIONS
+from .backend.packs.resolver import get_pack_paths
 from .backend.semantic.index import EmbeddingAdapter, index_is_ready
 from .backend.semantic.models import runtime_category_mapping
 from .backend.semantic.query import (
-    candidate_records,
+    candidate_records_multi_pack,
     dumps_result,
     remember_candidates,
-    search_memes,
+    search_memes_multi_pack,
 )
 from .backend.semantic.storage import load_metadata, semantic_metadata_is_complete
 from .backend.semantic.task import SemanticTaskManager
@@ -31,6 +32,7 @@ from .config import (
 from .image_host.img_sync import ImageSync
 from .mixins.commands import CommandMixin
 from .mixins.event_handlers import EventHandlerMixin, normalize_trigger_scope
+from .mixins.integration import IntegrationMixin
 from .mixins.web_api import WebAPIMixin
 from .utils import dict_to_string, load_json
 
@@ -42,7 +44,7 @@ PLUGIN_NAME = "meme_manager"
 WEBUI_LOG_PREFIX = f"[{PLUGIN_NAME}][WebUI]"
 
 
-class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
+class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin, IntegrationMixin):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self._normalize_mixin_handler_module_paths()
@@ -98,19 +100,6 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
         self.semantic_min_score = float(
             self._read_config_value(("semantic", "min_score"), default=0.25)
         )
-        # 2026-10-16 重复表情包事故：语义检索没有"最近已发"冷却，连续多轮
-        # 会选中同一张。这里给每个会话记录最近发过的表情 ID，冷却期内不再选中。
-        self.semantic_recent_cooldown_seconds = float(
-            self._read_config_value(
-                ("semantic", "recent_cooldown_seconds"),
-                default=1800.0,
-            )
-            or 0.0
-        )
-        self.semantic_recent_max_items = int(
-            self._read_config_value(("semantic", "recent_max_items"), default=12) or 12
-        )
-        self._recent_meme_uses: dict[str, list[tuple[float, str]]] = {}
         self.semantic_task_manager = SemanticTaskManager(
             PLUGIN_DATA_DIR,
             context=context,
@@ -199,7 +188,14 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
         auto_collect_config = self._read_path(("auto_collect",), {})
         self.auto_collect_manager = AutoCollectManager(
             self,
-            auto_collect_config if isinstance(auto_collect_config, dict) else {},
+            {
+                **(
+                    auto_collect_config if isinstance(auto_collect_config, dict) else {}
+                ),
+                "auto_embedding": bool(
+                    self._read_path(("semantic", "auto_collect_embedding"), True)
+                ),
+            },
         )
 
         # 配置项
@@ -299,8 +295,8 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
         self._semantic_initial_rebuild_task = None
 
     async def initialize(self) -> None:
-        """Start collection on plugin reload as well as initial startup."""
-        await self.auto_collect_manager.start()
+        """Start collection on reload, deferring unregistered providers at startup."""
+        await self.auto_collect_manager.start(defer_missing_provider=True)
 
     @filter.on_astrbot_loaded()
     async def _schedule_semantic_initial_rebuild(self):
@@ -592,13 +588,15 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
     ) -> bool:
         """判断当前选择的运行时表情包能否使用语义检索。
 
+        Checks all bound packs: ready if at least one pack is fully indexed.
+
         Args:
             event: 当前 AstrBot 消息事件。
             req: 检查请求阶段工具时的当前模型请求。
             require_tool: 是否要求回复模型和请求公开语义检索工具。
 
         Returns:
-            表情包语义数据完整且对应索引就绪时返回 True。
+            True if a bound pack has valid vectors matching its embedding model.
         """
         if not self.semantic_enabled:
             return False
@@ -616,39 +614,35 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
                 or not tool_set.get_tool("search_memes")
             ):
                 return False
+
         context = self._resolve_runtime_pack_context(event=event, req=req)
-        pack_id = str(context.get("pack_id") or "")
-        if not pack_id:
+        pack_ids = context.get("pack_ids", [])
+        if not pack_ids:
             return False
-        pack_dir = context.get("pack_dir")
-        metadata = load_metadata(pack_dir)
-        if not semantic_metadata_is_complete(
-            pack_dir, metadata, require_embeddings=True
-        ):
-            return False
-        try:
-            provider = self._resolve_embedding_provider(pack_id)
-            embedding = EmbeddingAdapter(
-                provider, self.semantic_embedding_provider_id or ""
-            )
-        except Exception as exc:
-            logger.warning(
-                "语义检索不可用，回退到旧版分类：%s",
-                exc,
-            )
-            return False
-        provider_id = embedding.provider_id
-        return (
-            index_is_ready(
-                PLUGIN_DATA_DIR,
-                pack_id,
-                metadata,
-                provider_id,
-                embedding.model_name,
-                embedding.dimension,
-            )
-            and embedding.ready
-        )
+
+        # A broken pack must not disable healthy packs in the same binding.
+        for pack_id in pack_ids:
+            try:
+                pack_dir = get_pack_paths(pack_id)["pack_dir"]
+                metadata = load_metadata(pack_dir)
+                provider = self._resolve_embedding_provider(pack_id)
+                embedding = EmbeddingAdapter(
+                    provider, self.semantic_embedding_provider_id or ""
+                )
+                if embedding.ready and index_is_ready(
+                    PLUGIN_DATA_DIR,
+                    pack_id,
+                    metadata,
+                    embedding.provider_id,
+                    embedding.model_name,
+                    embedding.dimension,
+                    allow_partial=True,
+                ):
+                    return True
+            except Exception as exc:
+                logger.warning("Pack %s semantic check failed: %s", pack_id, exc)
+
+        return False
 
     @staticmethod
     def _remove_semantic_tool(req: ProviderRequest) -> None:
@@ -673,14 +667,15 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
         """
         if event is None or not hasattr(event, "get_extra"):
             return False
-        verified_pack_id = str(
-            event.get_extra("meme_manager_semantic_verified_pack_id") or ""
+        verified_ids = str(
+            event.get_extra("meme_manager_semantic_verified_pack_ids") or ""
         )
-        runtime_pack_id = str(event.get_extra("meme_manager_runtime_pack_id") or "")
+        runtime_pack_ids = event.get_extra("meme_manager_runtime_pack_ids") or []
+        runtime_ids_str = ",".join(runtime_pack_ids)
         return (
             bool(event.get_extra("meme_manager_semantic_active"))
-            and bool(verified_pack_id)
-            and verified_pack_id == runtime_pack_id
+            and bool(verified_ids)
+            and verified_ids == runtime_ids_str
         )
 
     def _semantic_system_prompt(self) -> str:
@@ -790,9 +785,12 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
                 "meme_manager_runtime_memes_dir",
                 str(context["memes_dir"]),
             )
+            # Store both single pack_id (for backward compat) and pack_ids list.
+            pack_ids = context.get("pack_ids", [])
             event.set_extra(
                 "meme_manager_runtime_pack_id", str(context.get("pack_id") or "")
             )
+            event.set_extra("meme_manager_runtime_pack_ids", pack_ids)
         return context
 
     def _get_runtime_memes_dir_for_event(self, event: AstrMessageEvent):
@@ -865,11 +863,11 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
         if event is not None and hasattr(event, "set_extra"):
             event.set_extra("meme_manager_semantic_active", semantic_active)
             event.set_extra("meme_manager_semantic_mode", semantic_mode)
+            # Store verified pack IDs for later validation.
+            runtime_pack_ids = event.get_extra("meme_manager_runtime_pack_ids") or []
             event.set_extra(
-                "meme_manager_semantic_verified_pack_id",
-                str(event.get_extra("meme_manager_runtime_pack_id") or "")
-                if semantic_active
-                else "",
+                "meme_manager_semantic_verified_pack_ids",
+                ",".join(runtime_pack_ids) if semantic_active else "",
             )
             event.set_extra("meme_manager_semantic_selected_ids", [])
             event.set_extra("meme_manager_semantic_candidates", {})
@@ -898,14 +896,20 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
             else runtime_category_mapping(self.category_mapping)
         )
         # 首次安装时即使没有可用图片，也可能已有分类描述。
-        memes_dir = Path(pack_context["memes_dir"])
+        memes_dirs = [
+            Path(directory) / "memes"
+            for directory in pack_context.get("pack_dirs", {}).values()
+        ] or [Path(pack_context["memes_dir"])]
         category_mapping = {
             key: description
             for key, description in category_mapping.items()
-            if (memes_dir / key).is_dir()
-            and any(
-                image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS
-                for image in (memes_dir / key).iterdir()
+            if any(
+                (memes_dir / key).is_dir()
+                and any(
+                    image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS
+                    for image in (memes_dir / key).iterdir()
+                )
+                for memes_dir in memes_dirs
             )
         }
         req.system_prompt = self._strip_meme_prompt(req.system_prompt)
@@ -964,27 +968,41 @@ class MemeSender(Star, WebAPIMixin, CommandMixin, EventHandlerMixin):
         provider_request = event.get_extra("provider_request")
         if provider_request is not None:
             self._remove_semantic_tool(provider_request)
+
         context = self._resolve_runtime_pack_context(event=event)
-        if str(context.get("pack_id") or "") != str(
-            event.get_extra("meme_manager_semantic_verified_pack_id") or ""
-        ):
+        pack_ids = context.get("pack_ids", [])
+
+        # Verify pack_ids match what was checked before prompt injection.
+        verified_ids = str(
+            event.get_extra("meme_manager_semantic_verified_pack_ids") or ""
+        )
+        if ",".join(pack_ids) != verified_ids:
             return dumps_result({"ok": False, "reason": "当前语义图包已经变化"})
+
         try:
-            result = await search_memes(
-                context["pack_dir"],
+            # Resolve providers separately because packs can use different indexes.
+            pack_contexts = []
+            for pack_id in pack_ids:
+                paths = get_pack_paths(pack_id)
+                pack_contexts.append(
+                    {"pack_id": pack_id, "pack_dir": paths["pack_dir"]}
+                )
+
+            result = await search_memes_multi_pack(
+                pack_contexts,
                 PLUGIN_DATA_DIR,
-                str(context["pack_id"]),
                 query,
-                self._resolve_embedding_provider(str(context["pack_id"])),
+                self._resolve_embedding_provider,
                 top_k=self.semantic_top_k,
                 min_score=self.semantic_min_score,
-                _verified_complete=True,
             )
-            records = candidate_records(
-                context["pack_dir"], result.get("candidates") or []
+
+            records = candidate_records_multi_pack(
+                pack_contexts, result.get("candidates") or []
             )
             remember_candidates(event, records)
             event.set_extra("meme_manager_semantic_query", str(query or ""))
+
             return dumps_result(
                 {
                     **result,

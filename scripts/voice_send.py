@@ -1,8 +1,8 @@
 r"""End-to-end: text -> TTS -> so-vits-svc voice -> WeChat voice bubble.
 
 Usage:
-  python voice_send.py --target "测试群" --text "你好啊" [--model 孙燕姿] [--transpose 0]
-  python voice_send.py --target "测试群" --wav logs\foo48.wav   (skip TTS+SVC)
+  python voice_send.py --target "示例群聊D" --text "你好啊" [--model 孙燕姿] [--transpose 0]
+  python voice_send.py --target "示例群聊D" --wav logs\foo48.wav   (skip TTS+SVC)
 
 Flow: TTS (mimo) -> svc infer (rvc-backend\models\<model>) -> ffmpeg 48k mono
       -> default capture = CABLE Output -> wxui.open_chat(target)
@@ -20,7 +20,7 @@ import wave
 
 import numpy as np
 
-ROOT = r"C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack"
+ROOT = r"<REPO_ROOT>"
 sys.path.insert(0, ROOT + r"\scripts")
 
 try:

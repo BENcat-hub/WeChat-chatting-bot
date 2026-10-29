@@ -31,6 +31,23 @@ _recent_file_sends: dict[str, float] = {}
 _file_dedupe_lock = threading.Lock()
 
 
+def _queue_note(contact: str) -> str:
+    """发送失败时，日志里「到底有没有进重发队列」的事实。
+
+    2026-10-28：原来无条件写「已交重发队列」，而用户F别名那 4 条其实被
+    _retryable() 判成不可重发、当场丢弃，日志把排查引向了错误方向。
+    """
+    try:
+        n = state.sender_instance.pending_for(contact)
+    except Exception:  # noqa: BLE001
+        return "（队列状态未知）"
+    if n > 0:
+        return "已进入重发队列（待发 %d 条）" % n
+    if n == 0:
+        return "未进入重发队列（见 [wxui] 日志确认是否为不可重试错误）"
+    return "（队列状态未知）"
+
+
 def _file_fingerprint(path: str) -> str:
     import hashlib
 
@@ -235,7 +252,8 @@ async def _deliver_upload(params: dict, is_group: bool) -> dict:
     if ok:
         log.info(f"[OB11] 上传请求已投递为文件消息: {contact} {os.path.basename(fpath)} ({size} B)")
     else:
-        log.warning(f"[OB11] 文件未即时验证送达（已交重发队列）: {contact} {os.path.basename(fpath)}")
+        log.warning("[OB11] 文件未即时验证送达（%s）: %s %s",
+                    _queue_note(contact), contact, os.path.basename(fpath))
     return {"status": "ok", "retcode": 0,
             "data": {"file_id": os.path.basename(fpath), "file_name": name_val or os.path.basename(fpath),
                      "file_size": size}}
@@ -283,7 +301,7 @@ async def _handle_ob_api(data: dict):
                         log.info(f"[OB11] 文字已发送至 {contact}: {text[:50]}")
                     else:
                         log.warning(
-                            f"[OB11] ⚠ 文字未验证送达（已交重发队列，稍后自动补发）{contact}: {text[:50]}"
+                            "[OB11] ⚠ 文字未验证送达（%s）%s: %s", _queue_note(contact), contact, text[:50]
                         )
 
             elif seg_type == "image":
@@ -330,7 +348,7 @@ async def _handle_ob_api(data: dict):
                         if ok:
                             log.info(f"[OB11] 图片已发送至 {contact}")
                         else:
-                            log.warning(f"[OB11] ⚠ 图片未验证送达（已交重发队列，稍后自动补发）{contact}")
+                            log.warning("[OB11] ⚠ 图片未验证送达（%s）%s", _queue_note(contact), contact)
                     finally:
                         if normalized != img_path and "tmp" in os.path.basename(normalized or ""):
                             try:

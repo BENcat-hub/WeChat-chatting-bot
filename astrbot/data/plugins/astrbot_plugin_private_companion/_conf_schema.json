@@ -555,13 +555,13 @@
         "default": 6
       },
       "enable_group_relationship_affinity": {
-        "description": "允许测试群贡献统一好感度",
+        "description": "允许示例群聊D贡献统一好感度",
         "type": "bool",
-        "hint": "默认关闭。开启后也只有下方明确列出的测试群、正式已建档身份、明确 @/引用 Bot 且回复真实发送成功的事件才可能结算；普通群消息、转发、回流和发送失败始终不计分。",
+        "hint": "默认关闭。开启后也只有下方明确列出的示例群聊D、正式已建档身份、明确 @/引用 Bot 且回复真实发送成功的事件才可能结算；普通群消息、转发、回流和发送失败始终不计分。",
         "default": false
       },
       "group_relationship_affinity_allowlist": {
-        "description": "好感度测试群白名单",
+        "description": "好感度示例群聊D白名单",
         "type": "list",
         "hint": "必须逐项填写群 ID。空列表始终表示不允许任何群，绝不会解释为全部群。",
         "default": [],
@@ -611,7 +611,7 @@
           "max": 120,
           "step": 1
         },
-        "hint": "一个人在所有测试群累计的正负变化绝对量上限。",
+        "hint": "一个人在所有示例群聊D累计的正负变化绝对量上限。",
         "default": 4,
         "condition": "enable_group_relationship_affinity"
       },
@@ -623,7 +623,7 @@
           "max": 1000,
           "step": 1
         },
-        "hint": "同一测试群内所有用户合计的正负变化绝对量上限。",
+        "hint": "同一示例群聊D内所有用户合计的正负变化绝对量上限。",
         "default": 20,
         "condition": "enable_group_relationship_affinity"
       },

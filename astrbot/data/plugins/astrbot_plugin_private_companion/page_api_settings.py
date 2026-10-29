@@ -1173,6 +1173,7 @@ class PageSettingNormalizerMixin:
             "group_image_max_images",
             "group_slang_web_search_terms",
             "group_slang_web_search_results",
+            "meme_lookup_summary_chars",
             "auto_voice_max_chars",
             "auto_voice_cooldown_seconds",
         }:

@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -37,7 +38,22 @@ from ui_lock import UI_LOCK  # 与语音气泡链路共用的桌面输入锁
 
 log = logging.getLogger("ob11-bridge")
 
+_STRIP_CHARS = " \t\r\n。．.!！?？~～…,，、;；:：\"'\u201c\u201d\u2018\u2019"
+
+def _norm_dedupe_body(text: str) -> str:
+    """去重用的正文归一化：压缩空白、去掉首尾标点与表情尾巴。"""
+    t = re.sub(r"\s+", "", str(text or ""))
+    t = t.strip(_STRIP_CHARS)
+    return t
+
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# 2026-10-29：bridge 自己是无控制台的常驻进程（start-all 里隐藏启动），而 wxui.py 是
+# console 子系统的 python.exe。`subprocess.run/Popen` 不带 creationflags 时，Windows 会给
+# 这个子进程**新建一个控制台**——用户看到的就是「每点开一次微信就闪一个 Python 命令行窗口」。
+# CREATE_NO_WINDOW 让子进程不分配控制台；它的子进程（windows-mcp）同样需要这个标志，
+# 否则会再闪一个。真正的 console 句柄由父进程继承，没有父控制台时就必须靠它。
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
 class WxuiSender(WeMessengerSender):
@@ -105,6 +121,94 @@ class WxuiSender(WeMessengerSender):
 
     # ==================== 传输层 ====================
 
+    # 2026-10-27：复读的两个来源都已实测确认——
+    #   ① AstrBot/插件侧把同一条回复重复投递（一次翻唱完成能发 6~18 条）；
+    #   ② 重发队列每 20s 重放同一条「回读没确认到」的消息，而它其实早发出去了。
+    # 所以去重窗口必须覆盖整个重放周期（20s × 多次），并且要落盘（重启不丢）。
+    _dedupe_window_s = 300.0
+    _dedupe_cache_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "wxui_recent_sends.json")
+
+    def _dedupe_cache(self) -> dict:
+        cache = getattr(self, "_recent_sends", None)
+        if cache is not None:
+            return cache
+        cache = {}
+        try:
+            with open(self._dedupe_cache_path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            now = time.time()
+            cache = {str(k): float(v) for k, v in (raw or {}).items()
+                     if isinstance(v, (int, float)) and now - float(v) <= self._dedupe_window_s}
+        except Exception:
+            cache = {}
+        self._recent_sends = cache
+        return cache
+
+    def _flush_dedupe_cache(self, cache: dict) -> None:
+        try:
+            tmp = self._dedupe_cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(cache, fh, ensure_ascii=False)
+            os.replace(tmp, self._dedupe_cache_path)
+        except Exception as exc:  # 落盘失败不影响发送
+            log.debug("[wxui] 去重缓存写入失败: %s", exc)
+
+    def _is_duplicate_send(self, key: tuple, window: float | None = None) -> bool:
+        window = self._dedupe_window_s if window is None else float(window)
+        cache = self._dedupe_cache()
+        now = time.time()
+        stale = [k for k, ts in cache.items() if now - ts > window]
+        for k in stale:
+            cache.pop(k, None)
+        return str(key) in cache
+
+    def _remember_send(self, key: tuple) -> None:
+        cache = self._dedupe_cache()
+        cache[str(key)] = time.time()
+        self._flush_dedupe_cache(cache)
+
+    # ---- 尝试记录（只用于「别在没确认时反复重放」，不代表已送达）----
+    _attempt_hold_s = 120.0
+    _attempt_cache_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "wxui_recent_attempts.json")
+
+    def _attempt_cache(self) -> dict:
+        cache = getattr(self, "_recent_attempts", None)
+        if cache is not None:
+            return cache
+        cache = {}
+        try:
+            with open(self._attempt_cache_path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            now = time.time()
+            cache = {str(k): float(v) for k, v in (raw or {}).items()
+                     if isinstance(v, (int, float)) and now - float(v) <= self._attempt_hold_s}
+        except Exception:
+            cache = {}
+        self._recent_attempts = cache
+        return cache
+
+    def _remember_attempt(self, key: tuple) -> None:
+        cache = self._attempt_cache()
+        cache[str(key)] = time.time()
+        try:
+            tmp = self._attempt_cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(cache, fh, ensure_ascii=False)
+            os.replace(tmp, self._attempt_cache_path)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[wxui] 尝试缓存写入失败: %s", exc)
+
+    def _attempted_recently(self, key: tuple, window: float | None = None) -> bool:
+        window = self._attempt_hold_s if window is None else float(window)
+        cache = self._attempt_cache()
+        now = time.time()
+        stale = [k for k, ts in cache.items() if now - ts > window]
+        for k in stale:
+            cache.pop(k, None)
+        return str(key) in cache
+
     def _post(self, payload: dict) -> bool:
         if self.dry_run:  # 复用父类的 dry_run 日志格式
             return super()._post(payload)
@@ -121,7 +225,24 @@ class WxuiSender(WeMessengerSender):
                           {"retryable": True,
                            "error": "queued behind earlier undelivered message"})
             return False
+        # 短回复（「嗯」「行吧」「好」）本来就会连着发，不能按 5 分钟窗口去重；
+        # 用「原文逐字相同 + 30 秒」这个更严的口径，既拦住重试，又不会吞掉正常的短句。
+        norm_body = _norm_dedupe_body(text)
+        short_body = len(norm_body) < 8
+        dedupe_key = ("send", target, text.strip() if short_body else norm_body)
+        window = 30.0 if short_body else self._dedupe_window_s
+        if self._is_duplicate_send(dedupe_key, window) or self._attempted_recently(dedupe_key, window):
+            log.warning("[wxui] 🔁 同内容消息 %.0f 秒内刚发过/刚尝试过，跳过重复投递: %s",
+                        window, text[:40])
+            return True
+        # 2026-10-27 第二轮：发送前先记「尝试」（不等于已送达）。
+        # 回读超时（用户C那条要 90s）时 ok=False；没有尝试记录的话队列下一轮
+        # 会立刻重放同一句 → 刷屏。attempt 记录只用于抑制「短时间内重复重放」，
+        # 不会让消息被误判成已送达而丢掉。
+        self._remember_attempt(dedupe_key)
         ok, data = self._scheduled_run("send", {"target": target, "text": text}, target)
+        if ok:
+            self._remember_send(dedupe_key)
         if not ok and self._retryable(data) and not data.get("_enqueued") and not data.get("no_requeue"):
             self._block_contact(target)
             self._enqueue("send", {"target": target, "text": text}, target, data)
@@ -155,8 +276,16 @@ class WxuiSender(WeMessengerSender):
                           {"retryable": True,
                            "error": "queued behind earlier undelivered message"})
             return False
+        img_key = self._content_key("send-image", spec, contact)
+        if self._is_duplicate_send(img_key) or self._attempted_recently(img_key):
+            log.warning("[wxui] 🔁 同一张图片 %.0f 秒内刚发过/刚尝试过，跳过重复投递", self._dedupe_window_s)
+            return True
+        # 先记尝试、再发送（同 _post）
+        self._remember_attempt(img_key)
         ok, data = self._scheduled_run("send-image", spec, contact)
         self._settle()
+        if ok:
+            self._remember_send(img_key)
         if not ok and self._retryable(data) and not data.get("_enqueued") and not data.get("no_requeue"):
             self._block_contact(contact)
             self._enqueue("send-image", spec, contact, data)
@@ -182,8 +311,16 @@ class WxuiSender(WeMessengerSender):
                           {"retryable": True,
                            "error": "queued behind earlier undelivered message"})
             return False
+        file_key = self._content_key("send-file", spec, contact)
+        if self._is_duplicate_send(file_key) or self._attempted_recently(file_key):
+            log.warning("[wxui] 🔁 同一个文件 %.0f 秒内刚发过/刚尝试过，跳过重复投递", self._dedupe_window_s)
+            return True
+        # 先记尝试、再发送（同上）
+        self._remember_attempt(file_key)
         ok, data = self._scheduled_run("send-file", spec, contact)
         self._settle()
+        if ok:
+            self._remember_send(file_key)
         if not ok and self._retryable(data) and not data.get("_enqueued") and not data.get("no_requeue"):
             self._block_contact(contact)
             self._enqueue("send-file", spec, contact, data)
@@ -292,6 +429,7 @@ class WxuiSender(WeMessengerSender):
                     encoding="utf-8",
                     errors="replace",
                     timeout=self.wxui_timeout,
+                    creationflags=_CREATE_NO_WINDOW,
                 )
             except subprocess.TimeoutExpired:
                 log.error("[wxui] %s 超时（%.0fs）→ %s（消息进重发队列，重发前会先回读校验）",
@@ -343,6 +481,7 @@ class WxuiSender(WeMessengerSender):
                 errors="replace",
                 bufsize=1,
                 cwd=HERE,
+                creationflags=_CREATE_NO_WINDOW,
             )
         except Exception as e:
             log.warning("[wxui] 常驻 worker 启动失败，本条回退逐条起进程: %s", e)
@@ -569,15 +708,56 @@ class WxuiSender(WeMessengerSender):
             with urllib.request.urlopen(url, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             for item in (data.get("sessions") or []):
-                for key in ("name", "displayName", "nickname", "talker", "title"):
+                for key in ("name", "displayName", "nickname", "talker", "title", "username"):
                     val = item.get(key)
                     if val:
                         names.add(str(val))
         except Exception as exc:  # noqa: BLE001
             log.debug("[wxui] 读取会话列表失败，跳过幻影目标检查: %s", exc)
             return set()
+        # 2026-10-28：会话名和联系人名是两个名字空间（用户F别名的会话叫「用户F」、备注才是
+        # 用户F别名）。只认 /sessions 会让「用户F别名」永远过不了这道闸，把本来能发出去的消息
+        # 一次性丢光。这里把联系人的三种名字也并进来，比对时再归一化。
+        try:
+            import urllib.request
+
+            from config import ACCESS_TOKEN, WE_FLOW_BASE_URL
+
+            curl = "%s/api/v1/contacts?access_token=%s&limit=500" % (
+                WE_FLOW_BASE_URL.rstrip("/"), ACCESS_TOKEN)
+            with urllib.request.urlopen(curl, timeout=8) as resp:
+                cdata = json.loads(resp.read().decode("utf-8"))
+            for item in (cdata.get("contacts") or []):
+                for key in ("displayName", "remark", "nickname", "username", "alias"):
+                    val = item.get(key)
+                    if val:
+                        names.add(str(val))
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[wxui] 读取联系人列表失败（幻影检查只用会话名）: %s", exc)
         self._known_cache = (now, names)
         return names
+
+    @staticmethod
+    def _same_target(target: str, known: set) -> bool:
+        def _n(s):
+            return "".join(str(s or "").split()).lower()
+        t = _n(target)
+        if not t:
+            return False
+        return any(_n(k) == t for k in known)
+
+    def pending_for(self, target: str) -> int:
+        """队列里还有多少条发给 target 的消息（-1 = 读队列失败）。
+
+        OB11 层原来无论是否真的入队都写「已交重发队列」，用户F别名那次日志因此
+        骗了人（4 条其实当场就丢了）。这里给出事实，供日志使用。
+        """
+        try:
+            items = self._load_queue()
+        except Exception:  # noqa: BLE001
+            return -1
+        return sum(1 for it in (items or [])
+                   if self._same_target(target, {str(it.get("target") or "")}))
 
     @staticmethod
     def _retryable(data: dict) -> bool:
@@ -602,6 +782,39 @@ class WxuiSender(WeMessengerSender):
             "could not bring WeChat",
             "WeChat window not found",
         ))
+
+    @staticmethod
+    def _desktop_blocked(data: dict) -> bool:
+        """True when the attempt never reached WeChat because the desktop is unavailable.
+
+        2026-10-24：用户开全屏游戏时，wxui 抢不到前台（FULLSCREEN_HOLD / could not bring
+        WeChat to the foreground）。这类失败和「发出去但没回读到」不同——我们连尝试的机会
+        都没有，不该消耗重试次数，否则用户在游戏里待一会儿，队列就会把消息判成「重发放弃」
+        静默丢掉。
+        """
+        text = str((data or {}).get("error") or "")
+        return ("FULLSCREEN_HOLD" in text
+                or "could not bring WeChat to the foreground" in text
+                or "is covered by another window" in text
+                or "user is using the desktop" in text
+                or (data or {}).get("fullscreen_hold") is not None)
+
+    @staticmethod
+    def _content_key(kind: str, spec: dict, target: str) -> tuple:
+        """队列/入口去重用的内容指纹。
+
+        2026-10-27：正文先做归一化（去空白、去首尾标点）再比对。插件把同一条
+        「好啦好啦～…」投多次时，末尾的「~」「。」「…」和空格常常不一致，逐字节
+        比对会漏掉，进而各发一遍——这是刷屏的另一半原因。图片/文件用文件名
+        （同一张图从不同临时目录拷出来也是同一个文件）。
+        """
+        spec = spec or {}
+        body = str(spec.get("text") or "")
+        if body:
+            body = _norm_dedupe_body(body)
+        else:
+            body = os.path.basename(str(spec.get("path") or "")).lower()
+        return (str(kind), str(target), body)
 
     def _enqueue(self, kind: str, spec: dict, target: str, data: dict) -> None:
         if kind == "send-image":
@@ -631,7 +844,19 @@ class WxuiSender(WeMessengerSender):
             "since_time": time.time() - 5.0,
             "last_error": data.get("error") or data.get("error_kind") or "unknown",
         }
+        key = self._content_key(item["kind"], item["spec"], target)
         with self._queue_lock:
+            try:
+                existing = self._load_queue()
+            except Exception:
+                existing = []
+            for old in existing:
+                if self._content_key(old.get("kind"), old.get("spec") or {},
+                                     str(old.get("target") or "")) == key:
+                    log.warning("[wxui] 🔁 内容相同的消息已在重发队列里，跳过重复入队 → %s | 已有=%s",
+                                target, str(old.get("last_error") or "")[:60])
+                    self._drop_asset(item)
+                    return
             try:
                 with open(self.retry_queue_path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -744,27 +969,77 @@ class WxuiSender(WeMessengerSender):
                 remaining.append(it)
                 continue
             # 重发上限：同一条重试 2 次仍判不到送达就放弃，避免无限刷屏
-            if int(it.get("attempts") or 0) >= 2:
+            # （桌面被全屏程序占着造成的失败不算数：那不是「发不出去」，是「还没轮到发」）
+            if (int(it.get("attempts") or 0) >= 2
+                    and not self._desktop_blocked({"error": it.get("last_error") or ""})):
                 stat["dropped"] += 1
                 log.error("[wxui] ❌ 重发放弃（已重试 2 次仍无法确认送达）→ %s", target)
                 self._drop_asset(it)
                 continue
             # 1.5) 幻影目标：会话不存在就丢弃，绝不盲点侧栏（会发错人）
+            # 2026-10-28：改为归一化比对 + 会话名/联系人名并集（见 _known_targets），
+            # 否则「用户F别名」（备注名）永远匹配不上会话名「用户F」，一次就丢。
             known = self._known_targets()
-            if known and target not in known:
+            if known and not self._same_target(target, known):
                 stat["dropped"] += 1
-                log.error("[wxui] ❌ 重发放弃：目标「%s」不在微信会话列表里"
+                log.error("[wxui] ❌ 重发放弃：目标「%s」不在微信会话/联系人列表里"
                           "（幻影目标，盲点侧栏会发错人）", target)
                 self._drop_asset(it)
                 continue
             # 2) 确实没送到 → 重发
+            # 2026-10-27 复读事故：同一条「回读没确认到」的消息被每 20s 重放一次，
+            # 而它其实早就发出去了（一次翻唱完成最多发了 18 条）。重放前先看
+            # 去重缓存：同内容最近（5 分钟）已成功发出过 → 直接按已送达丢弃。
+            replay_key = self._content_key(it.get("kind"), spec, target)
+            if self._is_duplicate_send(replay_key):
+                stat["delivered"] += 1
+                log.info("[wxui] 🔁 重发队列：%s 的同内容消息近期已发出，按已送达丢弃（避免复读）",
+                         target)
+                self._drop_asset(it)
+                continue
             it["attempts"] = int(it.get("attempts") or 0) + 1
-            subcmd = "send-image" if it.get("kind") == "send-image" else "send"
+            _kind = str(it.get("kind") or "send")
+            subcmd = {"send-image": "send-image", "send-file": "send-file"}.get(_kind, "send")
+            # 2026-10-27 二次复读事故：发送动作已经执行、但回读校验超时（用户C那条
+            # 要 90s 才超时），ok=False 就没记指纹 → 下一轮重放又发一遍 → 刷屏。
+            # 现在：本轮先记 attempt；若 120s 内刚尝试过而仍未确认，本轮跳过（留在
+            # 队列里等下一轮回读），既不刷屏也不丢消息。
+            if self._attempted_recently(replay_key):
+                stat["failed"] += 1
+                it["last_error"] = "sent-but-unconfirmed; waiting for readback"
+                remaining.append(it)
+                blocked_this_round.add(target)
+                log.info("[wxui] ⏳ 重发队列：%s 近期已尝试发送但未确认，本轮不重放（等回读）", target)
+                continue
+            self._remember_attempt(replay_key)
             ok, data = self._scheduled_run(subcmd, {**spec, "commit": True}, target)
             if ok:
                 stat["resent"] += 1
+                key = self._content_key(it.get("kind"), spec, target)
+                self._remember_send(key)
+                kept = []
+                for other in remaining:
+                    okey = self._content_key(other.get("kind"), other.get("spec") or {},
+                                            str(other.get("target") or ""))
+                    if other is not it and okey == key:
+                        stat["dropped"] += 1
+                        log.warning("[wxui] 🔁 %s 的同内容重复副本已丢弃（本条刚送达）", target)
+                        self._drop_asset(other)
+                        continue
+                    kept.append(other)
+                remaining = kept
                 continue
             it["last_error"] = data.get("error") or data.get("error_kind") or "unknown"
+            if self._desktop_blocked(data):
+                # 桌面被全屏程序占着 / 真人正在用：这次连尝试都没有发生，退回重试计数，
+                # 消息继续留在队列里等，不按「发失败」处理（否则判定 2 次就静默丢了）。
+                it["attempts"] = max(0, int(it.get("attempts") or 0) - 1)
+                stat["failed"] += 1
+                remaining.append(it)
+                blocked_this_round.add(target)
+                log.info("[wxui] ⏸ 桌面被占用（%s）→ %s 的消息留在队列里，不计重试次数",
+                         str(it["last_error"])[:120], target)
+                continue
             if it["attempts"] >= self.queue_max_attempts or not self._retryable(data):
                 stat["dropped"] += 1
                 log.error("[wxui] ❌ 重发放弃（尝试 %d 次，原因=%s）→ %s",
@@ -805,6 +1080,7 @@ class WxuiSender(WeMessengerSender):
             proc = subprocess.run(
                 [self.python_exe, self.script, "info"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+                creationflags=_CREATE_NO_WINDOW,
             )
             data = json.loads(proc.stdout or "{}")
             info.update(ok=bool(data.get("hwnd")), hwnd=data.get("hwnd"),

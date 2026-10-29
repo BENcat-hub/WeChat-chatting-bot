@@ -490,7 +490,6 @@ class ConversationInjectionPlan:
         for block in self.blocks(include_materialized=True):
             if (
                 not block.materialized
-                or isinstance(block.section.content, ExactText)
                 or block.placement == PLACEMENT_TOOL_CONTRACT
             ):
                 continue
@@ -499,10 +498,14 @@ class ConversationInjectionPlan:
             visible = self._visible_content(block)
             rendered = f"{block.marker}\n{visible}".strip() if block.marker else visible
             for candidate in (rendered, raw, visible):
-                before = result
-                result = self._remove_once(result, candidate)
-                if result != before:
-                    break
+                # 同一段文本可能因为多次 materialize 在 system 里残留多份，
+                # 只删一次会让它逐轮累积（实测出现过 3 份重复的规则块），
+                # 所以这里循环删干净。
+                while candidate and candidate in result:
+                    before = result
+                    result = self._remove_once(result, candidate)
+                    if result == before:
+                        break
         return result
 
     @staticmethod
@@ -562,13 +565,18 @@ class ConversationInjectionPlan:
     def _render_system(self, req: Any) -> None:
         current = str(getattr(req, "system_prompt", "") or "")
         previous = str(getattr(req, "_private_companion_conversation_plan_system_text", "") or "")
-        if previous:
+        # 逐轮复用同一个 req 时，旧 owned 文本可能残留多份；删到不再出现为止，
+        # 否则 system 会一轮比一轮长，DeepSeek 的前缀缓存直接失效。
+        while previous and previous in current:
+            before = len(current)
             if current == previous:
                 current = ""
             elif current.endswith(f"\n\n{previous}"):
                 current = current[: -(len(previous) + 2)].rstrip()
-            elif previous in current:
+            else:
                 current = self._remove_once(current, previous)
+            if len(current) >= before:
+                break
         current = self._strip_registered_materialized_blocks(current)
         rendered: list[str] = []
         for placement in (PLACEMENT_STABLE_SYSTEM, PLACEMENT_DYNAMIC_SYSTEM):

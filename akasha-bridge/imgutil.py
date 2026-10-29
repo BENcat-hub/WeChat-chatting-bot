@@ -16,7 +16,7 @@ log = logging.getLogger("imgutil")
 def normalize_image_for_wechat(path: str) -> str:
     """WebP → GIF（多帧，保留动画）/ PNG（单帧）；其它格式原样返回。
 
-    2026-10-22 实测：插件把 WebP 内容的图存成 `.gif` 文件名发过来（与「天文学家」
+    2026-10-22 实测：插件把 WebP 内容的图存成 `.gif` 文件名发过来（与「用户C」
     对话里的 `tmpb9_4pwp2.gif`，550.1K，真实字节是 WebP），微信按后缀当 GIF 解析
     失败，聊天里只剩一个文件卡片、对方点开也解不了。
     """

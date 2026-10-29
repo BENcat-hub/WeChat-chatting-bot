@@ -225,6 +225,36 @@ class TokenBudgetMixin:
         # not silently allow an over-limit request to reach the primary model.
         return max(1, int(ascii_chars / 4.0 + non_ascii_chars))
 
+    _UNBILLED_LLM_ERROR_MARKERS = (
+        "insufficient balance",
+        "insufficient_quota",
+        "error code: 401",
+        "error code: 402",
+        "error code: 403",
+        "invalid_api_key",
+        "invalid api key",
+        "incorrect api key",
+        "unauthorized",
+        "authentication",
+        "insufficient permission",
+        "no available provider",
+        "未找到可用的 astrbot 默认模型 provider",
+        "余额不足",
+    )
+
+    @classmethod
+    def _llm_error_is_unbilled(cls, error: Any) -> bool:
+        """Whether a failed call was rejected before any tokens were billed.
+
+        Billing/auth/quota/no-provider rejections happen before the model runs,
+        so counting the character estimate as consumed tokens would inflate the
+        daily budget and silently starve later tasks (schedule / proactive).
+        """
+        text = str(error or "").strip().lower()
+        if not text:
+            return False
+        return any(marker in text for marker in cls._UNBILLED_LLM_ERROR_MARKERS)
+
     @staticmethod
     def _usage_raw_value(usage: Any, key: str) -> Any:
         if not usage:
@@ -557,6 +587,20 @@ class TokenBudgetMixin:
         request_policy: dict[str, Any] | None = None,
     ) -> None:
         usage = self._extract_llm_usage(resp, prompt, completion)
+        if (not success) and self._llm_error_is_unbilled(error):
+            # 请求在计费前就被拒绝（402/401/配额/无可用 provider），没有产生任何
+            # token 成本；不能再按字符估算计入当日预算，否则一次欠费风暴就会把
+            # 整天的限额吃光，日程生成和主动消息会被软/硬限额提前掐断。
+            usage = {
+                **usage,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "total_tokens": 0,
+                "cached_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            }
         now_ts = _now_ts()
         day = _today_key()
         now_dt = self._token_usage_now_dt()
@@ -671,6 +715,20 @@ class TokenBudgetMixin:
         message_type: str = "",
     ) -> None:
         usage = self._extract_llm_usage(resp, prompt, completion)
+        if (not success) and self._llm_error_is_unbilled(error):
+            # 请求在计费前就被拒绝（402/401/配额/无可用 provider），没有产生任何
+            # token 成本；不能再按字符估算计入当日预算，否则一次欠费风暴就会把
+            # 整天的限额吃光，日程生成和主动消息会被软/硬限额提前掐断。
+            usage = {
+                **usage,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "total_tokens": 0,
+                "cached_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            }
         now_ts = _now_ts()
         day = _today_key()
         now_dt = self._token_usage_now_dt()

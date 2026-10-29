@@ -103,7 +103,7 @@ class GroupShareFactGroundingTests(unittest.TestCase):
         user = {
             "group_share_context": {
                 "group_id": "300000101",
-                "group_name": "测试群",
+                "group_name": "示例群聊D",
                 "speaker": "群友甲",
                 "text": "@群友乙 最近在干嘛",
                 "event_ts": now,
@@ -116,7 +116,7 @@ class GroupShareFactGroundingTests(unittest.TestCase):
 
         context = self.harness._format_group_share_action_context(user)
 
-        self.assertIn("测试群（群号 300000101）", context)
+        self.assertIn("示例群聊D（群号 300000101）", context)
         self.assertIn("明确对群友 群友乙说话，不是对 Bot", context)
         self.assertIn("昵称", context)
 
@@ -128,7 +128,7 @@ class GroupShareFactGroundingTests(unittest.TestCase):
         }
         share = {
             "group_id": "300000101",
-            "group_name": "测试群",
+            "group_name": "示例群聊D",
             "kind": "funny",
             "speaker_id": "100000101",
             "speaker": "群友甲[QQ:100000101]",
@@ -156,7 +156,7 @@ class GroupShareFactGroundingTests(unittest.TestCase):
             now=2100,
         )
 
-        self.assertIn("测试群（群号 300000101）", context)
+        self.assertIn("示例群聊D（群号 300000101）", context)
         self.assertIn("来源成员：群友甲", context)
         self.assertIn("不是对 Bot", context)
         self.assertNotIn("[QQ:", context)

@@ -35,6 +35,10 @@ class BaseSender:
     def send_image(self, contact: str, image_path: str) -> bool:
         raise NotImplementedError
 
+    def send_file(self, contact: str, file_path: str) -> bool:
+        """发送任意文件（AI 点歌的翻唱 mp3 走这条）。默认后端不支持。"""
+        raise NotImplementedError
+
 
 class UiaSender(BaseSender):
     """

@@ -1368,7 +1368,7 @@ const featureMeta = {
   enable_proactive_only_mode: ["仅保留主动能力", "只让本插件负责主动私聊调度、生成和发送；普通私聊/群聊放行给默认主链或其他插件。"],
   enable_multi_persona_mode: ["多人格支持模式", "按人格隔离资料、日程、状态、日记、用户、群聊和 Token；会话人格由 AstrBot 路由决定。"],
   enable_custom_relationship_stage_policy: ["启用好感度系统", "关闭后不记账、不更新关系或当前互动、不注入关系表达；用户档案和画像仍会更新，已有关系数据会保留。"],
-  enable_group_relationship_affinity: ["测试群贡献好感度", "默认关闭；只允许白名单测试群中明确 @/引用 Bot 且回复成功的正式用户事件按低权重结算。"],
+  enable_group_relationship_affinity: ["示例群聊D贡献好感度", "默认关闭；只允许白名单示例群聊D中明确 @/引用 Bot 且回复成功的正式用户事件按低权重结算。"],
   enable_relationship_content_tiers: ["关系内容尺度", "把日常和非露骨暧昧纳入统一表达决策；关系阶段只是必要条件，不会自动升级尺度。"],
   enable_auto_user_profile_creation: ["用户档案", "首次收到符合范围的真实消息时自动建立统一用户档案；不会自动授予私聊陪伴或主动联系权限。"],
   enable_mai_style_integration: ["私聊互动策略", "把相处分寸、偏好和本轮接话方式注入回复。"],
@@ -1970,8 +1970,8 @@ const configLabels = {
   owner_exclusive_tone: "主要用户专属基础表达",
   owner_exclusive_address_style: "主要用户专属称呼尺度",
   owner_exclusive_proactive_limit: "主要用户专属主动阶段上限",
-  enable_group_relationship_affinity: "允许测试群贡献统一好感度",
-  group_relationship_affinity_allowlist: "好感度测试群白名单",
+  enable_group_relationship_affinity: "允许示例群聊D贡献统一好感度",
+  group_relationship_affinity_allowlist: "好感度示例群聊D白名单",
   group_relationship_daily_net_cap: "每人每群每日净变化上限",
   group_relationship_window_minutes: "群好感度滚动窗口（分钟）",
   group_relationship_window_absolute_cap: "每人每群窗口绝对量上限",
@@ -2675,8 +2675,8 @@ const configDescriptions = {
   group_relationship_daily_net_cap: "限制同一人在同一群一天内的净变化，正负绝对量还会受下面三层预算约束。",
   group_relationship_window_minutes: "滚动窗口长度，同一人与同一群在窗口内共享绝对量额度。",
   group_relationship_window_absolute_cap: "正负变化都占用额度，防止往返刷量。",
-  group_relationship_person_daily_absolute_cap: "同一人在所有测试群的每日绝对变化总额。",
-  group_relationship_scope_daily_absolute_cap: "一个测试群内所有用户的每日绝对变化总额。",
+  group_relationship_person_daily_absolute_cap: "同一人在所有示例群聊D的每日绝对变化总额。",
+  group_relationship_scope_daily_absolute_cap: "一个示例群聊D内所有用户的每日绝对变化总额。",
   relationship_event_window_minutes: "同一用户的同类互动在该时间内只按一个关系事件结算，避免连续短消息重复刷分。",
   relationship_positive_event_cap: "单个正向事件最多增加的长期亲密度；最终仍受每日正向增长上限约束。",
   relationship_negative_event_cap: "单个负向事件最多降低的长期亲密度。",
@@ -3551,8 +3551,8 @@ const featureSettingSections = {
       keys: ["relationship_event_window_minutes", "relationship_positive_event_cap", "relationship_negative_event_cap", "relationship_positive_daily_cap", "relationship_decay_grace_days", "relationship_decay_early_per_day", "relationship_decay_middle_per_day", "relationship_decay_late_per_day"],
     },
     {
-      title: "测试群低权重结算",
-      note: "默认关闭且必须填写测试群；只在 Bot 确认回复后预留预算，再沿耐崩溃统一账本链结算。",
+      title: "示例群聊D低权重结算",
+      note: "默认关闭且必须填写示例群聊D；只在 Bot 确认回复后预留预算，再沿耐崩溃统一账本链结算。",
       keys: ["enable_group_relationship_affinity", "group_relationship_affinity_allowlist", "group_relationship_daily_net_cap", "group_relationship_window_minutes", "group_relationship_window_absolute_cap", "group_relationship_person_daily_absolute_cap", "group_relationship_scope_daily_absolute_cap"],
     },
     {
@@ -13570,7 +13570,7 @@ function troubleshootingReq041Markup(req041 = {}) {
     ["待确认身份", pending ? `${pending} 条待处理` : "无待处理"],
     ["关系缓存", `${hitRateText(relationshipCache.hit_rate)} · P95 ${Number(relationshipCache?.latency_ms?.p95 || 0).toFixed(1)}ms`],
     ["隔离投影缓存", `${hitRateText(projectionCache.hit_rate)} · P95 ${Number(projectionCache?.latency_ms?.p95 || 0).toFixed(1)}ms`],
-    ["群好感度", config.group_affinity_effective ? `已限 ${Number(config.group_affinity_allowlist_count || 0)} 个测试群` : "关闭或白名单为空"],
+    ["群好感度", config.group_affinity_effective ? `已限 ${Number(config.group_affinity_allowlist_count || 0)} 个示例群聊D` : "关闭或白名单为空"],
   ];
   return rows.map(([name, text], index) => `
     <section class="troubleshooting-sqlite-row ${index === 0 ? (healthy ? "ok" : "warn") : "info"}">

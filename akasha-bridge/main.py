@@ -38,7 +38,11 @@ def _start_bridge():
     if not state.ob_client_started:
         t = threading.Thread(target=_run_ob_client, daemon=True, name="ob11-client")
         t.start()
-        state.ob_client_started = True
+    state.ob_client_started = True
+
+    if _CLEANUP_ENABLED:
+        _wc = threading.Thread(target=_window_cleanup_loop, daemon=True, name="window-cleanup")
+        _wc.start()
 
     state.bridge_thread = threading.Thread(target=_bridge_loop, daemon=True, name="bridge")
     state.bridge_thread.start()
@@ -161,6 +165,44 @@ def start_web():
     server = HTTPServer(("127.0.0.1", config.WEB_PORT), WebHandler)
     log.info(f"Web: http://127.0.0.1:{config.WEB_PORT}")
     server.serve_forever()
+
+
+
+# ============ 悬浮会话窗自动清理 ============
+
+_CLEANUP_INTERVAL_S = int(os.environ.get("BRIDGE_WINDOW_CLEANUP_INTERVAL", "900"))
+_CLEANUP_ENABLED = os.environ.get("BRIDGE_WINDOW_CLEANUP", "1") not in ("0", "false", "False")
+
+
+def _window_cleanup_loop():
+    """定期把微信「独立会话窗口」强制关掉。
+
+    微信 4.x 双击会话行会弹出一个置顶的独立聊天窗，用户反馈「关不掉，只能退出微信」，
+    点它里面的「点此从手机导入更多聊天记录」还会让微信直接崩溃。
+    这里每 15 分钟清一次（发送前 wxui.py 也会清），失败不影响主流程。
+    """
+    if not _CLEANUP_ENABLED:
+        log.info("[窗口清理] 已禁用（BRIDGE_WINDOW_CLEANUP=0）")
+        return
+    scripts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    try:
+        import winio
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[窗口清理] 无法导入 winio: {exc}")
+        return
+    time.sleep(45)  # 让 bridge 先把启动流程走完
+    while True:
+        try:
+            strays = winio.list_wechat_chat_windows()
+            if strays:
+                closed = winio.close_detached_chat(force=True)
+                if closed:
+                    log.info(f"[窗口清理] 关闭悬浮会话窗: {closed}")
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"[窗口清理] 异常（忽略）: {exc}")
+        time.sleep(max(120, _CLEANUP_INTERVAL_S))
 
 
 # ============ 入口 ============

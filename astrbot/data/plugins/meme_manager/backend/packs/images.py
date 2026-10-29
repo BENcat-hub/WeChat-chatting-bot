@@ -1,21 +1,40 @@
 import asyncio
 import hashlib
+import io
 import os
 import shutil
+import tempfile
+import uuid
 from pathlib import Path
 
+from PIL import Image as PILImage
 from werkzeug.utils import secure_filename
 
 from astrbot.api import logger
 
-from .categories import is_safe_category_name
-from .resolver import resolve_pack_context
+from .categories import is_safe_category_name, resolve_safe_category_directory
+from .resolver import resolve_pack_context, resolve_pack_paths
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+CHAT_UPLOAD_EXTENSIONS = {
+    "JPEG": ".jpg",
+    "PNG": ".png",
+    "GIF": ".gif",
+    "WEBP": ".webp",
+}
 
 
-def _get_memes_root() -> Path:
-    """动态解析当前默认资源包的表情目录。"""
+def _get_memes_root(pack_id: str | None = None) -> Path:
+    """解析目标资源包的表情目录。
+
+    Args:
+        pack_id: 目标资源包 ID；为空时沿用当前默认资源包。
+
+    Returns:
+        目标资源包的表情目录绝对路径。
+    """
+    if pack_id:
+        return Path(resolve_pack_paths(pack_id)["memes_dir"]).resolve()
     return Path(resolve_pack_context()["memes_dir"]).resolve()
 
 
@@ -31,11 +50,12 @@ def _is_supported_image(filename: str) -> bool:
     return filename.lower().endswith(IMAGE_EXTENSIONS)
 
 
-def _get_category_path(category: str) -> Path:
+def _get_category_path(category: str, pack_id: str | None = None) -> Path:
     """解析分类目录，并禁止目录穿越。
 
     Args:
         category: 只能包含单个目录段的分类名称。
+        pack_id: 目标资源包 ID；为空时沿用当前默认资源包。
 
     Returns:
         位于当前表情目录内的分类绝对路径。
@@ -47,7 +67,7 @@ def _get_category_path(category: str) -> Path:
     if not is_safe_category_name(normalized):
         raise ValueError("分类名称非法")
 
-    memes_root = _get_memes_root()
+    memes_root = _get_memes_root(pack_id)
     category_path = (memes_root / normalized).resolve()
     try:
         category_path.relative_to(memes_root)
@@ -97,6 +117,114 @@ def _build_available_file_path(category_path: Path, filename: str) -> Path:
         index += 1
 
 
+def save_chat_upload_image(
+    memes_root: str | Path,
+    category: str,
+    content: bytes,
+) -> dict[str, str]:
+    """Atomically save original chat-upload bytes into an explicit pack category.
+
+    The caller owns routing and category authorization. This routine works only
+    with the supplied ``memes_root`` and never resolves the global default pack,
+    so a changed runtime selection cannot redirect the write.
+
+    Args:
+        memes_root: Canonical ``memes`` directory of the destination pack.
+        category: Single path-segment category already accepted by that pack.
+        content: Original image bytes; animation frames are preserved verbatim.
+
+    Returns:
+        Dictionary containing the saved absolute path and final filename.
+
+    Raises:
+        DuplicateEmojiError: The same category already holds identical bytes.
+        ValueError: Content is empty, corrupt, unsupported, or the category is
+            unsafe or escapes the pack directory.
+        OSError: The image could not be written atomically.
+    """
+    if not content:
+        raise ValueError("上传图片内容为空")
+
+    # Validate before creating a directory so rejected bytes leave no category.
+    try:
+        with PILImage.open(io.BytesIO(content)) as image:
+            image_format = str(image.format or "").upper()
+            image.verify()
+        # verify() accepts some truncated JPEG payloads, so decode the first
+        # frame from the original bytes without re-encoding or altering them.
+        with PILImage.open(io.BytesIO(content)) as image:
+            image.load()
+    except Exception as exc:
+        raise ValueError("上传内容不是有效图片") from exc
+    extension = CHAT_UPLOAD_EXTENSIONS.get(image_format)
+    if not extension:
+        raise ValueError(f"不支持的表情图片格式: {image_format or 'unknown'}")
+
+    root = Path(memes_root).resolve()
+    category_path = resolve_safe_category_directory(root, category)
+    if category_path.is_dir():
+        duplicate_path = _find_duplicate_image(
+            category_path, _calculate_file_hash(content)
+        )
+        if duplicate_path is not None:
+            raise DuplicateEmojiError(duplicate_path.name)
+
+    # A configured category may legitimately have no directory yet. Re-resolve
+    # after creation so a symlink introduced meanwhile cannot escape the pack.
+    category_path.mkdir(parents=True, exist_ok=True)
+    category_path = category_path.resolve()
+    try:
+        category_path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("分类目录逃逸表情目录") from exc
+    if not category_path.is_dir():
+        raise OSError("分类目录不可用")
+
+    filename = f"{uuid.uuid4().hex}{extension}"
+    temp_path: Path | None = None
+    created_target: Path | None = None
+    completed = False
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{filename}.", suffix=".tmp", dir=category_path
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "wb") as file_obj:
+            file_obj.write(content)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+
+        while True:
+            file_path = _build_available_file_path(category_path, filename)
+            try:
+                # Reserve the final name exclusively, then atomically replace
+                # the reservation. Existing files are never overwritten, even
+                # when a controlled UUID collision produces the same name.
+                reservation_fd = os.open(
+                    file_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+            except FileExistsError:
+                filename = f"{uuid.uuid4().hex}{extension}"
+                continue
+            os.close(reservation_fd)
+            created_target = file_path
+            break
+
+        os.replace(temp_path, file_path)
+        temp_path = None
+        if not file_path.is_file() or file_path.stat().st_size != len(content):
+            raise OSError("图片保存后校验失败")
+        completed = True
+        return {"path": str(file_path), "filename": file_path.name}
+    except Exception as exc:
+        raise OSError(f"保存图片失败: {exc}") from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        if created_target is not None and not completed:
+            created_target.unlink(missing_ok=True)
+
+
 async def scan_emoji_folder():
     """扫描表情包目录，返回所有分类及其表情文件。"""
 
@@ -124,13 +252,14 @@ def get_emoji_by_category(category):
     return [path.name for path in _iter_category_image_paths(category_path)]
 
 
-def add_emoji_to_category(category, image_file):
+def add_emoji_to_category(category, image_file, pack_id: str | None = None):
     """
     添加表情包到指定类别
 
     Args:
         category: 类别名
         image_file: 上传的文件对象
+        pack_id: 目标资源包 ID；为空时沿用当前默认资源包
 
     Returns:
         dict[str, str]: 保存后的文件路径和最终文件名
@@ -149,7 +278,7 @@ def add_emoji_to_category(category, image_file):
         raise ValueError("表情文件扩展名非法")
 
     # 确保类别目录存在
-    category_path = _get_category_path(category)
+    category_path = _get_category_path(category, pack_id)
     category_path.mkdir(parents=True, exist_ok=True)
 
     # 保存文件
@@ -237,9 +366,9 @@ def add_emoji_to_category(category, image_file):
         raise OSError(f"保存文件时出错: {str(e)}")
 
 
-def delete_emoji_from_category(category, image_file):
+def delete_emoji_from_category(category, image_file, pack_id: str | None = None):
     """删除指定类别下的表情包"""
-    category_path = _get_category_path(category)
+    category_path = _get_category_path(category, pack_id)
     if not category_path.is_dir():
         return False
 
@@ -251,9 +380,11 @@ def delete_emoji_from_category(category, image_file):
     return False
 
 
-def batch_delete_emojis(category: str, image_files: list[str]) -> dict[str, object]:
+def batch_delete_emojis(
+    category: str, image_files: list[str], pack_id: str | None = None
+) -> dict[str, object]:
     """批量删除指定类别下的表情包。"""
-    category_path = _get_category_path(category)
+    category_path = _get_category_path(category, pack_id)
     if not category_path.is_dir():
         return {
             "category_exists": False,
@@ -264,7 +395,7 @@ def batch_delete_emojis(category: str, image_files: list[str]) -> dict[str, obje
     deleted_files = []
     missing_files = []
     for image_file in dict.fromkeys(image_files):
-        if delete_emoji_from_category(category, image_file):
+        if delete_emoji_from_category(category, image_file, pack_id):
             deleted_files.append(Path(image_file).name)
         else:
             missing_files.append(Path(image_file).name)
@@ -277,10 +408,13 @@ def batch_delete_emojis(category: str, image_files: list[str]) -> dict[str, obje
 
 
 def move_emoji_to_category(
-    source_category: str, image_file: str, target_category: str
+    source_category: str,
+    image_file: str,
+    target_category: str,
+    pack_id: str | None = None,
 ) -> dict[str, object]:
     """将单个表情包移动到另一个类别。"""
-    source_category_path = _get_category_path(source_category)
+    source_category_path = _get_category_path(source_category, pack_id)
     if not source_category_path.is_dir():
         return {
             "source_category_exists": False,
@@ -291,7 +425,7 @@ def move_emoji_to_category(
             "missing": True,
         }
 
-    target_category_path = _get_category_path(target_category)
+    target_category_path = _get_category_path(target_category, pack_id)
     target_category_path.mkdir(parents=True, exist_ok=True)
 
     image_name = Path(image_file).name
@@ -333,10 +467,13 @@ def move_emoji_to_category(
 
 
 def batch_move_emojis(
-    source_category: str, image_files: list[str], target_category: str
+    source_category: str,
+    image_files: list[str],
+    target_category: str,
+    pack_id: str | None = None,
 ) -> dict[str, object]:
     """批量将表情包移动到另一个类别。"""
-    source_category_path = _get_category_path(source_category)
+    source_category_path = _get_category_path(source_category, pack_id)
     if not source_category_path.is_dir():
         return {
             "source_category_exists": False,
@@ -350,7 +487,9 @@ def batch_move_emojis(
     conflicting_files = []
 
     for image_file in dict.fromkeys(image_files):
-        result = move_emoji_to_category(source_category, image_file, target_category)
+        result = move_emoji_to_category(
+            source_category, image_file, target_category, pack_id
+        )
         if result["moved"]:
             moved_files.append(result["filename"])
         elif result["conflict"]:
@@ -369,10 +508,13 @@ def batch_move_emojis(
 
 
 def copy_emoji_to_category(
-    source_category: str, image_file: str, target_category: str
+    source_category: str,
+    image_file: str,
+    target_category: str,
+    pack_id: str | None = None,
 ) -> dict[str, object]:
     """将单个表情包复制到另一个类别。"""
-    source_category_path = _get_category_path(source_category)
+    source_category_path = _get_category_path(source_category, pack_id)
     if not source_category_path.is_dir():
         return {
             "source_category_exists": False,
@@ -383,7 +525,7 @@ def copy_emoji_to_category(
             "missing": True,
         }
 
-    target_category_path = _get_category_path(target_category)
+    target_category_path = _get_category_path(target_category, pack_id)
     target_category_path.mkdir(parents=True, exist_ok=True)
 
     image_name = Path(image_file).name
@@ -425,10 +567,13 @@ def copy_emoji_to_category(
 
 
 def batch_copy_emojis(
-    source_category: str, image_files: list[str], target_category: str
+    source_category: str,
+    image_files: list[str],
+    target_category: str,
+    pack_id: str | None = None,
 ) -> dict[str, object]:
     """批量将表情包复制到另一个类别。"""
-    source_category_path = _get_category_path(source_category)
+    source_category_path = _get_category_path(source_category, pack_id)
     if not source_category_path.is_dir():
         return {
             "source_category_exists": False,
@@ -442,7 +587,9 @@ def batch_copy_emojis(
     conflicting_files = []
 
     for image_file in dict.fromkeys(image_files):
-        result = copy_emoji_to_category(source_category, image_file, target_category)
+        result = copy_emoji_to_category(
+            source_category, image_file, target_category, pack_id
+        )
         if result["copied"]:
             copied_files.append(result["filename"])
         elif result["conflict"]:
@@ -460,9 +607,11 @@ def batch_copy_emojis(
     }
 
 
-def clear_category_emojis(category: str) -> dict[str, object]:
+def clear_category_emojis(
+    category: str, pack_id: str | None = None
+) -> dict[str, object]:
     """清空指定类别下的所有表情包，但保留类别目录和配置。"""
-    category_path = _get_category_path(category)
+    category_path = _get_category_path(category, pack_id)
     if not category_path.is_dir():
         return {
             "category_exists": False,
@@ -480,17 +629,17 @@ def clear_category_emojis(category: str) -> dict[str, object]:
     }
 
 
-def clear_all_emojis() -> dict[str, object]:
+def clear_all_emojis(pack_id: str | None = None) -> dict[str, object]:
     """清空所有类别中的表情包，但保留目录和配置。"""
     deleted_by_category = {}
-    memes_root = _get_memes_root()
+    memes_root = _get_memes_root(pack_id)
     if not memes_root.exists():
         return {"deleted_by_category": deleted_by_category}
 
     for category_path in memes_root.iterdir():
         if not category_path.is_dir():
             continue
-        result = clear_category_emojis(category_path.name)
+        result = clear_category_emojis(category_path.name, pack_id)
         deleted_files = result["deleted_files"]
         if deleted_files:
             deleted_by_category[category_path.name] = len(deleted_files)

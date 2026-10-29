@@ -114,9 +114,12 @@ def test_upstream_merge_applies_conflicts_deletions_and_descriptions(workspace):
     storage._save_json(local / "memes_data.json", {"happy": "My description"})
     plan = updates.plan_update({**data, "strategy": "merge_upstream"})
     assert plan["ready"]
-    assert next(
-        row for row in plan["rows"] if row["path"] == "memes/happy/conflict.png"
-    )["action"] == "update"
+    assert (
+        next(row for row in plan["rows"] if row["path"] == "memes/happy/conflict.png")[
+            "action"
+        ]
+        == "update"
+    )
     execute({**data, "strategy": "merge_upstream"})
     assert (local / "memes/happy/conflict.png").read_bytes() == b"new-conflict"
     assert (local / "memes/happy/change.png").read_bytes() == b"new-change"
@@ -145,9 +148,7 @@ def test_skipping_individual_upstream_images_keeps_existing_and_omits_new(worksp
     skipped = ["memes/happy/conflict.png", "memes/happy/new.png"]
     plan = updates.plan_update({**data, "skip": skipped})
     assert all(
-        row["action"] == "keep"
-        for row in plan["rows"]
-        if row["path"] in skipped
+        row["action"] == "keep" for row in plan["rows"] if row["path"] in skipped
     )
     execute({**data, "skip": skipped})
     assert (local / "memes/happy/conflict.png").read_bytes() == b"user-edit"
@@ -164,12 +165,16 @@ def test_replace_can_skip_individual_upstream_images(workspace):
             "skip": ["memes/happy/conflict.png", "memes/happy/new.png"],
         }
     )
-    assert next(row for row in plan["rows"] if row["path"].endswith("new.png"))[
-        "kind"
-    ] == "added"
-    assert next(row for row in plan["rows"] if row["path"].endswith("conflict.png"))[
-        "kind"
-    ] == "changed"
+    assert (
+        next(row for row in plan["rows"] if row["path"].endswith("new.png"))["kind"]
+        == "added"
+    )
+    assert (
+        next(row for row in plan["rows"] if row["path"].endswith("conflict.png"))[
+            "kind"
+        ]
+        == "changed"
+    )
     execute(
         {
             **data,

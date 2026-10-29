@@ -87,7 +87,8 @@ async def test_final_filter_runs_after_selection(reply_context, enabled, empty_p
     )
     await sender._on_decorating_result_impl(event)
     visible = "".join(
-        component.text for component in state["result"].chain
+        component.text
+        for component in state["result"].chain
         if isinstance(component, Plain)
     )
     assert visible == ("Hello" if enabled else "Hello  :unknown: [unknown]")
@@ -104,7 +105,7 @@ async def test_empty_pack_stream_final_filter(reply_context, chunk_size):
 
     async def source():
         for index in range(0, len(text), chunk_size):
-            yield MessageChain([Plain(text[index:index + chunk_size])])
+            yield MessageChain([Plain(text[index : index + chunk_size])])
 
     visible = "".join(
         [
@@ -538,17 +539,20 @@ async def test_semantic_search_exposes_candidates_without_preselecting(
     sender._semantic_mode_active = lambda event: True
     sender._resolve_runtime_pack_context = lambda **kwargs: {
         "pack_id": "pack",
+        "pack_ids": ["pack"],
         "pack_dir": root,
     }
     sender._resolve_embedding_provider = lambda pack: object()
     sender.semantic_top_k = 3
     sender.semantic_min_score = 0
     state["meme_manager_semantic_mode"] = "tool"
-    state["meme_manager_semantic_verified_pack_id"] = "pack"
+    state["meme_manager_semantic_verified_pack_ids"] = "pack"
     candidate = {"id": "meme:000000000001", "caption": "安慰对方"}
     search = AsyncMock(return_value={"ok": True, "candidates": [candidate]})
-    monkeypatch.setattr(plugin_main, "search_memes", search)
-    monkeypatch.setattr(plugin_main, "candidate_records", lambda root, items: items)
+    monkeypatch.setattr(plugin_main, "search_memes_multi_pack", search)
+    monkeypatch.setattr(
+        plugin_main, "candidate_records_multi_pack", lambda contexts, items: items
+    )
     first = json.loads(await sender.search_memes_tool(event, "安慰对方"))
     assert first["candidates"] == [candidate]
     assert state["meme_manager_semantic_candidates"][candidate["id"]] == candidate

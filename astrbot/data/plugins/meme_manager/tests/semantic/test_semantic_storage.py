@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 
@@ -6,6 +7,7 @@ from astrbot_plugin_meme_manager.backend.semantic import storage
 from astrbot_plugin_meme_manager.backend.semantic.models import (
     SemanticImage,
     category_analysis_is_current,
+    semantic_entry_id,
 )
 
 
@@ -84,6 +86,188 @@ def test_scan_images_keeps_duplicate_content_as_distinct_entries(tmp_path):
 
 def test_scan_images_returns_empty_without_memes_directory(tmp_path):
     assert storage.scan_images(tmp_path / "missing") == []
+
+
+def test_inventory_snapshot_counts_duplicate_content_by_path_and_category(tmp_path):
+    pack_dir, memes_dir = create_pack(tmp_path)
+    shared = b"same-bytes"
+    for category, name in (
+        ("happy", "first.png"),
+        ("happy", "second.png"),
+        ("sad", "third.png"),
+    ):
+        category_dir = memes_dir / category
+        category_dir.mkdir(exist_ok=True)
+        (category_dir / name).write_bytes(shared)
+
+    metadata = storage.reconcile_metadata(pack_dir)
+    storage.refresh_metadata_inventory_snapshot(pack_dir, metadata)
+
+    assert metadata["file_total"] == 3
+    assert metadata["unique_total"] == 3
+    assert metadata["content_unique_total"] == 1
+    assert metadata["reused_duplicate_files"] == 1
+    assert metadata["cross_category_duplicate_entries"] == 1
+
+
+def test_inventory_snapshot_invalidates_counters_for_unknown_files(tmp_path):
+    pack_dir, memes_dir = create_pack(tmp_path)
+    category_dir = memes_dir / "happy"
+    category_dir.mkdir()
+    (category_dir / "known.png").write_bytes(b"known")
+    metadata = storage.reconcile_metadata(pack_dir)
+    for item in metadata["images"].values():
+        item.update(caption="Cat", tags=["cat"], caption_status="done")
+    storage.save_metadata(pack_dir, metadata)
+    assert (
+        storage.get_pack_semantic_summary(pack_dir, verify_files=False)[
+            "semantic_status"
+        ]
+        == "complete"
+    )
+    storage.refresh_metadata_inventory_snapshot(pack_dir, metadata)
+    assert metadata["file_total"] == 1
+
+    (category_dir / "unknown.png").write_bytes(b"unknown")
+    storage.refresh_metadata_inventory_snapshot(pack_dir, metadata)
+    assert metadata["file_total"] == -1
+
+    storage.save_metadata(pack_dir, metadata)
+    summary = storage.get_pack_semantic_summary(pack_dir, verify_files=False)
+    assert summary["semantic_status"] == "partial"
+    assert not summary["semantic_snapshot_matches"]
+    assert summary["semantic_files_changed"]
+
+
+@pytest.mark.parametrize("tamper", ["key", "entry_id"])
+def test_inventory_snapshot_requires_computed_key_and_entry_id(tmp_path, tamper):
+    pack_dir, memes_dir = create_pack(tmp_path)
+    category_dir = memes_dir / "happy"
+    category_dir.mkdir()
+    (category_dir / "meme.png").write_bytes(b"image")
+    digest = hashlib.sha256(b"image").hexdigest()
+    relative_path = "memes/happy/meme.png"
+    entry_id = semantic_entry_id(digest, "happy", relative_path)
+    record = {
+        "entry_id": entry_id,
+        "content_sha256": digest,
+        "relative_path": relative_path,
+        "category": "happy",
+    }
+    metadata = {"images": {entry_id: record}}
+    if tamper == "key":
+        metadata["images"] = {"wrong-key": metadata["images"].pop(entry_id)}
+    else:
+        record["entry_id"] = "wrong-entry"
+
+    storage.refresh_metadata_inventory_snapshot(pack_dir, metadata)
+
+    assert metadata["file_total"] == -1
+
+
+def test_inventory_snapshot_invalidates_escaping_image_symlink(tmp_path):
+    pack_dir, memes_dir = create_pack(tmp_path)
+    category_dir = memes_dir / "happy"
+    category_dir.mkdir()
+    (category_dir / "known.png").write_bytes(b"known")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"outside")
+    try:
+        (category_dir / "link.png").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("Image symlinks are unavailable")
+
+    digest = hashlib.sha256(b"known").hexdigest()
+    relative_path = "memes/happy/known.png"
+    entry_id = semantic_entry_id(digest, "happy", relative_path)
+    metadata = {
+        "images": {
+            entry_id: {
+                "entry_id": entry_id,
+                "content_sha256": digest,
+                "relative_path": relative_path,
+                "category": "happy",
+            }
+        }
+    }
+
+    storage.refresh_metadata_inventory_snapshot(pack_dir, metadata)
+
+    assert metadata["file_total"] == -1
+
+
+def test_summary_treats_invalid_negative_file_total_as_mismatch(tmp_path):
+    pack_dir, memes_dir = create_pack(tmp_path)
+    category_dir = memes_dir / "happy"
+    category_dir.mkdir()
+    image_path = category_dir / "meme.png"
+    image_path.write_bytes(b"image")
+    metadata = storage.reconcile_metadata(pack_dir)
+    for item in metadata["images"].values():
+        item.update(caption="Cat", tags=["cat"], caption_status="done")
+    storage.refresh_metadata_inventory_snapshot(pack_dir, metadata)
+    assert metadata["file_total"] == 1
+    storage.save_metadata(pack_dir, metadata)
+    assert (
+        storage.get_pack_semantic_summary(pack_dir, verify_files=False)[
+            "semantic_status"
+        ]
+        == "complete"
+    )
+
+    image_path.unlink()
+    metadata = storage.load_metadata(pack_dir)
+    storage.refresh_metadata_inventory_snapshot(pack_dir, metadata)
+    assert metadata["file_total"] == -1
+    storage.save_metadata(pack_dir, metadata)
+
+    summary = storage.get_pack_semantic_summary(pack_dir, verify_files=False)
+    assert summary["semantic_status"] == "partial"
+    assert summary["semantic_file_total"] == 0
+    assert not summary["semantic_snapshot_matches"]
+    assert summary["semantic_files_changed"]
+
+
+def test_summary_keeps_valid_empty_snapshot(tmp_path):
+    pack_dir, _ = create_pack(tmp_path)
+    storage.save_metadata(pack_dir, {"file_total": 0, "unique_total": 0, "images": {}})
+
+    summary = storage.get_pack_semantic_summary(pack_dir, verify_files=False)
+
+    assert summary["semantic_status"] == "none"
+    assert summary["semantic_snapshot_matches"]
+    assert not summary["semantic_files_changed"]
+
+
+@pytest.mark.parametrize("tamper", ["missing", "duplicate", "invalid_digest"])
+def test_inventory_snapshot_rejects_invalid_records_without_clearing_stale(
+    tmp_path, tamper
+):
+    pack_dir, memes_dir = create_pack(tmp_path)
+    category_dir = memes_dir / "happy"
+    category_dir.mkdir()
+    (category_dir / "meme.png").write_bytes(b"image")
+    metadata = storage.reconcile_metadata(pack_dir)
+    entry_id, record = next(iter(metadata["images"].items()))
+    if tamper == "missing":
+        record["relative_path"] = "memes/happy/missing.png"
+    elif tamper == "duplicate":
+        digest = "b" * 64
+        duplicate = dict(record)
+        duplicate["content_sha256"] = digest
+        duplicate["entry_id"] = semantic_entry_id(
+            digest, record["category"], record["relative_path"]
+        )
+        metadata["images"][duplicate["entry_id"]] = duplicate
+    else:
+        record["content_sha256"] = "not-a-digest"
+    original_images = copy.deepcopy(metadata["images"])
+
+    storage.refresh_metadata_inventory_snapshot(pack_dir, metadata)
+
+    assert metadata["file_total"] == -1
+    assert metadata["images"] == original_images
+    assert entry_id in metadata["images"]
 
 
 def test_save_and_load_empty_metadata_round_trip(tmp_path):

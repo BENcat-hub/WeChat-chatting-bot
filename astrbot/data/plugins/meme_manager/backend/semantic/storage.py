@@ -276,6 +276,95 @@ def _is_sha256(value: Any) -> bool:
     return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
 
 
+def refresh_metadata_inventory_snapshot(
+    pack_dir: Path | str, metadata: dict[str, Any]
+) -> None:
+    """Recompute inventory counters when records exactly cover the images.
+
+    Mutates ``metadata`` in place and never writes it to disk. Counters are
+    refreshed only when every record maps to one unique existing image path
+    and the record path set exactly matches the filesystem path set; otherwise
+    ``file_total`` is marked invalid so callers cannot report a stale complete
+    snapshot. Image contents are never read.
+
+    Args:
+        pack_dir: Pack root that contains the ``memes`` directory.
+        metadata: Semantic metadata to update in place.
+
+    Returns:
+        None.
+    """
+    root = Path(pack_dir).resolve()
+    memes_root = (root / "memes").resolve()
+    existing_paths: set[str] = set()
+    if memes_root.is_dir():
+        for path in sorted(memes_root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            try:
+                path.resolve().relative_to(memes_root)
+            except (OSError, RuntimeError, ValueError):
+                # An image symlink escaping the pack is untracked content, not
+                # something that can be silently ignored.
+                metadata["file_total"] = -1
+                return
+            existing_paths.add(path.relative_to(root).as_posix())
+
+    images = metadata.get("images")
+    if not isinstance(images, dict):
+        metadata["file_total"] = -1
+        return
+
+    record_paths: set[str] = set()
+    digests: list[str] = []
+    hash_categories: set[tuple[str, str]] = set()
+    for key, value in images.items():
+        if not isinstance(value, dict):
+            metadata["file_total"] = -1
+            return
+        digest = str(value.get("content_sha256") or "").lower()
+        relative_path = str(value.get("relative_path") or "")
+        category = str(value.get("category") or "")
+        resolved = safe_relative_path(root, relative_path)
+        computed_entry_id = (
+            semantic_entry_id(digest, category, relative_path)
+            if _is_sha256(digest)
+            else ""
+        )
+        if (
+            not _is_sha256(digest)
+            or not category
+            or relative_path in record_paths
+            or resolved is None
+            or not resolved.is_relative_to(memes_root)
+            or Path(relative_path).parent.name != category
+            or str(key) != computed_entry_id
+            or (
+                "entry_id" in value
+                and str(value.get("entry_id") or "") != computed_entry_id
+            )
+        ):
+            metadata["file_total"] = -1
+            return
+        record_paths.add(relative_path)
+        digests.append(digest)
+        hash_categories.add((digest, category))
+
+    if record_paths != existing_paths:
+        metadata["file_total"] = -1
+        return
+
+    file_count = len(existing_paths)
+    content_unique_total = len(set(digests))
+    metadata["file_total"] = file_count
+    metadata["unique_total"] = len(record_paths)
+    metadata["content_unique_total"] = content_unique_total
+    metadata["reused_duplicate_files"] = max(0, file_count - len(hash_categories))
+    metadata["cross_category_duplicate_entries"] = max(
+        0, len(hash_categories) - content_unique_total
+    )
+
+
 def _source_schema_version(data: dict[str, Any]) -> str:
     """返回规范化后的语义架构版本。
 
@@ -900,9 +989,10 @@ def get_pack_semantic_summary(
         snapshot_file_total = semantic_total
     else:
         try:
-            snapshot_file_total = max(0, int(raw_snapshot_total))
+            parsed_file_total = int(raw_snapshot_total)
         except (TypeError, ValueError):
-            snapshot_file_total = -1
+            parsed_file_total = -1
+        snapshot_file_total = parsed_file_total if parsed_file_total >= 0 else -1
     snapshot_matches = snapshot_file_total == current_file_total
     all_records_done = bool(images) and caption_done == len(images)
     completion_candidate = (
@@ -1380,6 +1470,7 @@ def save_collected_image_semantic(
     _assert_image_snapshot_unchanged(root, source, digest, entry_id)
     images[entry_id] = item.to_dict()
     metadata["requires_local_index_rebuild"] = True
+    refresh_metadata_inventory_snapshot(root, metadata)
     save_metadata(root, metadata)
 
 

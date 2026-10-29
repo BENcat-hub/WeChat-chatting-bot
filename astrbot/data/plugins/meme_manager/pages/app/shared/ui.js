@@ -72,7 +72,7 @@ const confirmMask = document.createElement("div");
 confirmMask.className = "dialog-mask ui-confirm-mask hidden";
 confirmMask.setAttribute("aria-hidden", "true");
 confirmMask.innerHTML = `<section class="dialog-card" role="dialog" aria-modal="true" aria-labelledby="ui-confirm-title" aria-describedby="ui-confirm-message">
-  <h3 id="ui-confirm-title" class="text-h3 pa-4 pb-0 pl-6"></h3>
+  <h3 id="ui-confirm-title" class="ui-dialog-title text-h3 pa-4 pb-0 pl-6"></h3>
   <p id="ui-confirm-message" class="dialog-message"></p>
   <div class="dialog-actions"><button type="button" id="ui-confirm-cancel" class="ghost" variant="text">取消</button><button type="button" id="ui-confirm-accept" variant="tonal">确认</button></div>
 </section>`;
@@ -124,7 +124,49 @@ const dialogObserver = new MutationObserver(() => {
   document.body.classList.toggle("ui-modal-open", dialogStack.length > 0);
 });
 for (const dialog of document.querySelectorAll('[role="dialog"]')) {
-  dialogObserver.observe(dialog.parentElement, {
+  const mask = dialog.parentElement;
+  let pointerDownTarget = null;
+  let pointerUpTarget = null;
+  mask.addEventListener(
+    "pointerdown",
+    (event) => {
+      pointerDownTarget = event.target;
+      pointerUpTarget = null;
+    },
+    true,
+  );
+  mask.addEventListener(
+    "pointerup",
+    (event) => {
+      pointerUpTarget = event.target;
+    },
+    true,
+  );
+  mask.addEventListener(
+    "pointercancel",
+    () => {
+      pointerDownTarget = null;
+      pointerUpTarget = null;
+    },
+    true,
+  );
+  mask.addEventListener(
+    "click",
+    (event) => {
+      // Drag selections can retarget click to the dialog or its backdrop.
+      if (
+        event.detail > 0 &&
+        (event.target === mask || event.target === dialog) &&
+        (event.target !== pointerDownTarget || event.target !== pointerUpTarget)
+      ) {
+        event.stopImmediatePropagation();
+      }
+      pointerDownTarget = null;
+      pointerUpTarget = null;
+    },
+    true,
+  );
+  dialogObserver.observe(mask, {
     attributes: true,
     attributeFilter: ["class", "aria-hidden", "hidden"],
   });
@@ -176,6 +218,37 @@ document.addEventListener(
   true,
 );
 
+// 压缩包分片上传：宿主对单次请求体有上限，大压缩包必须分片传输。
+const PACK_ARCHIVE_CHUNK_SIZE = 8 * 1024 * 1024;
+
+async function uploadPackArchiveInChunks(file, { onProgress } = {}) {
+  const pageApi = window.AstrBotPluginPage;
+  if (!pageApi) {
+    throw new Error("页面无法连接 AstrBot");
+  }
+  const totalChunks = Math.max(
+    1,
+    Math.ceil((file?.size || 0) / PACK_ARCHIVE_CHUNK_SIZE),
+  );
+  const session = await pageApi.apiPost("packs/import/session", {
+    filename: String(file?.name || "pack.zip"),
+    total_chunks: totalChunks,
+  });
+  const sessionId = session.session_id;
+  let result = null;
+  for (let index = 0; index < totalChunks; index += 1) {
+    const start = index * PACK_ARCHIVE_CHUNK_SIZE;
+    const end = Math.min(start + PACK_ARCHIVE_CHUNK_SIZE, file.size);
+    const chunk = file.slice(start, end);
+    result = await pageApi.upload(
+      `packs/import/session/chunk/${sessionId}/${index}/${totalChunks}`,
+      chunk,
+    );
+    onProgress?.(index + 1, totalChunks);
+  }
+  return result;
+}
+
 window.MemeUI = {
   get navAuthToken() {
     return navAuthToken;
@@ -183,6 +256,7 @@ window.MemeUI = {
   withCurrentAuthParams,
   ensureNavAuthToken,
   applySecureNavLinks,
+  uploadPackArchiveInChunks,
   toast(message, type = "info") {
     let container = document.getElementById("toast-container");
     if (!container) {

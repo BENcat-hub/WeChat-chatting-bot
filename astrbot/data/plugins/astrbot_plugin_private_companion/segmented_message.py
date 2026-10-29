@@ -12,20 +12,96 @@ from .persona_config import runtime_persona_setting
 LLM_SEGMENT_MARKER = "<<PRIVATE_COMPANION_SPLIT>>"
 LLM_SEGMENT_PLACEHOLDER = "{{split_marker}}"
 
+
+def fit_segments_to_budget(candidate: Any, remaining: int) -> list[str]:
+    """把规则切分结果压到剩余名额内，且一个字都不丢。
+
+    场景：模型自己用标记切了 N 段，`max_segments` 只剩 `remaining` 个名额，
+    但某个段落里还挤着好几句话（逗号连成长句）。原实现是「切出来的段数超过
+    名额就整段放弃」，于是长段原样发出去——看起来就像分段规则没生效。
+    这里改成从尾部并回：保留切分点，把多出来的尾巴并进最后一段。
+    """
+
+    parts = [str(part or "") for part in (candidate or [])]
+    parts = [part for part in parts if part.strip()]
+    try:
+        budget = int(remaining)
+    except Exception:
+        budget = 0
+    limit = max(2, budget + 1)
+    while len(parts) > limit:
+        tail = parts.pop()
+        head = parts[-1]
+        if head and tail and head[-1] not in "。！？!?…~～；;，,、\n":
+            parts[-1] = f"{head}，{tail}"
+        else:
+            parts[-1] = f"{head}{tail}"
+    return parts
+
+
+_SEGMENT_BOUNDARY_PATTERN = re.compile(r"[。！？!?…~～；;\n，,、]")
+
+
+def segment_exceeds_granularity(text: Any, limit: int = 20) -> bool:
+    """这段是不是「一句话里塞了好几句」，值得再用规则切一次。
+
+    模型有时会自己用标记分段，但每段仍是「逗号串起来的长句」。两种情况要再切：
+    1. 长度超过一条微信消息的粒度上限（默认 20 字）且内部有断句点；
+    2. 虽然不超长，但内部有 2 个以上断句点（典型：「补偿啊，我又不欠你钱，欠的是照片」），
+       也就是三条短句被逗号硬串成了一条。
+    """
+
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return False
+    try:
+        boundary = max(8, int(limit))
+    except Exception:
+        boundary = 20
+    breaks = len(_SEGMENT_BOUNDARY_PATTERN.findall(cleaned))
+    if len(cleaned) > boundary and breaks >= 1:
+        return True
+    return breaks >= 2 and len(cleaned) >= 10
+
+
+def limit_planned_segments(planned: Any, max_segments: int) -> list[list[str]]:
+    """把（可能被再切过的）分段列表压回 max_segments，超出的并进最后一段。"""
+
+    try:
+        budget = max(1, int(max_segments))
+    except Exception:
+        budget = 3
+    limited: list[list[str]] = []
+    for buffer_parts in planned or []:
+        parts = [str(part or "").strip() for part in (buffer_parts or [])]
+        parts = [part for part in parts if part]
+        if len(parts) > budget:
+            parts = fit_segments_to_budget(parts, budget - 1)
+        limited.append(parts)
+    return limited
+
+
 _ESCAPED_LLM_SEGMENT_MARKER_PATTERN = re.compile(
-    r"(?:&lt;|&#0*60;){2}\s*PRIVATE_COMPANION_SPLIT\s*(?:&gt;|&#0*62;){2}",
+    r"(?:&lt;|&#0*60;){1,3}\s*PRIVATE_COMPANION_SPLIT\s*(?:&gt;|&#0*62;){1,3}",
     flags=re.IGNORECASE,
 )
 _MARKDOWN_ESCAPED_LLM_SEGMENT_MARKER_PATTERN = re.compile(
-    r"\\<\\<\s*PRIVATE\s*_\s*COMPANION\s*_\s*SPLIT\s*\\>\\>",
+    r"(?:\\<){1,3}\s*PRIVATE\s*_\s*COMPANION\s*_\s*SPLIT\s*(?:\\>){1,3}",
     flags=re.IGNORECASE,
 )
 _PLACEHOLDER_PATTERN = re.compile(
     r"\{\{\s*split_marker\s*\}\}",
     flags=re.IGNORECASE,
 )
+# 模型经常把 <<PRIVATE_COMPANION_SPLIT>> 写成单尖括号、三尖括号或带空格的变体；
+# 只认双尖括号会让这些变体原样漏到聊天里（用户可见 <PRIVATE_COMPANION_SPLIT>）。
 _SPACED_LLM_SEGMENT_MARKER_PATTERN = re.compile(
-    r"<<\s*PRIVATE\s*_\s*COMPANION\s*_\s*SPLIT\s*>>",
+    r"<{1,3}\s*PRIVATE\s*_\s*COMPANION\s*_\s*SPLIT\s*>{1,3}",
+    flags=re.IGNORECASE,
+)
+# 兜底清洗：即使用户把标记放进代码块/引用里，也不许它出现在外发文本中。
+_LOOSE_LLM_SEGMENT_MARKER_PATTERN = re.compile(
+    r"[<\uFF1C]{1,3}\s*PRIVATE\s*_\s*COMPANION\s*_\s*SPLIT\s*[>\uFF1E]{1,3}",
     flags=re.IGNORECASE,
 )
 
@@ -142,6 +218,8 @@ def _replace_reserved_tokens(value: str, *, marker: str) -> tuple[str, dict[str,
         else re.compile(re.escape(marker), flags=re.IGNORECASE)
     )
     cleaned = replace(marker_pattern, "marker", cleaned)
+    # 双尖括号之外的变体（单尖括号、全角尖括号）也必须清掉，绝不允许外发。
+    cleaned = replace(_LOOSE_LLM_SEGMENT_MARKER_PATTERN, "marker", cleaned)
     if any(counts.values()):
         token_pattern = re.escape(replacement_token)
         cleaned = re.sub(
@@ -235,8 +313,14 @@ def parse_llm_segment_control(
         )
         quoted = raw_line.lstrip().startswith(">")
 
-        if not inside_fence and not quoted and raw_line.count(marker) == 1:
-            left, right = raw_line.split(marker, 1)
+        marker_match = marker_pattern.search(raw_line)
+        if (
+            not inside_fence
+            and not quoted
+            and marker_match is not None
+            and len(marker_pattern.findall(raw_line)) == 1
+        ):
+            left, right = raw_line[: marker_match.start()], raw_line[marker_match.end() :]
             left_has_text = bool(left.strip())
             right_has_text = bool(right.strip())
             if not (left_has_text and right_has_text):

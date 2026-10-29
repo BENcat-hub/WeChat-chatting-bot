@@ -180,7 +180,7 @@ class ProactiveFactGroundingTests(unittest.TestCase):
                 reason="group_share",
                 action="message",
                 action_context=(
-                    "群聊分享线索：测试群（群号 300000101）\n"
+                    "群聊分享线索：示例群聊D（群号 300000101）\n"
                     "代表性片段：群友甲: @testbot 出来回话\n"
                     "消息指向：结构化场景确认该消息对 Bot 说话。"
                 ),

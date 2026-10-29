@@ -53,15 +53,28 @@ except Exception:
 import logging                                                      # noqa: E402
 
 if not logging.getLogger().handlers:
+    # 2026-10-29：bridge 用 subprocess.run(capture_output=True, timeout=45) 调 wxui；
+    # **超时被杀时 stdout/stderr 全丢**，日志里只剩「send 超时」，没法定位卡在哪一步。
+    # 所以同时写一份按天的日志文件，超时后仍能回看。
+    _handlers = [logging.StreamHandler()]
+    try:
+        _logdir = os.path.join(ROOT, "logs")
+        os.makedirs(_logdir, exist_ok=True)
+        _handlers.append(logging.FileHandler(
+            os.path.join(_logdir, "wxui-%s.log" % time.strftime("%Y%m%d")),
+            encoding="utf-8-sig"))
+    except Exception:  # noqa: BLE001
+        pass
     logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+                        format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=_handlers)
 log = logging.getLogger("wxui")
 
 CONFIG_PATH = os.path.join(HERE, "wxui-config.json")
 
 
 def config():
-    with open(CONFIG_PATH, encoding="utf-8") as fh:
+    with open(CONFIG_PATH, encoding="utf-8-sig") as fh:
         cfg = json.load(fh)
     # 防双击参数随配置下发（winio 自己不知道配置文件在哪）：同点连点的最小间隔与位置容差。
     if winio is not None:
@@ -70,28 +83,31 @@ def config():
 
 
 def token(cfg):
-    with open(os.path.join(ROOT, cfg["token_file"]), encoding="utf-8") as fh:
+    with open(os.path.join(ROOT, cfg["token_file"]), encoding="utf-8-sig") as fh:
         return fh.read().strip()
 
 
 def api(cfg, path, **params):
     # 2026-10-22：WeFlow 的 /messages 偶发 500（会话列表/回读同时坏掉），
     # 以前直接抛异常 → 重发队列把「其实已送达」判成失败 → 同一条消息刷屏 12 次。
-    # 这里给所有 GET 加 3 次重试，把瞬时 5xx/超时吸收掉。
+    # 这里给所有 GET 加重试，把瞬时 5xx/超时吸收掉。
+    # 2026-10-28：原来是 3 次 × 20s 超时 = 最多 60s+，超过 bridge 的 wxui_timeout=45s，
+    # 于是「API 只是在重试」被上层当成「发送超时」。改成 2 次 × 12s（≤25s），
+    # 仍能吸收瞬时故障，又给后面的 UI 操作留出余量。
     _last = None
-    for _i in range(3):
+    for _i in range(2):
         try:
             return _api_once(cfg, path, **params)
         except Exception as _e:            # noqa: BLE001
             _last = _e
-            time.sleep(0.35 + 0.3 * _i)
+            time.sleep(0.25 + 0.25 * _i)
     raise _last
 
 
 def _api_once(cfg, path, **params):
     params["access_token"] = token(cfg)
     url = cfg["weflow_base_url"] + path + "?" + urllib.parse.urlencode(params)
-    with urllib.request.urlopen(url, timeout=20) as resp:
+    with urllib.request.urlopen(url, timeout=12) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -417,6 +433,14 @@ def wait_for_session(client, cfg, plan, hwnd=None):
                         plan["session_waited_s"] = round(time.time() - started, 1)
                         return True
                     reason = "could not bring WeChat to the foreground"
+                    # 2026-10-24：用户开无边框全屏游戏时，ForegroundWindow 永远是游戏，
+                    # 再等 60 秒也只是白等，而重发队列会把这 60 秒算成一次失败。认出来就
+                    # 立刻交回，让 bridge 把消息留在队列里等桌面空出来（不计重试次数）。
+                    fsh, fst = winio.fullscreen_app(exclude=(hwnd,))
+                    if fsh:
+                        plan["fullscreen_hold"] = fst
+                        return fail(plan, "desktop held by fullscreen app「%s」 (FULLSCREEN_HOLD)"
+                                    % fst, retryable=True)
         if time.time() >= deadline:
             break
         time.sleep(float(cfg.get("session_poll_s", 3.0)))
@@ -437,14 +461,14 @@ def fit(text):
 
 
 # Windows OCR cannot read emoji and drops most symbols, and WeChat truncates a long name
-# in the sidebar — so a group named ㊙️情🔞VIP💎508🉑👅🈲✈️ comes back as "情VIP508" (or split
+# in the sidebar — so a group named 示例群聊B comes back as "情VIP508" (or split
 # over two lines). Comparing raw strings can therefore never match, whatever the remark is.
 _NAME_KEEP = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+")
 NAME_MATCH_CLEAR = 0.9         # one side contains the other: trust it like today's partial
 NAME_MATCH_MIN_RATIO = 0.7     # otherwise: this share of the shorter name, as one run
 NAME_MATCH_MIN_CHARS = 3       # ...and at least this many characters in a row
 NAME_MATCH_UNIQUE_MARGIN = 0.15  # a fuzzy winner must beat the runner-up by this much
-NAME_MATCH_LENIENT = 0.55       # 同长度+首字相同（OCR 形近替身，如 测试群→测讠羊）；
+NAME_MATCH_LENIENT = 0.55       # 同长度+首字相同（OCR 形近替身，如 示例群聊D→测讠羊）；
                                 # 低于 CLEAR，只供"唯一最佳"分支使用，闸门一概不认
 
 
@@ -453,7 +477,7 @@ def name_key(text):
     return _NAME_KEEP.sub("", (text or "")).lower()
 
 
-# Windows OCR 最常见的数字/字母认错（杏园6-508 → 「杏园6巧08」就是这样来的）。只用于
+# Windows OCR 最常见的数字/字母认错（示例群聊 → 「杏园6巧08」就是这样来的）。只用于
 # 「整串折一折再比」这一步：两侧都折，所以像 Lisa 里的 l→1 不会单独造成误判；真正防错
 # 的是调用方要求「折完相等且全屏唯一」。
 _OCR_FOLD = str.maketrans({
@@ -505,14 +529,14 @@ def name_match(key, text):
         ratio = run / float(min(len(a), len(b)))
         if ratio >= NAME_MATCH_MIN_RATIO:
             return ratio
-    # 2026-10-21：「测试群」在侧边栏和聊天标题里被 Windows OCR 稳定读成「测讠羊」
+    # 2026-10-21：「示例群聊D」在侧边栏和聊天标题里被 Windows OCR 稳定读成「测讠羊」
     # （实测 1x/2x/3x/4x 放大结果一致，放大救不回来——所以只能改判定），只要有一个
     # 字读错，exact/containment 就全废，于是明明在列表第二行也报
     # "could not locate target row by OCR"。同长度 + 首字相同是这种"部首/形近替身"的
     # 典型特征；但 0.55 远低于 NAME_MATCH_CLEAR，因此它**只能**通过需要"同一屏里唯一
     # 最佳"的 fuzzy 分支（find_row / 标题复核）生效，凡是要求精确的闸门都不认它。
-    # 2026-10-23：「桃桃真可爱」的旧备注「陈铭坚」靠这条宽匹配认领了「陈奥琦」，
-    # 身份闸因此放行，发给桃桃的消息全敲进了陈奥琦。收紧成首尾都相同：
+    # 2026-10-23：「用户B」的旧备注「用户B别名」靠这条宽匹配认领了「用户A」，
+    # 身份闸因此放行，发给桃桃的消息全敲进了用户A。收紧成首尾都相同：
     # OCR 形近改写通常两端都对得上，而不同人的名字极少首尾同时撞车。
     if len(a) == len(b) >= 3 and a[0] == b[0] and a[-1] == b[-1]:
         return NAME_MATCH_LENIENT
@@ -542,7 +566,7 @@ def name_matches_any(key, texts, allow_fuzzy=False):
     return False
 
 
-# 2026-10-18（用户反馈：把「桃桃真可爱」的备注改成「陈铭坚」后，侧边栏 OCR 再也找不到那条
+# 2026-10-18（用户反馈：把「用户B」的备注改成「用户B别名」后，侧边栏 OCR 再也找不到那条
 # 会话，消息直接发不出去）：WeFlow 的 displayName 是旧名字，侧边栏显示的却是新备注，于是
 # 「用 API 名字找 UI 行」永远匹配不上。别名表让一条会话可以有几个合法拼写——手填在
 # wxui-config.json 的 contact_aliases 里，或由一次「WeFlow 回读确认成功」的发送自动学到
@@ -563,7 +587,7 @@ def _alias_pairs(cfg):
         for other in ([others] if isinstance(others, str) else (others or [])):
             add(primary, other)
     try:
-        with open(_alias_learn_path(cfg), encoding="utf-8") as fh:
+        with open(_alias_learn_path(cfg), encoding="utf-8-sig") as fh:
             learned = json.load(fh)
     except Exception:
         learned = {}
@@ -606,7 +630,7 @@ def _learn_alias(cfg, target, plan):
         return None
     path = _alias_learn_path(cfg)
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except Exception:
         data = {}
@@ -621,7 +645,7 @@ def _learn_alias(cfg, target, plan):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
+        with open(tmp, "w", encoding="utf-8-sig") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, path)
     except Exception:
@@ -774,7 +798,21 @@ def ui_paste(client, cfg, point, text):
 
 
 def ui_escape(client, cfg):
-    """按 Escape 收起搜索面板。"""
+    """按 Escape 收起搜索面板。**只在搜索面板确实展开时可用！**
+
+    2026-10-29 隔离实验（scripts/_exp_search_freeze_1029.py，4 个 trial）：
+
+      | trial | 动作                                   | 结果 |
+      | 0     | 只按 Esc（没有面板）                   | **冻结**（hover ratio 0.42 → 0.00） |
+      | A     | 打开面板 → 按 Esc                      | 正常（面板收起） |
+      | B     | 打开面板 → 点联系人结果（不按 Esc）    | 正常（微信自己关面板） |
+      | C     | 打开面板 → 点结果 → 再补一个 Esc       | **冻结** |
+
+    → 微信 4.x 在没有覆盖层时按 Esc 会让 MMUI 渲染子窗停止重绘（消息不进侧栏、点击/滚轮
+    全部无响应、WM_NULL 仍然 9ms）。这就是用户说的「搜索导致微信卡死」：搜索路径点完结果
+    后微信已经把面板收起来了，我们再补的那一下 Esc 打在聊天窗口上。**不要用它来清场**。
+    清覆盖层用 `dismiss_overlay()`（点聊天头部空白处）。
+    """
     if _native_on(cfg, "native_input"):
         winio.press_escape()
         return "native"
@@ -782,24 +820,166 @@ def ui_escape(client, cfg):
     return "mcp"
 
 
-def image_size(path):
+def dismiss_overlay(cfg, rect):
+    """收起搜索面板/覆盖层：点聊天头部的空白处（不要用 Esc，见 `ui_escape` 的说明）。
+
+    面板展开时这个点在面板右缘之外 → 微信视为「点到外面」，自己收起面板；
+    面板没开时这个点落在聊天标题栏的空白处，没有任何副作用。
+    """
+    x = int(rect[0] + (rect[2] - rect[0]) * float(cfg.get("overlay_dismiss_x_ratio", 0.464)))
+    y = int(rect[1] + (rect[3] - rect[1]) * float(cfg.get("overlay_dismiss_y_ratio", 0.084)))
     try:
-        from winsdk.windows.graphics.imaging import BitmapDecoder
-        from winsdk.windows.storage import FileAccessMode, StorageFile
-    except Exception:
+        ui_click(None, cfg, (x, y))
+        return {"ok": True, "point": [x, y]}
+    except HumanBusy:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "point": [x, y], "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+# ---------------------------------------------------------------------------
+# OCR 后端：RapidOCR 常驻进程（首选）/ Windows OCR（兜底）
+#
+# 2026-10-29：Windows OCR 对「用户F」在侧栏和聊天头部**任何缩放都读不出**
+# （固定读成「丕 忄 尸」或整行漏掉），「示例群聊D」读成「测讠羊」；而 RapidOCR
+# （PP-OCRv4）在 1x 原图上就能读对（用户F score 0.91，示例群聊D也正确）。
+# 引擎跑在 `.venv-ocr` 的常驻进程里，通过命名管道复用，避免把
+# onnxruntime/opencv 装进 bridge 的 venv，也避免每次发送重付 ~2.5s 的模型加载。
+# ---------------------------------------------------------------------------
+_OCR_AUTHKEY = b"wxui-ocr-v1"
+_OCR_STATE = {"spawn_at": 0.0, "spawns": 0, "pid": None, "last_error": ""}
+
+
+def _ocr_python(cfg=None):
+    """RapidOCR 用的解释器：优先 .venv-ocr，其次 $WXUI_OCR_PYTHON。"""
+    env = os.environ.get("WXUI_OCR_PYTHON")
+    if env and os.path.exists(env):
+        return env
+    p = os.path.abspath(os.path.join(ROOT, ".venv-ocr", "Scripts", "python.exe"))
+    return p if os.path.exists(p) else None
+
+
+def _ocr_pipe_name(cfg):
+    return str((cfg or {}).get("ocr_pipe") or r"\\.\pipe\wxui-ocr")
+
+
+def _ocr_connect(cfg):
+    from multiprocessing.connection import Client
+    return Client(_ocr_pipe_name(cfg), family="AF_PIPE", authkey=_OCR_AUTHKEY)
+
+
+def _ocr_spawn(cfg):
+    """拉起常驻 OCR 服务（detached，父进程退出也不死；空闲会自动退出）。"""
+    py = _ocr_python(cfg)
+    if not py:
+        return False
+    script = os.path.join(HERE, "ocr_server.py")
+    if not os.path.exists(script):
+        return False
+    flags = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
+    try:
+        proc = subprocess.Popen(
+            [py, script, "--serve", "--pipe", _ocr_pipe_name(cfg),
+             "--idle", str(int((cfg or {}).get("ocr_idle_s", 1800) or 1800))],
+            cwd=HERE, creationflags=flags,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True)
+    except Exception as exc:  # noqa: BLE001
+        _OCR_STATE["last_error"] = "spawn failed: %s" % exc
+        return False
+    _OCR_STATE.update(spawn_at=time.time(), spawns=_OCR_STATE["spawns"] + 1, pid=proc.pid)
+    log.info("[wxui] OCR 服务已拉起 pid=%s pipe=%s", proc.pid, _ocr_pipe_name(cfg))
+    return True
+
+
+def _ocr_server_conn(cfg, wait_s=None):
+    """拿到一条到 OCR 服务的连接；服务不在就拉起来再等它开始监听。"""
+    try:
+        return _ocr_connect(cfg)
+    except OSError:
+        pass
+    wait_s = float(wait_s if wait_s is not None else (cfg or {}).get("ocr_spawn_wait_s", 25))
+    # 刚拉过就别重复拉：管道名是单实例，重复 spawn 只会失败退出。
+    if time.time() - _OCR_STATE["spawn_at"] > 6:
+        _ocr_spawn(cfg)
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        try:
+            return _ocr_connect(cfg)
+        except OSError:
+            time.sleep(0.25)
+    return None
+
+
+def _ocr_rapid(path, cfg):
+    """一次 RapidOCR 请求；失败返回 {"ok": False, "error": ...} 由调用方决定是否兜底。"""
+    try:
+        conn = _ocr_server_conn(cfg)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "engine": "rapidocr", "error": "connect failed: %s" % exc}
+    if conn is None:
+        _OCR_STATE["last_error"] = "ocr server did not come up"
+        return {"ok": False, "engine": "rapidocr",
+                "error": "ocr server unavailable (pipe %s)" % _ocr_pipe_name(cfg)}
+    try:
+        conn.send({"id": int(time.time() * 1000), "path": os.path.abspath(path)})
+        if not conn.poll(float((cfg or {}).get("ocr_timeout_s", 20))):
+            _OCR_STATE["last_error"] = "timeout"
+            return {"ok": False, "engine": "rapidocr", "error": "ocr request timed out"}
+        res = conn.recv()
+        if isinstance(res, dict):
+            return res
+        return {"ok": False, "engine": "rapidocr", "error": "bad ocr response"}
+    except Exception as exc:  # noqa: BLE001
+        _OCR_STATE["last_error"] = "%s: %s" % (type(exc).__name__, exc)
+        return {"ok": False, "engine": "rapidocr", "error": _OCR_STATE["last_error"]}
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def ocr_engine_name():
+    """当前生效的 OCR 引擎（诊断用）。"""
+    cfg = config()
+    return str(cfg.get("ocr_engine") or "auto")
+
+
+def image_size(path):
+    """(w, h)。先用 PIL（本地、无 WinRT 代理），再退回 ocr.py 的解码器。"""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.size
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import ocr
+        return asyncio.run(ocr.image_size(path))
+    except Exception:  # noqa: BLE001
         return None
-    async def _size():
-        f = await StorageFile.get_file_from_path_async(path)
-        s = await f.open_async(FileAccessMode.READ)
-        d = await BitmapDecoder.create_async(s)
-        return int(d.pixel_width), int(d.pixel_height)
-    return asyncio.run(_size())
 
 
 def ocr_lines(path):
+    """OCR 一张图，返回 {"ok", "engine", "lines":[{text,x,y,w,h,words}]}。
+
+    `ocr_engine` 配置：
+      rapid / auto  → 先走常驻 RapidOCR 进程
+      windows       → 只用 Windows OCR（旧行为，保留给排障）
+    RapidOCR 失败时**永远退回 Windows OCR**（即使显式配了 rapid）：RapidOCR 服务起不来
+    时宁可降级（读不出「用户F」这种 12px 短名，但其他会话照常发），也不要整条发送链失败。
+    """
+    cfg = config()
+    engine = str(cfg.get("ocr_engine") or "auto").lower()
+    if engine in ("rapid", "rapidocr", "auto"):
+        res = _ocr_rapid(path, cfg)
+        if res.get("ok"):
+            return res
+        log.warning("[wxui] RapidOCR 不可用（%s），本次退回 Windows OCR", res.get("error"))
     import ocr
-    res = asyncio.run(ocr.run(path))
-    return res
+    return asyncio.run(ocr.run(path))
+
 
 
 def header_names_target(key, texts):
@@ -816,7 +996,7 @@ def header_names_target(key, texts):
     if not keys:
         return False
     # 第一个是真实名称，后面是备注/历史别名。别名只接受**高置信**命中：
-    # 事故里别名「陈铭坚」用 0.55 的宽匹配认领了「陈奥琦」。
+    # 事故里别名「用户B别名」用 0.55 的宽匹配认领了「用户A」。
     if name_matches_any(keys[0], lines):
         return True
     for k in keys[1:]:
@@ -840,7 +1020,7 @@ def header_names_target(key, texts):
 
 
 def _header_group_clean(text):
-    """去掉群标题尾巴上的成员数：「测试群（3）」→「测试群」。"""
+    """去掉群标题尾巴上的成员数：「示例群聊D（3）」→「示例群聊D」。"""
     return re.sub(r"\s*[（(]\s*\d+\s*[)）]\s*$", "", text or "").strip()
 
 
@@ -856,7 +1036,7 @@ def _char_dice(a, b):
 def header_matches_surface(texts, surface, threshold=0.5):
     """聊天标题的 OCR 与「刚才点的那一行」是不是同一个名字。
 
-    Windows OCR 对「测试群」这个短名很不稳定：侧边栏读成「测讠羊」，同一时刻聊天标题
+    Windows OCR 对「示例群聊D」这个短名很不稳定：侧边栏读成「测讠羊」，同一时刻聊天标题
     又读成「测讠胡羊（3）」——两边都不等于目标名，但两边互相同源（字符重合 3/4）。所以
     复核分两步：先按目标名/别名严格比，不中再退回「标题 ≈ 我点的这一行」，两者都过不了
     才拒绝打字。这一条只在侧边栏已经用唯一最佳匹配选中该行之后才会用到，不会放宽发错人。
@@ -879,7 +1059,7 @@ _SCROLL_POS = {"at_top": True, "ts": 0.0, "serial": 0}
 
 
 # 2026-10-21（用户反复实测「怎么还是点两次」）：一次 send() 可能重试多次，每次都走 open_chat
-# 又点一下侧栏同一行；名字 OCR 读不准的会话（「测试群」→「测讠羊」）靠名字永远复核不过，
+# 又点一下侧栏同一行；名字 OCR 读不准的会话（「示例群聊D」→「测讠羊」）靠名字永远复核不过，
 # 于是重试 = 再点一次鼠标，用户看到的就是「点两次」。这里记「刚给谁点过哪一行、点完头部
 # 长什么样」，同一目标在 row_click_dedup_s 秒内再次进入 open_chat 时不再点击。
 _CLICK_MEMO = {}
@@ -893,7 +1073,7 @@ def _note_click(target, point, header_texts=None, why=""):
     try:
         log_dir = os.path.join(ROOT, "logs")
         os.makedirs(log_dir, exist_ok=True)
-        with open(os.path.join(log_dir, "wxui-clicks.log"), "a", encoding="utf-8") as fh:
+        with open(os.path.join(log_dir, "wxui-clicks.log"), "a", encoding="utf-8-sig") as fh:
             fh.write("%s target=%s point=%s why=%s\n" % (
                 time.strftime("%Y-%m-%d %H:%M:%S"), target, rec["point"], why or "-"))
     except Exception:
@@ -944,7 +1124,7 @@ def selected_row_text(cfg, rect):
     为什么需要它：头部 OCR 对私聊短名并不可靠（「文件传输助手」常被拆开），于是
     `header_looks_like` 的宽匹配会在**打开了别的会话**时误报「已经是目标」，
     接着 mic/发送就点到错的会话上（2026-10-22 实测：目标 文件传输助手，实际停在
-    雾中人耍起，`open_chat` 却返回 `chat already on target`）。
+    示例群聊C，`open_chat` 却返回 `chat already on target`）。
     侧栏绿底高亮是像素事实，用它复核头部判断，比再加名字规则稳。
     """
     left, top = rect[0], rect[1]
@@ -964,10 +1144,14 @@ def selected_row_text(cfg, rect):
     scale_y = (region[3] - region[1]) / float(img_h or 1)
     for line in res.get("lines") or []:
         box_h = max((w["y"] + w["h"] for w in line.get("words") or []), default=line["y"] + 18) - line["y"]
-        y = int(region[1] + (line["y"] + max(box_h, 18) / 2.0) * scale_y)
-        point = (int(region[0]) + 60, y)
-        if _row_selected(png, point, rect):
-            return {"text": line.get("text") or "", "y": y}
+        # 2026-10-29 修坐标：png 是**侧栏区域截图**，所以选中态取样点必须用截图内坐标。
+        # 旧代码把绝对屏幕坐标传给 _row_selected 再减 rect 原点，等于多偏了
+        # (sidebar_capture_x_offset, sidebar_capture_y_offset) ≈ (90,150)，
+        # 永远在测下面 1.5 行的绿底 —— 于是「选中行」经常读成邻居（用户F被读成示例群聊D）。
+        y_crop = int((line["y"] + max(box_h, 18) / 2.0) * scale_y)
+        if _row_selected(png, (200, y_crop), (0, 0, 0, 0)):
+            return {"text": line.get("text") or "",
+                    "y": int(region[1] + y_crop * 1.0)}
     return None
 
 
@@ -987,7 +1171,8 @@ def _row_selected_live(cfg, rect, point):
         png = shot(None, box, os.path.join(ROOT, "logs", "wmcp"))
         if not png:
             return None
-        return _row_selected(png, point, rect)
+        # 2026-10-29 同上：png 是 box 的局部截图，取样点要换成 box 内坐标。
+        return _row_selected(png, (140, 14), (0, 0, 0, 0))
     except HumanBusy:
         raise
     except Exception:  # noqa: BLE001
@@ -1082,7 +1267,7 @@ _PINNED_STATE = {"expanded": False, "ts": 0.0}
 def ensure_pinned_expanded(client, cfg, rect=None):
     """微信侧栏把置顶会话折成一行时，先点开它，否则里面的会话在 OCR 里完全不存在。
 
-    2026-10-23 用户指正：定位失败的「陈奥琦 / 桃桃真可爱 / 海蛇」都是**置顶**会话，
+    2026-10-23 用户指正：定位失败的「用户A / 用户B / 用户G」都是**置顶**会话，
     被折进「N 个置顶聊天」这一行里，扫描自然找不到。以前只在彻底失败后才试着展开，
     而且展开成功与否没有校验。现在改为：扫描前先看有没有这一行 → 点开 → 再 OCR 一次
     确认置顶会话确实出现了（行数变多或那一行本身消失），确认后把滚动状态复位。
@@ -1213,6 +1398,39 @@ def session_exists_in_weflow(cfg, target):
         return {"error": str(exc)}
 
 
+def _capture_probes(cfg):
+    """遮挡抽检点必须落在**真的会拿去 OCR/点击**的区域里。
+
+    2026-10-29 傍晚事故：DSH 的窗口一直盖在微信左侧（当时它被设成置顶），侧栏截图抓到的
+    是 DSH 的对话文字。旧抽检点全在窗口右半边（聊天区），那里没被盖住 → `ensure_wechat_ready`
+    判「没遮挡」，于是 OCR 拿 DSH 的像素去匹配「用户B」，必然找不到，搜索兜底再把
+    点击/粘贴打到 DSH 上。现在把侧栏、聊天头部、输入框都纳入抽检。
+    """
+    return (
+        (0.10, 0.22), (0.10, 0.40), (0.22, 0.30), (0.10, 0.62),   # 侧栏会话列表
+        (0.40, 0.06), (0.55, 0.06),                                 # 聊天头部
+        (0.72, 0.93),                                               # 输入框
+    )
+
+
+def _point_belongs_to(hwnd, point):
+    """这个屏幕坐标现在属于 hwnd 所在进程吗？（返回 (bool|None, pid)）
+
+    点击/粘贴之前用它兜底：置顶的别的窗口（如 no-activate 的 DSH 窗）会吃掉鼠标事件，
+    而 `GetForegroundWindow` 仍是微信 —— 只看前台判断不出来。
+    """
+    try:
+        user32 = ctypes.windll.user32
+        target = int(user32.GetWindowThreadProcessId(int(hwnd), None))
+        h = int(user32.WindowFromPoint(ctypes.wintypes.POINT(int(point[0]), int(point[1]))) or 0)
+        if not h:
+            return None, 0
+        pid = int(user32.GetWindowThreadProcessId(h, None))
+        return pid == target, pid
+    except Exception:  # noqa: BLE001
+        return None, 0
+
+
 def _pixels_belong_to(hwnd, rect, probes=((0.35, 0.5), (0.5, 0.3), (0.5, 0.5), (0.5, 0.7), (0.7, 0.5))):
     """窗口矩形内抽样几个点，看屏幕上真正显示的是不是这个进程的窗口。
 
@@ -1239,8 +1457,36 @@ def _pixels_belong_to(hwnd, rect, probes=((0.35, 0.5), (0.5, 0.3), (0.5, 0.5), (
         hits.append((x, y, hwnd_at, pid_at))
         if pid_at and pid_at == target_pid:
             ok += 1
-    return {"ok": ok >= max(1, int(len(probes) * 0.6)), "hits": hits, "pid": target_pid,
+    return {"ok": ok >= max(1, int(len(probes) * 0.8)), "hits": hits, "pid": target_pid,
             "covered": [h for h in hits if h[3] != target_pid]}
+
+
+def _window_label(hwnd):
+    """「标题 (类名)」的短标签，用来在失败文案里指名道姓说清是谁盖住了微信。"""
+    try:
+        user32 = ctypes.windll.user32
+        t = ctypes.create_unicode_buffer(160)
+        c = ctypes.create_unicode_buffer(160)
+        user32.GetWindowTextW(int(hwnd), t, 160)
+        user32.GetClassNameW(int(hwnd), c, 160)
+        label = (t.value or "").strip()
+        return ("%s (%s)" % (label, c.value)) if label else (c.value or "hwnd=%s" % hwnd)
+    except Exception:                                          # noqa: BLE001
+        return "hwnd=%s" % hwnd
+
+
+def _covered_names(on_top):
+    """把抽检里挡住微信的窗口列成一段可读文字（最多两个，去重）。"""
+    names = []
+    for hit in (on_top or {}).get("covered") or []:
+        label = _window_label(hit[2])
+        if label and label not in names:
+            names.append(label)
+        if len(names) >= 2:
+            break
+    if not names:
+        return ""
+    return "，最上层是 %s" % " / ".join(names)
 
 
 def ensure_wechat_ready(cfg, raise_it=True):
@@ -1301,11 +1547,18 @@ def ensure_wechat_ready(cfg, raise_it=True):
         info["rect"] = []
     on_top = None
     if info["rect"]:
-        on_top = _pixels_belong_to(hwnd, info["rect"])
+        on_top = _pixels_belong_to(hwnd, info["rect"], _capture_probes(cfg))
     info["on_top"] = on_top
-    info["ok"] = bool(info["rect"]) and (info["foreground"] or bool(on_top and on_top.get("ok")))
+    # 2026-10-25：「GetForegroundWindow 是微信」不等于「微信在屏幕上最上层」。
+    # 实测：DSH 自己的 Electron 窗口（Chrome_WidgetWin_1，no-activate）压在微信上面时，
+    # 系统仍把前台记在微信头上，老判断 `foreground or pixels_ok` 直接放行，
+    # 于是侧栏 BitBlt 抓到的是对方的像素 —— 日志里的「sidebar shows」其实是 DSH 的对话文本，
+    # 最后报成误导性的 "could not locate target row by OCR"。
+    # 现在以 WindowFromPoint 抽检为准；抽检不过就把「谁盖住了」写进 reason，不再发脏 OCR。
+    info["ok"] = bool(info["rect"]) and bool(on_top and on_top.get("ok"))
+    info["foreground_only"] = bool(info["foreground"])
     if not info["ok"]:
-        info["reason"] = ("wechat window is covered by another window"
+        info["reason"] = ("wechat window is covered by another window%s" % _covered_names(on_top)
                           if info["visible"] else "wechat window is hidden or minimized")
     return info
 
@@ -1435,6 +1688,7 @@ def find_row(client, cfg, rect, target):
     # 判成找不到（群发失败会把消息塞进重发队列，代价远高于一次 0.4s 的复扫）。
     if pages > 1 and cfg.get("locate_second_pass", True):
         timing["second_pass"] = True
+        prev_top2 = None
         for page2 in range(pages):
             point2, dbg2 = _scan_sidebar(client, cfg, region, top, target)
             if point2:
@@ -1443,6 +1697,18 @@ def find_row(client, cfg, rect, target):
                 if page2:
                     dbg2["scrolled_pages"] = page2
                 return point2, dbg2
+            # 2026-10-28：这一遍原来没有任何「到底」判断，列表到底以后还会继续
+            # 滚满 sidebar_scroll_pages 次 —— 5 个无效滚轮事件 + 6 次全屏 OCR 全打在
+            # 最后那一屏上，画面一动不动（离屏复现见 logs/_sim_findrow.py 的滚轮序列
+            # [-6,-6,-6,-6,-6]）。这就是用户看到的「一直在上下滑」。这里和第一遍一样
+            # 用「首行文字不再变化」判定到底。
+            rows2 = sorted((c for c in (dbg2.get("candidates") or []) if c.get("text")),
+                           key=lambda c: c["y"])
+            top2 = fit(rows2[0]["text"]) if rows2 else None
+            if top2 and prev_top2 and top2 == prev_top2:
+                debug["second_pass_bottom"] = True
+                break
+            prev_top2 = top2 or prev_top2
             if page2 + 1 >= pages:
                 break
             _side_scroll(client, cfg, hover, -wheel_times)
@@ -1459,7 +1725,7 @@ def find_row(client, cfg, rect, target):
 def _upscale_for_ocr(png, scale):
     """把侧边栏截图放大后再 OCR。
 
-    微信会话名是 12px 左右的小字，Windows OCR 对「测试群」这种短名会读成
+    微信会话名是 12px 左右的小字，Windows OCR 对「示例群聊D」这种短名会读成
     「是测讠羊」——只要有一个字读错，整行匹配（exact/partial）就全废，于是明明
     在第一屏也报 "could not locate target row by OCR"。放大 2 倍基本能救回来，
     而坐标映射本来就用截图尺寸换算，放大不影响落点。
@@ -1526,6 +1792,13 @@ def _scroll_to_top(client, cfg, region, hover, keep_dir, chunk=None, max_chunks=
             return False, i
         vec = _frame_vec(png)
         if prev is not None and _frames_same(vec, prev):
+            # 2026-10-28：确认到顶就必须把状态记进 _SCROLL_POS。以前这里只 return，
+            # 缓存从不更新，于是 find_row 的 at_top 判断永远为假（`_note_scroll` 要求
+            # 单次 >= sidebar_reset_notches*0.9 = 14.4 格才认「到顶」，而这里的 chunk
+            # 只有 12 格）：结果每次定位都白滚一趟（24 格）回顶、page0 还要重复 OCR
+            # 一遍。和 ensure_pinned_expanded(:1148) / _expand_pinned_section(:1206) 一致。
+            _SCROLL_POS["at_top"] = True
+            _SCROLL_POS["ts"] = time.time()
             return True, i + 1
         prev = vec
     return False, max_chunks
@@ -1562,6 +1835,11 @@ def _settled_frame(client, cfg, region, keep_dir, prev_md5, timeout=0.25, step=0
     原来是滚完先调 `_sidebar_stable` 连拍两帧验稳定，再截第三帧去 OCR —— 每页三次截图。
     这里只截一帧：和上一页像素一致就说明列表还没动（动画起步/滚轮没吃到），隔 40ms 再截；
     一旦不同就已经滚到位，这一帧直接拿去 OCR。
+
+    2026-10-28：「一旦不同就已经滚到位」不成立 —— 微信的列表是有滚动动画的，抓在动画
+    中间的那一帧行位置还是过渡值、字也糊，OCR 会读出半屏文字或干脆一行都读不出来
+    （实测 20:13:24 那帧 0 行，直接导致「找不到目标」）。所以检测到画面变化后再确认
+    一帧，稳定了才交出去；仍然在动就用更新的那一帧，绝不把已过期的那帧交出去。
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -1570,7 +1848,17 @@ def _settled_frame(client, cfg, region, keep_dir, prev_md5, timeout=0.25, step=0
             return None, None, False
         md5 = _frame_vec(png)
         if prev_md5 is None or not _frames_same(md5, prev_md5):
-            return png, md5, True
+            best_png, best_md5 = png, md5
+            while time.monotonic() < deadline:
+                time.sleep(step)
+                png2 = shot(client, region, keep_dir, tries=1)
+                if not png2:
+                    break
+                md5b = _frame_vec(png2)
+                if md5b is not None and _frames_same(md5b, best_md5):
+                    return png2, md5b, True
+                best_png, best_md5 = png2, md5b
+            return best_png, best_md5, True
         if time.monotonic() >= deadline:
             # 画面等满 timeout 还没变：多半已经滚到底了（再滚也没有新内容）。
             return png, md5, False
@@ -1585,7 +1873,8 @@ def _scan_sidebar(client, cfg, region, top, target, png_path=None):
     """
     _ready = ensure_wechat_ready(cfg)
     if not _ready.get("ok"):
-        return None, {"error": "wechat window is not in the foreground", "window": _ready}
+        return None, {"error": _ready.get("reason") or "wechat window is not in the foreground",
+                      "window": _ready}
     if png_path:
         png, err = png_path, None
     else:
@@ -1608,7 +1897,7 @@ def _scan_sidebar(client, cfg, region, top, target, png_path=None):
     key = fit(target)
     # A renamed chat keeps its old API name, so an alias is accepted — but only as a
     # whole-line match: a partial hit on an alias would also match a *preview* line such
-    # as "陈铭坚：嗯" inside a group row, and clicking that opens the wrong chat.
+    # as "用户B别名：嗯" inside a group row, and clicking that opens the wrong chat.
     keys = target_keys(cfg, target)
     exact_keys = {fit(k) for k in keys}
     candidates = []
@@ -1627,8 +1916,8 @@ def _scan_sidebar(client, cfg, region, top, target, png_path=None):
                            "fold": ocr_fold(line["text"]) == ocr_fold(target),
                            "score": round(name_match(target, line["text"]), 3)})
     exact = [c for c in candidates if c["exact"]]
-    # 2026-10-22 事故：目标「天文学家」在列表里已被删掉，但群「杏园6-508」的预览行是
-    # 「天文学家：我猜又断电了」，partial 命中它就去点那一行 → 打开错的会话，
+    # 2026-10-22 事故：目标「用户C」在列表里已被删掉，但群「示例群聊」的预览行是
+    # 「用户C：我猜又断电了」，partial 命中它就去点那一行 → 打开错的会话，
     # 头部复核失败后白白多一轮。预览行（带冒号）永远不是会话名，partial 里也剔掉。
     partial = [c for c in candidates if c["partial"]
                and not any(ch in c["text"] for ch in "：:")]
@@ -1691,6 +1980,11 @@ def row_point(cfg, rect, index):
 def talker_for(cfg, target, sessions):
     keys = target_keys(cfg, target)
     keyset = {fit(k) for k in keys}
+    # 2026-10-28：target 本身可能就是 wxid（OneBot 出站改成按 wxid 寻址后）。
+    if fit(target).startswith("wxid_") or fit(target).startswith("gh_"):
+        for s in sessions:
+            if fit(s.get("username")) == fit(target):
+                return s.get("username")
     best_score, best_user = 0.0, None
     for s in sessions:
         if fit(s.get("displayName")) in keyset:
@@ -1705,20 +1999,26 @@ def talker_for(cfg, target, sessions):
         return best_user
     # Service accounts and official chats are missing from the session list but
     # still resolvable as contacts (needed to read the message back).
+    # 2026-10-28：这里原来 except 里直接 return None，异常被吞掉，事后完全看不出
+    # 是「查无此人」还是「API 超时」——用户F别名那次 4 条回复就是在这里静默丢了。
     try:
         contacts = api(cfg, "/api/v1/contacts", keyword=target, limit=20).get("contacts", [])
-    except Exception:
+    except Exception as exc:               # noqa: BLE001
+        log.warning("[wxui] 兜底查询联系人失败 target=%s: %s: %s",
+                    target, type(exc).__name__, exc)
         return None
     fuzzy_user, fuzzy_score = None, 0.0
     for c in contacts:
-        names = (c.get("displayName"), c.get("remark"))
+        names = (c.get("displayName"), c.get("remark"), c.get("nickname"), c.get("username"))
         if any(fit(n) in keyset for n in names):
             return c.get("username")
-        score = max(name_match_keys(keys, n) for n in names)
+        score = max((name_match_keys(keys, n) for n in names if n), default=0.0)
         if score > fuzzy_score:
             fuzzy_score, fuzzy_user = score, c.get("username")
     if fuzzy_user and fuzzy_score >= NAME_MATCH_CLEAR:
         return fuzzy_user
+    log.warning("[wxui] 未能解析 talker target=%s（会话 %d 个、联系人 %d 条均不匹配）",
+                target, len(sessions or []), len(contacts or []))
     return None
 
 
@@ -1907,7 +2207,8 @@ def chat_header_matches(client, cfg, rect, target):
     """
     _ready = ensure_wechat_ready(cfg)
     if not _ready.get("ok"):
-        return False, {"error": "wechat window is not in the foreground", "window": _ready,
+        return False, {"error": _ready.get("reason") or "wechat window is not in the foreground",
+                       "window": _ready,
                        "texts": [], "ocr_tries": 0}
     left, top, right, bottom = rect
     region = clamp_region(
@@ -1919,7 +2220,7 @@ def chat_header_matches(client, cfg, rect, target):
     if not png:
         return False, {"error": "no header image"}
     # 2026-10-21 实测：Windows OCR 对同一行字并不稳定，而且**放大不一定更好**——
-    # 「陈奥琦」1x 返回空、2x 才读得出来；「严正阳」1x 读得对、2x 反而变空。所以这里按
+    # 「用户A」1x 返回空、2x 才读得出来；「用户J」1x 读得对、2x 反而变空。所以这里按
     # 档位依次试，取第一个非空的：空结果绝不能被当成“不是目标”（那会把明明已经打开的会话
     # 判失败、还多挨一次点击）。三档都空才补抓新帧。
     scales = [float(s) for s in (cfg.get("header_ocr_scales") or [1.0, 2.0, 3.0])]
@@ -1928,16 +2229,27 @@ def chat_header_matches(client, cfg, rect, target):
     tries = 0
     texts = []
     res = {}
+    all_texts = []
     while tries < retries:
         for scale in scales:
             ocr_png = _upscale_for_ocr(png, scale) if scale > 1.0 else png
             res = ocr_lines(ocr_png)
-            texts = [ln["text"] for ln in res.get("lines", [])] if res.get("ok") else []
-            if texts:
+            got = [ln["text"] for ln in res.get("lines", [])] if res.get("ok") else []
+            if not got:
+                continue
+            all_texts.extend(got)
+            # 2026-10-28：「用户F」在 1x 被拆读成「丕忄尸」（部首碎字），以前拿到非空就停，
+            # 于是永远不试 2x/3x、明明已经切过去的会话被判失败。现在每个缩档都读，命中即返回。
+            if header_names_target(target_keys(cfg, target), got):
+                texts = got
                 break
+            if not texts:
+                texts = got
         tries += 1
-        if texts:
+        if texts and header_names_target(target_keys(cfg, target), texts):
             break
+        if all_texts:
+            texts = texts or all_texts
         time.sleep(wait_s)
         new_png = shot(client, region, os.path.join(ROOT, "logs", "wmcp"))
         if not new_png:
@@ -2042,7 +2354,7 @@ def _chat_ready_to_type(cfg, plan, target):
     Shared by every path that has already decided the right conversation is open, so the
     "refuse to type blind" checks can never drift apart.
 
-    2026-10-22 事故（「卷子分完了没」被连发到陈奥琦那边 6 遍）：搜索框兜底路径
+    2026-10-22 事故（「卷子分完了没」被连发到用户A那边 6 遍）：搜索框兜底路径
     (`opened by Ctrl+F search`) 点完结果行就直接宣称「已打开」，没有回头确认聊天头部，
     于是文本被粘进了当时开着的**另一个**会话；WeFlow 回读当然找不到 → 判失败 →
     重试 3 次 + 重发队列，全都粘进同一个错会话。这里补最后一道闸：只有头部 OCR 或
@@ -2077,6 +2389,13 @@ def _chat_ready_to_type(cfg, plan, target):
                     "selected_row": row_now,
                     "verified_by": verified_by,
                 }
+        if not verified_by and _header_unreadable(
+                (header_detail or {}).get("texts"), target):
+            # 头部全是碎字（Windows OCR 把「用户F」读成「丕忄尸」，各缩放档都一样），
+            # 读不出不等于不是目标：会话是刚从微信搜索的精确结果点进来的，采信它，
+            # 真正发没发对由 WeFlow 回读判定。
+            verified_by = "header_fragments"
+            plan["header_fragments"] = (header_detail.get("texts") or [])[:3]
         if not verified_by and find_window(cfg, target, fuzzy=True) is None:
             return fail(plan, "chat identity not confirmed before typing "
                               "(header=%s selected_row=%s)" % (
@@ -2102,7 +2421,7 @@ _SEARCH_SECTION_WORDS = ("聊天记录", "搜索网络结果", "公众号", "文
 
 
 def _strip_icon_noise(text):
-    """去掉搜索行前面被 OCR 当成文字的图标噪声（「0 文件传输助手」「．测试群」「八…」）。
+    """去掉搜索行前面被 OCR 当成文字的图标噪声（「0 文件传输助手」「．示例群聊D」「八…」）。
 
     只剥掉开头 1~3 个「不像名字开头」的字符：数字/标点/单个字母，且剥完还剩至少 2 个字。
     目标本身以数字开头的会话（如「12306」）不受影响 —— 剥完对不上目标名时调用方也不会采纳。
@@ -2124,8 +2443,8 @@ def _strip_icon_noise(text):
 def _collapse_repeats(text):
     """把 OCR 把同一行文字重复读出的结果压回一份（群聊结果行特别容易这样）。
 
-    实测：「雾中人耍起」的搜索结果行被读成
-        `雾中人耍起雾中人耍起雾中人耍起雾中，`
+    实测：「示例群聊C」的搜索结果行被读成
+        `示例群聊C示例群聊C示例群聊C雾中，`
     —— 行里既有群名又有成员名/标签，Windows OCR 把几段拼成一串重复文字，长度远超名字，
     精确比对和 2..24 长度过滤都过不去，长名字群因此永远找不到。这里检测「整串是某个前缀
     的重复（末尾允许截断）」并只留一份前缀。
@@ -2136,6 +2455,381 @@ def _collapse_repeats(text):
         if (t[:p] * ((n + p - 1) // p))[:n] == t:
             return t[:p]
     return t
+
+
+
+def _header_unreadable(texts, target=""):
+    """头部 OCR 读出来的全是碎字（部件）而不是一个名字。
+
+    实测 Windows OCR 对「用户F」在聊天头部固定读成「丕 忄 尸」（三个部首碎片，1x/2x/3x 都
+    一样），而同位置的「用户C」读得完全正确。碎片既不能证明也不能否定目标，所以这种
+    情况按「采信微信搜索的精确结果 + WeFlow 回读兜底」继续，不把明明已经打开的会话判失败。
+    """
+    import re as _re
+    frag = 0
+    for t in texts or []:
+        fold = _re.sub(r"[^一-鿿A-Za-z0-9]", "", t or "")
+        if not fold:
+            continue
+        if len(fold) > 4:
+            return False
+        frag += len(fold)
+    return 0 < frag <= 6
+
+
+def _search_first_row_point(cfg, rect):
+    """搜索面板里**第一行结果**的坐标（联系人分组的第一条）。
+
+    2026-10-28：OCR 挑结果行不可靠——实测它把「聊天记录」分区里的 `"用户F" 拍了拍我`
+    当成 exact 命中（score 1.0）去点了，结果点开的是聊天记录搜索页；用户还遇到点进视频号。
+    微信自己的排序是「联系人 → 网络结果 → 聊天记录」，名字精确命中时第一条基本就是联系人，
+    所以这里先按几何位置点第一行，点完仍然由聊天头部 OCR 复核，不对就放弃，绝不盲发。
+    """
+    return [int(rect[0] + cfg.get("search_first_row_x_px", 250)),
+            int(rect[1] + cfg.get("search_first_row_y_px", 231))]
+
+
+def _wx_alive(hwnd, timeout_ms=1500):
+    """窗口还有没有消息循环（WM_NULL 是否在 timeout 内返回）。
+
+    2026-10-28 事故：微信主窗处于「半冻结」状态时消息循环还活着、但列表/聊天区完全不响应
+    鼠标和滚轮。每次 GUI 动作前先量一次，卡住就立刻停手并报出来，不要继续往死窗口里灌输入。
+    """
+    import ctypes as _c
+    try:
+        res = _c.c_size_t()
+        ok = _c.windll.user32.SendMessageTimeoutW(
+            int(hwnd), 0, 0, 0, 2, int(timeout_ms), _c.byref(res))
+        return bool(ok)
+    except Exception:
+        return True
+
+
+# ---------------------------------------------------------------------------
+# MMUI 渲染进程「半冻结」：探活 + 自愈
+#
+# 2026-10-28/29 现象：微信 4.x 的主窗口由 Qt 外壳 + MMUI 渲染子窗
+# （MMUIRenderSubWindowHW）组成。渲染进程卡住时 shell 仍然健康 —— WM_NULL 9ms 返回、
+# IsHungAppWindow=False、前台正常、原生搜索框还能接键盘 —— 但侧栏/聊天区**不刷新也不
+# 接受鼠标**（侧栏时间戳停在冻结那一刻）。用户把它归因于搜索框，日志里也确实每次都在
+# 搜索定位之后出现。`_wx_alive()` 测不出这种卡死，必须靠「画面有没有重绘」来判。
+#
+# 实测（正常状态）：光标移到会话行上 → 同一块区域 53% 像素变化、最大差 78；移开 → 精确
+# 复原；静止画面两帧 0 像素差。所以「悬停不重绘」是一个很干净的冻结判据。
+# ---------------------------------------------------------------------------
+_LIVE_STATE = os.path.join(ROOT, "logs", "wxui-liveness.json")
+
+
+def _read_live_state():
+    try:
+        with open(_LIVE_STATE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _write_live_state(**kw):
+    try:
+        data = _read_live_state()
+        data.update(kw)
+        os.makedirs(os.path.dirname(_LIVE_STATE), exist_ok=True)
+        with open(_LIVE_STATE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _png_diff_ratio(a, b):
+    """两张同尺寸 PNG 里「灰度差 > 8」的像素占比；读不了返回 None。"""
+    try:
+        from PIL import Image, ImageChops
+        with Image.open(a) as ia, Image.open(b) as ib:
+            ia = ia.convert("L")
+            ib = ib.convert("L")
+            if ia.size != ib.size:
+                return None
+            d = ImageChops.difference(ia, ib)
+            hist = d.histogram()
+            total = float(sum(hist))
+            changed = float(sum(hist[9:]))
+            return changed / total if total else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _render_repaint_once(cfg, rect, row_index, tag, wait_s=0.45):
+    """测一行：光标离开窗口 → 抓基线；移到该行 → 再抓；返回灰度变化比例。"""
+    if winio is None:
+        return None, None
+    left, top, right, bottom = rect
+    pitch = int(cfg.get("row_pitch_px", 120) or 120)
+    first = top + int(cfg.get("sidebar_capture_y_offset", 150))
+    band = (left + int(cfg.get("sidebar_capture_x_offset", 90)),
+            first + int(pitch * row_index),
+            left + int(cfg.get("sidebar_capture_x2_offset", 560)),
+            first + int(pitch * (row_index + 2)))
+    band = tuple(int(v) for v in band)
+    hover = (int((band[0] + band[2]) / 2), int((band[1] + band[3]) / 2))
+    import ctypes as _c
+    import ctypes.wintypes as _wt
+    old = None
+    try:
+        p = _wt.POINT()
+        if _c.windll.user32.GetCursorPos(_c.byref(p)):
+            old = (int(p.x), int(p.y))
+    except Exception:  # noqa: BLE001
+        old = None
+    keep = os.path.join(ROOT, "logs", "wmcp", "alive")
+    try:
+        user32 = _c.windll.user32
+        # 先把光标停到窗口外（窗口上方 40px），保证抓的是「未悬停」基线
+        user32.SetCursorPos(int(left + (right - left) // 2), int(max(2, top - 40)))
+        time.sleep(wait_s)
+        os.makedirs(keep, exist_ok=True)
+        before = winio.grab(band, os.path.join(keep, "%s-before.png" % tag))
+        user32.SetCursorPos(hover[0], hover[1])
+        time.sleep(wait_s)
+        after = winio.grab(band, os.path.join(keep, "%s-after.png" % tag))
+    except Exception as exc:  # noqa: BLE001
+        return None, {"error": "%s: %s" % (type(exc).__name__, exc)}
+    finally:
+        if old:
+            try:
+                _c.windll.user32.SetCursorPos(old[0], old[1])
+            except Exception:  # noqa: BLE001
+                pass
+    return _png_diff_ratio(before, after), {"band": list(band), "hover": list(hover),
+                                            "before": before, "after": after}
+
+
+def ui_render_alive(cfg, rect, wait_s=0.45):
+    """把光标移到会话行上，看那一行会不会重绘 → 渲染进程是否还活着。
+
+    返回 {"alive": bool|None, "ratio": float|None, "error": ...}。
+    None = 测不出来（窗口不在最上层 / 抓屏失败），调用方必须当「不知道」，绝不能据此重启微信。
+
+    2026-10-29 08:38 的第一次实装就是漏了这层门：当时微信被最小化/被盖住，屏幕像素里
+    根本没有它的会话行，悬浮自然「不重绘」，于是被误判成冻结并重启了一次微信。现在
+    先过 `ensure_wechat_ready()`（可见 + 未最小化 + 前台 + WindowFromPoint 抽检未遮挡），
+    再测两行取最大值，两行都不重绘才算死。
+    """
+    if winio is None:
+        return {"alive": None, "ratio": None, "error": "winio unavailable"}
+    ready = ensure_wechat_ready(cfg)
+    if not ready.get("ok"):
+        return {"alive": None, "ratio": None,
+                "error": "wechat not ready: %s" % (ready.get("reason") or "unknown"),
+                "window": {k: ready.get(k) for k in ("visible", "iconic", "foreground", "reason")}}
+    rect = tuple(ready.get("rect") or rect)
+    ratios, extra = [], {}
+    for i, row in enumerate((0, 2)):
+        ratio, info = _render_repaint_once(cfg, rect, row, "row%d" % row, wait_s)
+        extra["row%d" % row] = info
+        if ratio is None:
+            continue
+        ratios.append(ratio)
+    if not ratios:
+        return {"alive": None, "ratio": None, "error": "cannot diff captures", "detail": extra}
+    ratio = max(ratios)
+    threshold = float(cfg.get("ui_alive_diff_ratio", 0.01))
+    return {"alive": ratio >= threshold, "ratio": round(ratio, 4),
+            "ratios": [round(r, 4) for r in ratios],
+            "threshold": threshold, "detail": extra}
+
+
+def _recover_budget(cfg):
+    """自愈频率闸门：默认 10 分钟内最多 1 次、1 小时最多 3 次。"""
+    path = os.path.join(ROOT, "logs", "wxui-wechat-restarts.json")
+    now = time.time()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            hist = [float(t) for t in (json.load(fh).get("restarts") or [])]
+    except Exception:  # noqa: BLE001
+        hist = []
+    hour = [t for t in hist if now - t < 3600]
+    cooldown = float(cfg.get("wxui_recover_cooldown_s", 600))
+    if hour and now - max(hour) < cooldown:
+        return {"ok": False, "reason": "cooldown", "last": max(hour),
+                "cooldown_s": cooldown}
+    if len(hour) >= int(cfg.get("wxui_recover_max_per_hour", 3)):
+        return {"ok": False, "reason": "hourly budget exhausted", "count": len(hour)}
+    return {"ok": True, "count": len(hour)}
+
+
+def _record_restart():
+    path = os.path.join(ROOT, "logs", "wxui-wechat-restarts.json")
+    hist = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            hist = [float(t) for t in (json.load(fh).get("restarts") or [])]
+    except Exception:  # noqa: BLE001
+        hist = []
+    hist = [t for t in hist if time.time() - t < 86400] + [time.time()]
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"restarts": hist}, fh)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def restart_wechat(cfg):
+    """重启微信客户端 —— 半冻结唯一有效的恢复手段（2026-10-28 22:55 实测）。
+
+    只在「探活确认死了 + 发送需要 GUI」时才调用；有冷却与次数上限，避免和用户抢电脑。
+    """
+    exe = str(cfg.get("wechat_exe") or r"C:\Program Files\Tencent\Weixin\Weixin.exe")
+    out = {"ok": False, "steps": []}
+    if not os.path.exists(exe):
+        out["error"] = "wechat exe not found: %s" % exe
+        return out
+    log.warning("[wxui] 微信 UI 已冻结，尝试自动重启（这是自愈，不是普通操作）")
+    try:
+        subprocess.run(["taskkill", "/IM", "Weixin.exe", "/F"], capture_output=True, timeout=15)
+        out["steps"].append("taskkill")
+    except Exception as exc:  # noqa: BLE001
+        out["steps"].append("taskkill failed: %s" % exc)
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        try:
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe"],
+                               capture_output=True, timeout=8)
+            if b"Weixin.exe" not in (r.stdout or b""):
+                break
+        except Exception:  # noqa: BLE001
+            break
+        time.sleep(0.5)
+    try:
+        subprocess.Popen([exe], close_fds=True)
+        out["steps"].append("started")
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = "start failed: %s" % exc
+        return out
+    # 等主窗（登录页或直接进主界面）
+    hwnd = 0
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        hwnd = find_wechat(cfg) or 0
+        if hwnd:
+            break
+        time.sleep(1.0)
+    if not hwnd:
+        out["error"] = "wechat window did not appear"
+        return out
+    out["steps"].append("window %s" % hwnd)
+    try:
+        focus(hwnd)
+    except Exception:  # noqa: BLE001
+        pass
+    # 登录页（约 514x677）会出现「进入微信」按钮，按相对位置点一下（2026-10-28 验证过）
+    rect = restored_rect(hwnd)
+    if rect and (rect[2] - rect[0]) < int(cfg.get("wechat_login_width_px", 900)):
+        p = (int(rect[0] + (rect[2] - rect[0]) * float(cfg.get("wechat_login_x_ratio", 0.5))),
+             int(rect[1] + (rect[3] - rect[1]) * float(cfg.get("wechat_login_y_ratio", 0.79))))
+        try:
+            winio.click(p[0], p[1]) if winio is not None else None
+            out["steps"].append("login click %s" % (p,))
+        except Exception as exc:  # noqa: BLE001
+            out["steps"].append("login click failed: %s" % exc)
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            rect2 = restored_rect(find_wechat(cfg) or 0)
+            if rect2 and (rect2[2] - rect2[0]) >= int(cfg.get("wechat_login_width_px", 900)):
+                rect = rect2
+                break
+            time.sleep(1.0)
+    out["rect"] = list(rect) if rect else None
+    out["ok"] = bool(rect)
+    _record_restart()
+    log.warning("[wxui] 微信重启结果: %s", json.dumps({k: v for k, v in out.items() if k != "steps"},
+                                                    ensure_ascii=False))
+    return out
+
+
+def ensure_ui_live(cfg, rect, ttl_s=None, allow_recover=None):
+    """GUI 动作前的探活闸门：正常就放行（带 TTL 缓存），半冻结就自愈一次。
+
+    为什么需要 TTL：每次发送都测一遍要多花 ~1.2s；而冻结是持续状态，25 秒内不会
+    「测着测着就坏了」。`logs/wxui-liveness.json` 让短命的 wxui 进程之间共享这份结论。
+    """
+    ttl = float(ttl_s if ttl_s is not None else cfg.get("ui_live_ttl_s", 60))
+    now = time.time()
+    state = _read_live_state()
+    if state.get("alive") and now - float(state.get("ts") or 0) < ttl:
+        return {"ok": True, "cached": True, "ts": state.get("ts")}
+    # 探活要动鼠标（悬停测试）：用户正在用键鼠时不抢，直接当「不知道」放行，
+    # 后面真正输入前还有 defer_to_human / 前台复查两道闸。
+    try:
+        if winio is not None and winio.human_busy():
+            return {"ok": True, "unknown": True, "reason": "user is using the computer; "
+                                                          "skip the hover liveness probe"}
+    except Exception:  # noqa: BLE001
+        pass
+    probe = ui_render_alive(cfg, rect)
+    if probe.get("alive") is None:
+        # 测不出来（抓屏/权限问题）不能据此重启，放行让后续步骤自己报错。
+        return {"ok": True, "unknown": True, "probe": probe}
+    if not probe.get("alive"):
+        # 再测一次，排除光标停错位置等偶发
+        time.sleep(0.35)
+        probe2 = ui_render_alive(cfg, rect)
+        if probe2.get("alive"):
+            _write_live_state(alive=True, ts=time.time())
+            return {"ok": True, "probe": probe2, "first_probe": probe}
+        probe = probe2 if probe2.get("alive") is not None else probe
+        log.warning("[wxui] UI 探活失败：ratio=%s ratios=%s err=%s",
+                    probe.get("ratio"), probe.get("ratios"), probe.get("error"))
+        # 2026-10-29 实测：**搜索面板展开时侧栏被整块盖住**，悬停到「会话行」坐标其实悬停在
+        # 面板上，两行都不重绘 → 会被误判成冻结。所以「死」了以后先试着点一下聊天头部空白处
+        # 把覆盖层收掉（**绝不能用 Esc**：面板没开时按 Esc 会真的把 MMUI 渲染弄卡死，见
+        # ui_escape 的试验表）。收掉后复活 = 刚才只是面板没关。
+        try:
+            dismissed = dismiss_overlay(cfg, rect)
+            time.sleep(0.45)
+            probe_esc = ui_render_alive(cfg, rect)
+        except Exception:  # noqa: BLE001
+            dismissed, probe_esc = {}, {}
+        if probe_esc.get("alive"):
+            _write_live_state(alive=True, ts=time.time())
+            log.info("[wxui] UI 探活恢复：覆盖层（多为搜索面板）收起后重绘正常（previous ratio=%s）",
+                     probe.get("ratio"))
+            return {"ok": True, "probe": probe_esc, "closed_overlay": True,
+                    "dismiss": dismissed,
+                    "first_probe": {k: probe.get(k) for k in ("ratio", "ratios", "error")}}
+        if probe_esc.get("alive") is not None:
+            probe = probe_esc
+            log.warning("[wxui] 收起覆盖层后仍然不重绘：ratio=%s", probe.get("ratio"))
+        allowed = cfg.get("wxui_auto_recover", True) if allow_recover is None else allow_recover
+        if not allowed:
+            return {"ok": False, "probe": probe,
+                    "error": "wechat UI is frozen (MMUI repaint dead) and auto-recover is off"}
+        # 用户正在用键鼠时绝不重启微信：那会打断他手上的操作（也违反 human_busy 的让路约定）。
+        try:
+            if winio is not None and winio.human_busy():
+                return {"ok": False, "probe": probe,
+                        "error": "wechat UI frozen but the user is using the computer; "
+                                 "defer recovery (消息会留在重发队列)"}
+        except Exception:  # noqa: BLE001
+            pass
+        budget = _recover_budget(cfg)
+        if not budget.get("ok"):
+            return {"ok": False, "probe": probe,
+                    "error": "wechat UI frozen; auto-recover skipped (%s)" % budget.get("reason")}
+        rec = restart_wechat(cfg)
+        if not rec.get("ok"):
+            return {"ok": False, "probe": probe, "restart": rec,
+                    "error": "wechat UI frozen; restart failed: %s" % rec.get("error")}
+        hwnd = find_wechat(cfg)
+        rect2 = restored_rect(hwnd) if hwnd else None
+        probe3 = ui_render_alive(cfg, rect2) if rect2 else {"alive": None}
+        if probe3.get("alive"):
+            _write_live_state(alive=True, ts=time.time(), restarted_at=time.time())
+            return {"ok": True, "probe": probe3, "restarted": True}
+        return {"ok": False, "probe": probe3, "restart": rec,
+                "error": "wechat restarted but the UI still does not repaint"}
+    _write_live_state(alive=True, ts=time.time())
+    return {"ok": True, "probe": probe}
 
 
 def _search_result_pick(client, cfg, rect, target):
@@ -2168,6 +2862,17 @@ def _search_result_pick(client, cfg, rect, target):
     img_w, img_h = size if size else (region[2] - region[0], region[3] - region[1])
     scale_y = (region[3] - region[1]) / float(img_h)
     scale_x = (region[2] - region[0]) / float(img_w)
+    # 2026-10-29 安全闸：粘贴后搜索面板不一定立刻展开（窗口刚被唤起时，第一下点击常被
+    # 「激活窗口」吃掉）。这时截到的是**普通侧边栏**，里面同样有「用户F」这一行 —— 如果
+    # 照常返回坐标，下一下点击就会落在随后弹出的搜索面板上，可能点进网络结果/视频号。
+    # 所以先确认画面里确实有搜索面板的分区标题，认不出就返回失败、绝不点。
+    panel_texts = [fit(l.get("text") or "") for l in res["lines"]]
+    strong = ("最常使用", "搜索网络结果", "搜索聊天记录")
+    dbg["panel_visible"] = any(any(m in t for m in strong) for t in panel_texts)
+    if not dbg["panel_visible"]:
+        dbg["error"] = "search panel not detected (paste may not have landed)"
+        dbg["lines"] = panel_texts[:20]
+        return None, dbg
     keys = [k for k in target_keys(cfg, target) if k]
     lines = []
     for line in res["lines"]:
@@ -2190,6 +2895,7 @@ def _search_result_pick(client, cfg, rect, target):
     # 一起毙掉了。现在改成按 y 顺序跟踪「当前处于哪个分区」：只有顶部（还没遇到分区标题）和
     # 「聊天记录/联系人/群聊」分区里的行才允许点，网络结果/公众号/文章里的行一律跳过。
     section = ""
+    exact_rows = []
     scored = []
     for c in lines:
         text = c["text"]
@@ -2201,17 +2907,28 @@ def _search_result_pick(client, cfg, rect, target):
         if blocked_section:
             continue
         name = _collapse_repeats(_strip_icon_noise(text))
-        score = name_match_keys(keys, name)
-        if score >= NAME_MATCH_CLEAR or (target_fold and ocr_fold(name) == target_fold):
-            scored.append(dict(c, text=name, score=max(score, 1.0), exact=True, section=section))
+        # 2026-10-28：只认**整串等于**目标名的那一行。
+        # 事故：name_match_keys 对 `"用户F" 拍了拍我`（聊天记录分区）也返回 1.0，于是点到
+        # 聊天记录搜索页；用户还遇到点进视频号。名字命中就要求相等，别用包含关系。
+        # 但联系人那一行的头像会被 OCR 读成前缀噪声（实测 `0 用户F`、`0` 单独一行），
+        # 所以允许「短前缀噪声 + 目标名结尾」算相等，长度差最多 2 个字符。
+        nfold = ocr_fold(name)
+        same = bool(target_fold) and (
+            nfold == target_fold
+            or (nfold.endswith(target_fold) and len(nfold) - len(target_fold) <= 2))
+        if same:
+            row = dict(c, text=name, score=1.0, exact=True, section=section)
+            (exact_rows if section in ("", "联系人", "群聊") else scored).append(row)
             continue
-        if score > 0 and not blocked_section and not any(ch in name for ch in "：:") \
-                and 2 <= len(name) <= 24:
+        score = name_match_keys(keys, name)
+        if score > 0 and not any(ch in name for ch in "：:") and 2 <= len(name) <= 24:
             scored.append(dict(c, text=name, score=score, exact=False, section=section))
-    if not scored:
+    if not exact_rows and not scored:
         dbg["error"] = "no search result row names the target"
         return None, dbg
-    exact = [c for c in scored if c["exact"]]
+    # 联系人/群聊分区里的整串命中优先（微信排序：联系人 → 网络结果 → 聊天记录）；
+    # 只有在联系人分区里找不到时才退回模糊候选，且必须与第二名拉开差距。
+    exact = exact_rows
     pick = exact[0] if exact else None
     if pick is None:
         best = max(scored, key=lambda c: c["score"])
@@ -2243,7 +2960,7 @@ def header_looks_like(cfg, target, texts):
     """聊天头部这一行是不是目标会话（含 OCR 把字读歪的宽匹配）。
 
     严格判定优先（名字/别名/折串）。再退一档：**同长度 + 首字相同**的宽匹配——微信头部把
-    「测试群」读成「测讠胡羊（3）」就是这种「部首/形近替身」，严格判定永远不中。宽度只给
+    「示例群聊D」读成「测讠胡羊（3）」就是这种「部首/形近替身」，严格判定永远不中。宽度只给
     同长度同首字的串，误判面很小；而且这条只用来决定「不要再点一次侧栏」，真正发出去之后
     仍有 WeFlow 回读校验兜底。
     """
@@ -2266,7 +2983,7 @@ def open_chat_by_search(client, cfg, rect, target):
 
     `ctrl+f` 在微信 4.x 里不可用（打不开结果面板），改成点搜索框（`_search_box_point`）。
 
-    侧边栏 OCR 对短名、生僻字、被 emoji 挤压的名字并不可靠（实测「测试群」在侧边栏和聊天
+    侧边栏 OCR 对短名、生僻字、被 emoji 挤压的名字并不可靠（实测「示例群聊D」在侧边栏和聊天
     标题里都被读成「测讠羊」），而微信自带的搜索是精确匹配，因此它比逐行 OCR 可靠得多；
     顺带还省掉了「滚 12 次到顶 + 翻 6 页」那 40 秒。但**绝不按 Enter**：Enter 会选中默认
     高亮的第一条，那条可能是公众号；这里先 OCR 结果列表、跳过公众号/文章等分区、点名对上
@@ -2274,10 +2991,20 @@ def open_chat_by_search(client, cfg, rect, target):
     """
     dbg: dict = {"target": target}
     started = time.time()
+    wx_h = 0
     try:
         hwnd = find_wechat(cfg)
+        wx_h = int(hwnd or 0)
         if not hwnd or not focus(hwnd):
             dbg["error"] = "WeChat main window not focusable"
+            return False, dbg
+        # 2026-10-29 傍晚事故：置顶的 DSH 窗盖住搜索框时，点击+粘贴会打进 DSH 的输入框。
+        # 点下去之前先问 Windows「这个坐标现在属于谁」。
+        _sb = _search_box_point(cfg, rect)
+        _own, _pid = _point_belongs_to(hwnd, _sb)
+        if _own is False:
+            dbg["error"] = ("search box at %s is covered by another window (pid=%s); "
+                            "refusing to click/paste" % (list(_sb), _pid))
             return False, dbg
         if cfg.get("search_use_ctrl_f", False):
             client.call("Shortcut", {"shortcut": "ctrl+f"})
@@ -2286,26 +3013,85 @@ def open_chat_by_search(client, cfg, rect, target):
             client.call("Shortcut", {"shortcut": "ctrl+v"})
             time.sleep(float(cfg.get("search_paste_wait_s", 0.7)))
         else:
-            dbg["driver"] = ui_paste(client, cfg, _search_box_point(cfg, rect), target)
+            dbg["driver"] = ui_paste(client, cfg, _sb, target)
     except HumanBusy as e:  # 人为在用鼠标键盘：不抢
         dbg["error"] = "%s: %s" % (CONTROL_PREEMPTED, e)
         return False, dbg
     except Exception as e:
         dbg["error"] = "search jump failed: %s" % e
         return False, dbg
-    point, pdbg = _search_result_pick(client, cfg, rect, target)
-    dbg["results"] = pdbg
-    dbg["search_ms"] = int((time.time() - started) * 1000)
-    if not point:
+    # 2026-10-29（用户要求：搜索只当兜底，而且必须先解决「搜索导致微信冻结」）：
+    # 旧版按固定坐标盲点第一条（rect.top+210）。搜索没出结果 / 面板还没画完时，这一下会落进
+    # 聊天区，用户实测「点视频号去了」，随后整个 MMUI 渲染子窗卡死（鼠标滚轮点击全无响应）。
+    # 现在只用 RapidOCR 读面板：**整串等于目标名**且处于「联系人/群聊」分区的行才点；
+    # 读不到就 Esc 收工（消息留在重发队列里），绝不猜、绝不点到网络结果/视频号。
+    open_wait = float(cfg.get("search_open_wait_s", 1.4))
+    panel_wait = float(cfg.get("search_panel_wait_s", 1.2))
+    panel_tries = max(1, int(cfg.get("search_panel_tries", 3)))
+    dbg["tries"] = []
+    dbg["panel_wait_s"] = panel_wait
+    matched, header, pdbg = False, {}, {}
+    point = None
+    time.sleep(panel_wait)
+    for _try in range(panel_tries):
+        pick, pdbg = _search_result_pick(client, cfg, rect, target)
+        dbg["panel_try_%d" % _try] = {"picked": bool(pick),
+                                      "error": pdbg.get("error"),
+                                      "lines": (pdbg.get("lines") or [])[:12]}
+        if pick:
+            point = pick
+            break
+        time.sleep(float(cfg.get("search_panel_retry_wait_s", 0.5)))
+    if point is None and not (pdbg or {}).get("panel_visible"):
+        # 2026-10-29 实测：窗口刚被唤起时，点搜索框的第一下会被「激活窗口」吃掉，粘贴
+        # 落不进去。这时面板根本没开，再 OCR 多少次都是侧边栏。重粘一次再读一轮。
         try:
-            ui_escape(client, cfg)
+            dbg["repaste"] = ui_paste(client, cfg, _search_box_point(cfg, rect), target)
+        except Exception as exc:  # noqa: BLE001
+            dbg["repaste_error"] = "%s: %s" % (type(exc).__name__, exc)
+        time.sleep(panel_wait)
+        pick, pdbg = _search_result_pick(client, cfg, rect, target)
+        dbg["panel_try_repaste"] = {"picked": bool(pick),
+                                    "error": pdbg.get("error"),
+                                    "lines": (pdbg.get("lines") or [])[:12]}
+        if pick:
+            point = pick
+    if point is None and cfg.get("search_blind_click", False):
+        point = [rect[0] + int(cfg.get("search_first_row_x_px", 250)),
+                 rect[1] + int(cfg.get("search_first_row_y_px", 210))]
+        dbg["blind_click"] = True
+        log.warning("[wxui] 搜索面板 OCR 没认出行，按 search_blind_click 盲点第一行")
+    if point is None:
+        dbg["error"] = ("search panel shows no row whose name equals %r (%s); "
+                        "不盲点，直接收工" % (target, pdbg.get("error") or "no OCR match"))
+        # 面板还开着：点聊天头部空白处收起（不能用 Esc —— 面板万一已经自己关了，Esc 会把
+        # MMUI 渲染弄卡死；2026-10-29 实测）。
+        try:
+            dbg["dismiss"] = dismiss_overlay(cfg, rect)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if winio is not None:
+                winio.close_detached_chat()
         except Exception:
             pass
-        dbg["error"] = "search fallback: %s" % pdbg.get("error", "no safe result row")
+        log.warning("[wxui] 搜索兜底放弃（不乱点）：%s", dbg["error"])
         return False, dbg
     try:
+        if not _wx_alive(wx_h):
+            dbg["error"] = "wechat client stopped responding before clicking"
+            return False, dbg
+        # 同一道防误点闸：结果行坐标此刻必须仍属于微信（别把点击打进盖在上面的置顶窗口）。
+        _own, _pid = _point_belongs_to(wx_h, point)
+        if _own is False:
+            dbg["error"] = ("search result row at %s is covered by another window (pid=%s)"
+                            % (list(point), _pid))
+            return False, dbg
         ui_click(client, cfg, point)
-        time.sleep(float(cfg.get("search_open_wait_s", 1.4)))
+        time.sleep(open_wait)
+        # 2026-10-29：点中结果行之后微信会**自己**收起搜索面板，这里绝对不能再补一个 Esc。
+        # 旧代码的「点完补 Esc」正是用户说的「搜索导致微信卡死」的根因：面板已关时 Esc 落在
+        # 聊天窗口上，MMUI 渲染子窗当场停止重绘（实验见 ui_escape 文档）。
     except HumanBusy as e:  # 人为在用鼠标键盘：不抢
         dbg["error"] = "%s: %s" % (CONTROL_PREEMPTED, e)
         return False, dbg
@@ -2313,11 +3099,19 @@ def open_chat_by_search(client, cfg, rect, target):
         dbg["error"] = "click on search result failed: %s" % e
         return False, dbg
     matched, header = chat_header_matches(client, cfg, rect, target)
-    if not matched:
-        matched = header_matches_surface(header.get("texts", []),
-                                         (pdbg.get("picked") or {}).get("text"))
+    if not matched and _header_unreadable(header.get("texts"), target):
+        # 头部 OCR 只读到碎字时不能当成「不是目标」（旧版 Windows OCR 把「用户F」读成
+        # 「丕忄尸」）。RapidOCR 上线后正常不会走到这里，这段留给兜底的 Windows OCR。
+        dbg["header_unreadable"] = (header.get("texts") or [])[:3]
+        matched = True
+    dbg["tries"].append({"how": "ocr-pick", "point": list(point), "matched": bool(matched),
+                         "header": (header.get("texts") or [])[:2]})
+    dbg["picked"] = (pdbg or {}).get("picked")
+    if not _wx_alive(find_wechat(cfg) or 0):
+        dbg["error"] = "wechat client stopped responding after clicking the result"
+        return False, dbg
     # 点完结果行，微信要先收起搜索面板再切换会话：0.3s 时抓到的那一帧很可能还是**上一个**
-    # 会话的头部（实测点「严正阳」时读到「杨志贺」，于是明明切过去了却判失败）。所以这一
+    # 会话的头部（实测点「用户J」时读到「用户I」，于是明明切过去了却判失败）。所以这一
     # 步按「等它变成目标」轮询，只在最后仍不匹配时才认输。
     polls = max(1, int(cfg.get("header_verify_polls", 4)))
     poll_wait = float(cfg.get("header_verify_wait_s", 0.3))
@@ -2334,7 +3128,7 @@ def open_chat_by_search(client, cfg, rect, target):
     if not matched:
         dbg["error"] = "search result header does not show the target"
         try:
-            ui_escape(client, cfg)
+            dbg["dismiss"] = dismiss_overlay(cfg, rect)
         except Exception:
             pass
         return False, dbg
@@ -2343,13 +3137,15 @@ def open_chat_by_search(client, cfg, rect, target):
     # 又被判成失败——白跑一趟、还要重试）。所以这里只留头部复核通过的结论，只有配置显式要求
     # 时才去做「清搜索词 + 二次复核」。
     if cfg.get("search_escape_after_open", False):
+        # 2026-10-29：这个开关原来发的是 Escape —— 那正是「搜索后微信卡死」的根因
+        # （面板已自动关闭时 Esc 落在聊天窗口，MMUI 渲染停止重绘）。改成点头部空白处。
         try:
-            client.call("Shortcut", {"shortcut": "escape"})
+            dismiss_overlay(cfg, rect)
             time.sleep(float(cfg.get("search_escape_wait_s", 0.4)))
         except Exception:
             pass
         still, header2 = chat_header_matches(client, cfg, rect, target)
-        dbg["header_after_escape"] = header2
+        dbg["header_after_dismiss"] = header2
         return bool(still or header_matches_surface(header2.get("texts", []), target)), dbg
     return True, dbg
 
@@ -2376,6 +3172,13 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
         raised = bool(winio is not None and winio.raise_window(hwnd))
         plan["raised_by"] = "winio.raise_window" if raised else "failed"
         if not raised or not focus(hwnd):
+            # 2026-10-24：无边框全屏程序（游戏）占着桌面时 focus 永远失败——这不是
+            # 「窗口被挡」，而是「桌面现在不归我们」，要单独出来告诉 bridge 别算失败。
+            fsh, fst = winio.fullscreen_app(exclude=(hwnd,)) if winio is not None else (0, "")
+            if fsh:
+                plan["fullscreen_hold"] = fst
+                return fail(plan, "desktop held by fullscreen app「%s」 (FULLSCREEN_HOLD)"
+                            % fst, retryable=True)
             return fail(plan, "could not bring WeChat to the foreground "
                               "(window is minimized or behind another window)")
     rect = restored_rect(hwnd)
@@ -2383,11 +3186,24 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
     if not rect_usable(rect):
         return fail(plan, "WeChat window is minimized/hidden (rect=%s); put it back "
                           "on screen and retry" % (list(rect),))
+    # 2026-10-29：半冻结时点击/滚轮全部无效（WM_NULL 仍然 9ms、IsHungAppWindow=False）。
+    # 先做一次「悬停是否重绘」探活；判定死了就自愈一次（重启微信，有冷却），再继续。
+    if do_ocr and _native_on(cfg, "native_input"):
+        try:
+            live = ensure_ui_live(cfg, rect)
+        except HumanBusy:
+            raise
+        except Exception as _live_exc:  # noqa: BLE001
+            live = {"ok": True, "error": "probe failed: %s" % _brief(_live_exc)}
+        plan["ui_live"] = {k: v for k, v in (live or {}).items() if k != "probe"}
+        if not (live or {}).get("ok"):
+            return fail(plan, "wechat client UI is frozen (no repaint on hover): %s"
+                        % ((live or {}).get("error") or "unknown"), retryable=True)
     if do_ocr and not find_window(cfg, target, fuzzy=True):
         reuse, header_recent = _warm_get(cfg, target, rect)
         if reuse and header_recent:
             # 常驻 worker 刚给这个人发过消息，但**绝不能因此就跳过确认**：2026-10-22 实测
-            # 一次「暖会话直接粘贴」把给天文学家的翻唱 mp3 发进了杏园6-508（中间有别的
+            # 一次「暖会话直接粘贴」把给用户C的翻唱 mp3 发进了示例群聊（中间有别的
             # 发送把会话切走了）。这里只花 ~120ms 看一眼聊天头部，命中了才敢粘贴。
             _warm_ok, _warm_hd = chat_header_matches(client, cfg, rect, target)
             _warm_row = None
@@ -2443,7 +3259,7 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                                       "header_texts": header0.get("texts", [])[:6],
                                       "png": header0.get("png")}
         if already or looks:
-            # 2026-10-22 事故：目标 文件传输助手，界面实际停在 雾中人耍起，头部 OCR 走了
+            # 2026-10-22 事故：目标 文件传输助手，界面实际停在 示例群聊C，头部 OCR 走了
             # 宽匹配就宣称「已经在目标会话」，结果 mic/发送点到错的会话上。这里用侧栏绿底
             # 高亮复核：选中行读得出来但不是目标 → 绝不认「已打开」，老老实实去定位。
             sel = None
@@ -2536,16 +3352,26 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                     plan["open_attempts"] = 0
                     plan["ocr_failed_sidebar"] = " / ".join(seen) or "nothing"
                     return _chat_ready_to_type(cfg, plan, target)
+            # 2026-10-28：整张列表都读完了（list_bottom）而且 OCR 确实读到了行，说明
+            # 这一行真的不在列表里。此时再重试只是把同一份列表从顶部整扫一遍 ——
+            # send 的 3 次尝试各自还要回顶两趟，用户看到的就是「滚来滚去停不下来」
+            # （离屏复现 logs/_sim_findrow.py：一遍 find_row 就是 13 个滚轮事件 /
+            # 12 遍全屏 OCR，×3 次尝试 = 39 个滚轮事件，直到 bridge 45s 超时）。
+            # 这里把这种「扫完没有」标成不可重试，send 直接收工；消息不会丢：
+            # bridge 的 _retryable 对 "could not locate target row" 恒为真，仍会进重发队列。
+            _rows_read = len([c for c in (dbg.get("candidates") or []) if c.get("text")])
+            _full_scan = bool(dbg.get("list_bottom")) and _rows_read >= 4
             return fail(plan, "could not locate target row by OCR (target=%s, aliases=%s; "
                               "sidebar shows: %s; search fallback: %s)"
                         % (target, alias_names(cfg, target) or "none",
                            " / ".join(seen) or "nothing",
-                           (plan.get("search_fallback") or {}).get("error") or "not tried"))
+                           (plan.get("search_fallback") or {}).get("error") or "not tried"),
+                        retryable=not _full_scan)
         x, y = point
     else:
         x, y = row_point(cfg, rect, int(cfg.get("assume_row_index", 0)))
     # 2026-10-21（用户实测：打开聊天窗口后又被点了一次）：点之前先确认「当前显示的
-    # 就是这个会话」。名字 OCR 读不准的群（如「测试群」被读成「测讠羊」）名字改写命不中，
+    # 就是这个会话」。名字 OCR 读不准的群（如「示例群聊D」被读成「测讠羊」）名字改写命不中，
     # 于是每次都去点侧栏同一行——这一下就是用户看到的「双击」。这里除了名字，再拿刚扫到的
     # 那一行 OCR 文本跟聊天头部做「同源」比较，命中就完全跳过点击。
     picked_text = ((plan.get("ocr") or {}).get("picked") or {}).get("text")
@@ -2574,7 +3400,7 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
             _texts_now = [t for t in (_hd.get("texts") or []) if fit(t)]
             if not _matched and not _same and _texts_now:
                 # 头部读得出字、但压根不是这个会话 —— 说明点完这一行之后会话被切走了
-                # （实测：先点「测试群」再点别的聊天，回到「测试群」时会误判成「已打开」，
+                # （实测：先点「示例群聊D」再点别的聊天，回到「示例群聊D」时会误判成「已打开」，
                 # 消息就发进了上一个会话）。这种情况必须重新点。
                 plan["click_dedup"] = {"age_s": round(time.time() - _memo["ts"], 1),
                                        "stale_header": _texts_now[:4]}
@@ -2717,6 +3543,8 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
     plan["header_surface_check"] = {"picked": picked_text, "ok": header_ok}
     if do_ocr and not find_window(cfg, target, fuzzy=True) and not header_ok:
         return fail(plan, "open chat header does not show the target")
+    plan["claimed"] = ("opened by sidebar click (row_selected)" if plan.get("row_selected_verified")
+                       else "opened by sidebar click (header/surface verified)")
     # 这一条路径确认过「头部名字/独立会话窗口标题」的，才算把 warm 状态置为「名字已确认」。
     plan["warm_header_verified"] = bool(find_window(cfg, target, fuzzy=True)) or header_ok
     # WeChat 4.x puts the chat in its own Qt window titled with the contact name.
@@ -2767,8 +3595,8 @@ def _assemble(plan, attempt_log, found, kind, cfg, talker, text=None):
 def _identity_recheck(cfg, target):
     """打字中途再确认一次「现在开着的还是不是目标会话」。
 
-    2026-10-23 事故：给「桃桃真可爱」的消息被连发三份到「陈奥琦」——校验那一刻还是
-    桃桃，真正 Ctrl+V 的时候会话已经被用户切到陈奥琦。这里只做一件事：**只有明确
+    2026-10-23 事故：给「用户B」的消息被连发三份到「用户A」——校验那一刻还是
+    桃桃，真正 Ctrl+V 的时候会话已经被用户切到用户A。这里只做一件事：**只有明确
     认出「另一个像人名的会话名」才否决**；OCR 读不出、读到界面噪声（`楼 上 6 巧 08`
     这种）一律放行，否则会把正常发送全部误拦（实测第一版就误拦了文件传输助手）。
     """
@@ -2792,6 +3620,13 @@ def _identity_recheck(cfg, target):
             if ok:
                 return True, "header"
             texts = [t for t in (hd.get("texts") or []) if fit(t)]
+            if _header_unreadable(texts, target):
+                # 2026-10-29：全是部首碎字（Windows OCR 把「用户F」读成「丕忄尸」）——
+                # 既不是目标名，也不是「另一个像人名的会话」，不能据此判定会话被切走。
+                # 这条以前把给用户F的消息全部拦死（07:51-07:53 连拦 4 条）。
+                reason = "header unreadable (allow)"
+                time.sleep(0.12)
+                continue
             other = None
             for t in texts:
                 if _plausible(t) and name_match(target, t) < 0.3:
@@ -2880,6 +3715,10 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
         # 队列每 20s 再补一遍，同一条「翻唱完成」在群里连发 12 条。
         # 发之前先看 180s 内是不是已经有同样的文本 —— 有就不发。
         _dedupe_window = float(cfg.get("dedupe_window_s", 600))
+        # 2026-10-27：短回复（「嗯」「好」「行吧」）本来就该重复出现，600 秒窗口会把
+        # 正常的第二句当重复吞掉。短文本只看最近 30 秒，长文本才用完整窗口。
+        if len(re.sub(r"\s+", "", text or "")) < 8:
+            _dedupe_window = min(_dedupe_window, 30.0)
         _recent = verify(cfg, talker, text, time.time() + 2, 0, time.time() - _dedupe_window)
         if _recent:
             plan.update(ok=True, verified=True, localId=_recent.get("localId"),
@@ -2916,6 +3755,10 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                     break
                 time.sleep(retry_wait)
                 continue
+            log.info("[wxui] ↪ attempt=%d/%d open_chat ok target=%s claimed=%s "
+                     "open_attempts=%s elapsed=%.1fs",
+                     attempt, attempts_max, target, plan.get("claimed"),
+                     plan.get("open_attempts"), time.time() - t_start)
             try:
                 plan["input_clear"] = clear_input(client, cfg, plan.get("window_rect"),
                                                   focused_clean=fresh_input and attempt == 1)
@@ -2952,6 +3795,16 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                                 no_requeue=True)
                     attempt_log.append({"attempt": attempt, "stage": "defer_to_human"})
                     break
+                # 2026-10-29 傍晚事故：置顶的别的窗口盖住输入框时，点击会落到它上面，
+                # 粘贴的文本会打进那个窗口（用户会看到自己的输入框里冒出「用户B」）。
+                # 前台仍是微信也挡不住 no-activate 的置顶覆盖层，所以这里再问一次归属。
+                if _native_on(cfg, "native_input"):
+                    _win = plan.get("window_rect") or restored_rect(find_wechat(cfg))
+                    _ib = input_box_point(cfg, _win)
+                    _own, _pid = _point_belongs_to(find_wechat(cfg), _ib)
+                    if _own is False:
+                        raise RuntimeError("input box at %s is covered by another window "
+                                           "(pid=%s); refusing to type" % (list(_ib), _pid))
                 if _native_on(cfg, "native_input"):
                     # 原生粘贴：写剪贴板 + Ctrl+V + Enter ≈ 20ms，而三次 windows-mcp 输入调用
                     # 要 ~1.7s（每条消息都付一遍，这是“发一条要好几秒”的主要来源）。
@@ -2969,6 +3822,8 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                                                 "why": _id_why})
                             break
                     time.sleep(float(cfg.get("after_paste_wait_text", 0.3)))
+                    log.info("[wxui] ⏎ 复核通过，按回车 target=%s attempt=%d elapsed=%.1fs",
+                             target, attempt, time.time() - t_start)
                     winio.chord(winio.VK_RETURN)
                 else:
                     client.call("Clipboard", {"mode": "set", "text": text})
@@ -2985,6 +3840,8 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                 time.sleep(retry_wait)
                 continue
             found = verify(cfg, talker, text, time.time() + verify_timeout, since, t_start - 3)
+            log.info("[wxui] 🔎 verify attempt=%d found=%s elapsed=%.1fs",
+                     attempt, bool(found), time.time() - t_start)
             attempt_log.append({"attempt": attempt, "verified": bool(found),
                                 "localId": (found or {}).get("localId"),
                                 "open_attempts": plan.get("open_attempts")})
@@ -3107,6 +3964,10 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                     break
                 time.sleep(retry_wait)
                 continue
+            log.info("[wxui] ↪ attempt=%d/%d open_chat ok target=%s claimed=%s "
+                     "open_attempts=%s elapsed=%.1fs",
+                     attempt, attempts_max, target, plan.get("claimed"),
+                     plan.get("open_attempts"), time.time() - t_start)
             try:
                 plan["input_clear"] = clear_input(client, cfg, plan.get("window_rect"),
                                                   focused_clean=fresh_input and attempt == 1)
@@ -3316,10 +4177,21 @@ def sidebar_rows(cfg):
         return {"ok": False, "error": "no image from Screenshot (%s)" % (_brief(err) or "empty region"),
                 "control_preempted": bool(preempted(err))}
     res = ocr_lines(png)
-    return {"ok": bool(res.get("ok")), "png": png, "engine": res.get("engine"),
-            "lines": [{"text": ln.get("text"), "y": ln.get("y")}
-                      for ln in (res.get("lines") or [])],
-            "aliases": cfg.get("contact_aliases") or {}}
+    rows = [{"text": ln.get("text"), "y": ln.get("y")} for ln in (res.get("lines") or [])]
+    # 2026-10-28：微信被别的窗口盖住时 BitBlt 抓到的是上面那个窗口的像素，OCR 自然读
+    # 0 行，可原来照样返回 ok:true —— 诊断命令反而把人往「OCR 引擎不准」上带。这里带上
+    # 遮挡判定（raise_it=False，只读命令不许抢前台），读不到行又不在最上层就直接报错。
+    ready = ensure_wechat_ready(cfg, raise_it=False)
+    out = {"ok": bool(res.get("ok")), "png": png, "engine": res.get("engine"),
+           "lines": rows, "aliases": cfg.get("contact_aliases") or {},
+           "window_on_top": (ready or {}).get("on_top"),
+           "window_foreground": (ready or {}).get("foreground")}
+    if not rows and not (ready or {}).get("ok"):
+        out["ok"] = False
+        out["error"] = ("wechat is covered by another window (%s): the capture holds that "
+                        "window's pixels, not the sidebar"
+                        % ((ready or {}).get("reason") or "not on top"))
+    return out
 
 
 def main():
@@ -3390,7 +4262,7 @@ def main():
         if not args.spec:
             print(json.dumps({"ok": False, "error": "--spec required"}, ensure_ascii=False))
             return 2
-        with open(args.spec, encoding="utf-8") as fh:
+        with open(args.spec, encoding="utf-8-sig") as fh:
             out = verify_delivered(cfg, json.load(fh))
     elif args.cmd == "sessions":
         rows = api(cfg, "/api/v1/sessions", limit=200).get("sessions", [])
@@ -3400,7 +4272,7 @@ def main():
         target, text, commit = args.target, args.text, args.commit
         assume_current = bool(args.assume_current)
         if args.spec:
-            with open(args.spec, encoding="utf-8") as fh:
+            with open(args.spec, encoding="utf-8-sig") as fh:
                 spec = json.load(fh)
             target, text = spec.get("target"), spec.get("text")
             commit = bool(spec.get("commit"))
@@ -3415,7 +4287,7 @@ def main():
         target, path, commit = args.target, args.path, args.commit
         assume_current = bool(args.assume_current)
         if args.spec:
-            with open(args.spec, encoding="utf-8") as fh:
+            with open(args.spec, encoding="utf-8-sig") as fh:
                 spec = json.load(fh)
             target, path = spec.get("target"), spec.get("path")
             commit = bool(spec.get("commit"))

@@ -17,9 +17,8 @@ const mime = {
 };
 const server = createServer(async (request, response) => {
   try {
-    const pathname = decodeURIComponent(
-      new URL(request.url, "http://localhost").pathname,
-    );
+    const requestUrl = new URL(request.url, "http://localhost");
+    const pathname = decodeURIComponent(requestUrl.pathname);
     if (pathname === "/api/plugin/page/bridge-sdk.js") {
       response.writeHead(200, { "Content-Type": "text/javascript" });
       response.end("");
@@ -106,6 +105,10 @@ const server = createServer(async (request, response) => {
           "</head>",
           '<script src="/__preview/bridge.js"></script></head>',
         );
+      const theme = requestUrl.searchParams.get("theme");
+      if (theme === "light" || theme === "dark") {
+        content = content.replace("<html ", `<html data-theme="${theme}" `);
+      }
     }
     response.writeHead(200, {
       "Content-Type": `${

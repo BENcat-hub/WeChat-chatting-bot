@@ -20,6 +20,9 @@ def png_bytes(color=(255, 0, 0)) -> bytes:
 
 
 class DummyMutationManager:
+    def assert_pack_mutation_allowed(self, _pack_id, _operation):
+        return None
+
     def begin_external_pack_operation(self, _pack_id, _operation):
         return None
 
@@ -68,7 +71,7 @@ class DummyEvent:
                     )
                 )
                 for path in paths
-            ]
+            ],
         )
         if raw_image_data is not None:
             self.message_obj.raw_message = {
@@ -294,7 +297,9 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(auto_collect, "PACKS_DIR", packs_dir),
                 patch.object(auto_collect, "AUTO_COLLECT_TEMP_DIR", root / "queue"),
-                patch.object(auto_collect, "AUTO_COLLECT_STATE_PATH", root / "state.json"),
+                patch.object(
+                    auto_collect, "AUTO_COLLECT_STATE_PATH", root / "state.json"
+                ),
                 patch.object(
                     auto_collect,
                     "load_pack_category_mapping",
@@ -362,7 +367,9 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(auto_collect, "PACKS_DIR", packs_dir),
                 patch.object(auto_collect, "AUTO_COLLECT_TEMP_DIR", root / "queue"),
-                patch.object(auto_collect, "AUTO_COLLECT_STATE_PATH", root / "state.json"),
+                patch.object(
+                    auto_collect, "AUTO_COLLECT_STATE_PATH", root / "state.json"
+                ),
                 patch.object(
                     auto_collect,
                     "load_pack_category_mapping",
@@ -422,9 +429,15 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(auto_collect.time, "time", return_value=1000000),
             ):
                 manager = auto_collect.AutoCollectManager(DummyPlugin(), {})
-                self.assertFalse(manager._sample_observation("pack-a:first", "message-1"))
-                self.assertFalse(manager._sample_observation("pack-a:second", "message-2"))
-                self.assertFalse(manager._sample_observation("pack-a:third", "message-3"))
+                self.assertFalse(
+                    manager._sample_observation("pack-a:first", "message-1")
+                )
+                self.assertFalse(
+                    manager._sample_observation("pack-a:second", "message-2")
+                )
+                self.assertFalse(
+                    manager._sample_observation("pack-a:third", "message-3")
+                )
                 self.assertEqual(len(manager._state["observations"]), 2)
                 self.assertNotIn("pack-a:first", manager._state["observations"])
             with patch.object(
@@ -433,8 +446,12 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                 return_value=1000000 + auto_collect.OBSERVATION_TTL_SECONDS + 1,
             ):
                 manager = auto_collect.AutoCollectManager(DummyPlugin(), {})
-                self.assertFalse(manager._sample_observation("pack-a:second", "message-4"))
-                self.assertEqual(manager._state["observations"]["pack-a:second"]["count"], 1)
+                self.assertFalse(
+                    manager._sample_observation("pack-a:second", "message-4")
+                )
+                self.assertEqual(
+                    manager._state["observations"]["pack-a:second"]["count"], 1
+                )
                 self.assertEqual(len(manager._state["observations"]), 1)
 
     async def test_progressive_probability_rises_after_second_observation(self):
@@ -446,12 +463,22 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(
                     auto_collect.random, "random", side_effect=[0.46, 0.50]
                 ) as roll:
-                    self.assertFalse(manager._sample_observation("pack-a:digest", "first"))
-                    self.assertFalse(manager._sample_observation("pack-a:digest", "second"))
-                    self.assertTrue(manager._sample_observation("pack-a:digest", "third"))
-                    self.assertTrue(manager._sample_observation("pack-a:digest", "fourth"))
+                    self.assertFalse(
+                        manager._sample_observation("pack-a:digest", "first")
+                    )
+                    self.assertFalse(
+                        manager._sample_observation("pack-a:digest", "second")
+                    )
+                    self.assertTrue(
+                        manager._sample_observation("pack-a:digest", "third")
+                    )
+                    self.assertTrue(
+                        manager._sample_observation("pack-a:digest", "fourth")
+                    )
                 self.assertEqual(roll.call_count, 2)
-                self.assertEqual(manager._state["observations"]["pack-a:digest"]["count"], 4)
+                self.assertEqual(
+                    manager._state["observations"]["pack-a:digest"]["count"], 4
+                )
 
     async def test_close_removes_unprocessed_snapshots(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -496,6 +523,7 @@ class AutoCollectSubmissionTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertFalse(snapshot_path.exists())
                 self.assertTrue(manager.queue.empty())
+
 
 if __name__ == "__main__":
     unittest.main()

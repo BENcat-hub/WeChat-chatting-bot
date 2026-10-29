@@ -1,4 +1,4 @@
-# akasha-bridge 依赖（Python 3.12）
+﻿# akasha-bridge 依赖（Python 3.12）
 # 与 akasha-bridge\requirements.txt 内容一致，这里再给一份便于单独安装。
 requests>=2.31.0
 pyautogui>=0.9.54

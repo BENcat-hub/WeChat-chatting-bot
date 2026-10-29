@@ -455,6 +455,159 @@ bridge 的 `wxui_sender._run()` 看到该标记会 `_worker_kill()` 丢掉常驻
 
 ---
 
+## 13. 2026-10-19 「梗速查」（不懂的梗联网查，已上线）
+
+### 13.1 策略
+遇到不认识的梗时不再直接走 AstrBot 的通用网页搜索，而是按站点顺序逐个查：
+
+1. **B 站**（`bilibili.com`）：`"{term} 是什么意思 site:bilibili.com"`
+2. **梗 wiki**（`cnmeme.wiki`）
+3. **梗百科**（`gengbaike.cn`）
+
+每一站命中一条就停；非 B 站来源如果摘要太短（<60 字）再调 `fetch` 抓正文补全。
+结果会按 `rerank_score + 0.35 × 本地分` 排序（本地分看词命中/释义信号词），**低于 1.5 判为不采用**，
+所以「B 站只有视频标题、没有释义」时会自动往下一站退，不会把视频标题当释义用。
+
+### 13.2 代码位置
+- 新文件 `astrbot\data\plugins\astrbot_plugin_private_companion\meme_lookup.py`（`MemeLookupMixin`）：
+  - `_deepseek_search()` / `_deepseek_fetch()`：`POST https://api.deepseek.com/v1/tools/search`、
+    `POST https://api.deepseek.com/v1/tools/fetch`，多 Key 轮换（`websearch_deepseek_key`），401/402/403 换 Key。
+  - `_meme_lookup_term(term, umo)`：主流程（逐站搜索 → 打分 → 必要时 fetch 补正文），
+    结果缓存 3 天（`self.data["meme_lookup_cache"]`，最多 120 条）。
+  - `_meme_lookup_evidence(terms, limit, umo, purpose)`：拼成提示词证据块（≤1800 字）。
+  - `_meme_terms_from_query(query)`：从「XX 是什么意思 / 是什么梗」里抽词；
+    先定位触发短语再往左取词块（允许夹「到底/究竟/那个」），所以
+    `昨晚那个 city不city 到底什么意思` → `city不city`。
+- 接入点：
+  - 群黑话释义：`group_observation.py:5374` `_collect_group_slang_web_evidence()`
+    先调梗速查，命中就不退回通用搜索。
+  - 空闲自动浏览（主动搜索）：`news_exploration.py:4820` `_maybe_trigger_web_exploration()`
+    —— 探索到的查询若含梗，走梗速查；否则走通用搜索。
+  - 通用搜索的 deepseek 分支：`news_exploration.py:3894`（`_astrbot_web_search_available` 认 `provider == "deepseek"`）
+    与 `news_exploration.py:4289`（`_run_astrbot_web_search` 走 `_deepseek_search`）。
+    在此之前 provider=deepseek 会被判成「未配置搜索」，群黑话与空闲浏览都静默跳过。
+
+### 13.3 配置
+- 插件配置（`astrbot\data\config\astrbot_plugin_private_companion_config.json`，UTF-8 BOM）：
+  `enable_meme_web_lookup=true`、`meme_lookup_sites="bilibili,cnmeme,gengbaike"`、`meme_lookup_summary_chars=260`。
+- 面板位置：群聊黑话 → 「梗速查（B站→梗wiki→梗百科）」。
+- 依赖：`astrbot\data\cmd_config.json` 里 `provider_settings.websearch_provider="deepseek"` 且 `websearch_deepseek_key` 非空。
+- 计费：DeepSeek 官方 Search/Fetch 每 1000 次成功请求 5 元；Search 限 100 QPS、Fetch 25 QPS。
+
+### 13.4 验证
+```
+astrbot\.venv\Scripts\python.exe -X utf8 scripts\test_meme_lookup.py city不city
+astrbot\.venv\Scripts\python.exe -X utf8 scripts\test_meme_lookup.py 依托答辩 cnmeme,gengbaike
+```
+实测：`city不city` 命中 B 站 BV19i421a7Ma（rerank 1.903）；`依托答辩` 在梗 wiki 0 命中 → 自动退到梗百科命中
+（摘要「一坨大便的谐音」），证明兜底链路有效。
+
+### 13.5 两个新增的坑（都已踩过）
+- **`_conf_schema.json` 不能带 BOM**。用 `utf-8-sig` 回写会加 BOM，AstrBot 用普通 `json.load` 读，
+  直接 `Unexpected UTF-8 BOM` → 整个插件 import 失败。
+- **schema 里同名 key 只能在「分组 items」中出现一次**。我一开始在
+  `group_slang_topic_config.items` 和 `web_exploration_config.items` 里都放了 `enable_meme_web_lookup`，
+  AstrBot 报 `duplicate grouped schema key: enable_meme_web_lookup` 同样导致 import 失败。
+  现在只保留群黑话分组里那一处（面板可见），空闲浏览走同一个键。
+
+### 13.6 重载提醒
+改插件 `.py` 后 `start-all.ps1` 只在端口未监听时才启动 AstrBot，**必须**先
+`taskkill /T /F /PID <6185 监听进程>` 再 detached 重启，否则新代码不生效。
+
+### 13.7 回复里「不认识这个梗」→ 截断 + 查词 + 重写（2026-10-19 追加）
+
+动机：模型有时会老实写「我不知道 XX 是什么意思」。这种句子发到微信里很崩人格，所以拦在发送之前。
+
+流程（全在插件侧，一轮最多一次）：
+1. `on_llm_response` 钩子 `repair_unknown_meme_response`（`main.py`，priority=110000，排在 TTS 归一化之前）
+   读模型本轮的 `completion_text`。
+2. `_meme_ignorance_terms()` 用三条正则捞出「不认识」句式里的梗名，并过滤
+   `_IGNORANCE_STOP_TERMS`（什么/啥/意思…）与长度<2 或纯虚词的候选；最多取 `meme_reply_repair_max_terms`（默认 2）个。
+3. `_meme_lookup_evidence()` 走同一套 B 站→梗wiki→梗百科链路（同一份缓存），拿到释义。
+4. `_meme_strip_ignorance()` 把这句（连同句末标点）从回复里摘掉，保留剩下的话。
+5. `_meme_regenerate_reply()` 带上释义重写一遍；重写结果若还含「不认识」句式，就退化成只截断。
+6. 查不到释义 → 完全不改回复、也不多调模型。
+
+开关与位置：
+- 运行配置（UTF-8 BOM 那份）：`enable_meme_reply_repair`（默认 true）、`meme_reply_repair_max_terms`（默认 2，1~3）。
+- `plugin_bootstrap.py` 里用 `_cfg_bool` / `_cfg_int` 读取。
+- 面板：群黑话分组里的「回复里不认识这个梗就联网重写」+「一次最多重查几个梗」。
+
+自测（不联网、不启动 AstrBot）：
+```
+astrbot\.venv\Scripts\python.exe -X utf8 scripts\test_meme_reply_repair.py
+```
+覆盖：三种句式抽词 / 不误伤正常回复 / 只摘问题句 / 命中后替换 / 系统提示里带释义 / 同一事件只重写一次 /
+查不到时保留原文且不调模型 / 重写仍不懂则只截断。当前 14 项全 PASS。
+
+注意：`_repair_unknown_meme_response` 用的是 `event` 上的 `provider_request`
+（由 `enforce_model_replacement_request` 在 `on_llm_request` 阶段写入 extra），
+拿不到时回退到 `event.message_str` 当 prompt、不传对话历史——极端情况下重写会更「干」，
+但不会报错。
+
+---
+
+## 14. 2026-10-19 分段规则「看起来不管用」的真相（已修）
+
+现象：20:42 的回复只发了 2 条气泡，每条都是「逗号串起来的长句」，用户以为分段规则失效。
+
+根因（不是规则坏了，是规则被跳过了）：
+1. 模型自己在回复里写了 2 个 `<<PRIVATE_COMPANION_SPLIT>>` 标记；
+2. `parse_llm_segment_control()` 因此把结果标记为「模型已控制分段」，
+   `suppress_plugin_rule_split` 为真；
+3. `main.py` 的 `_segment_llm_reply_chain` 在 `any(suppress_plugin_rule_split)`
+   分支里**直接采纳模型的切分**，不再跑 `_split_proactive_text` —— 于是模型切多长就发多长。
+
+修法：
+- `segmented_message.py` 新增三个纯函数：
+  - `segment_exceeds_granularity(text, limit=20)`：长度超 20 字且有断句点，**或**有 2 个以上断句点
+    且不短于 10 字 → 判为「一句塞了好几句」；
+  - `fit_segments_to_budget(candidate, remaining)`：名额不够时从尾部并回（并回时补回逗号），一个字不丢；
+  - `limit_planned_segments(planned, max_segments)`：把最终分段压回 `max_segments`。
+- `main.py` 的 `suppress_plugin_rule_split` 分支不再无条件采纳：逐段判断是否超粒度，
+  超了就 `_split_proactive_text` 再切，最后 `_limit_planned_segments` 收口。
+- 原来「切出的段数超过剩余名额就整段放弃」的循环也改成先 `fit_segments_to_budget` 再判断。
+
+验证：
+```
+astrbot\.venv\Scripts\python.exe -X utf8 scripts\test_segmentation_rules.py
+```
+用真实运行配置跑：`补偿啊，我又不欠你钱，欠的是照片` → 3 段；`这样，这周末我专门出门一趟，好好拍一组给你，不糊的那种` → 4 段。
+再模拟生产那条 2 段回复：两段都被判超粒度，重切出 7 段。
+
+可调项（都在运行配置，UTF-8 BOM）：
+- `segmented_proactive_max_segments`：总段数上限（当前 8）。
+- `segmented_proactive_granularity_chars`：一条消息的字数粒度，默认 20（代码里读，配置缺失时用默认值）。
+- `enable_segmented_proactive_chat_profiles=false` 时**私聊专用那套**（`segmented_proactive_private_*`，max 3 / min 8 字）
+  不生效，用的是全局值——想让私聊更克制就把这个开关打开。
+
+---
+
+## 15. 2026-10-20 DeepSeek 前缀缓存命中率从 ~10% 提到 ~88%（已修）
+
+现象：`provider_stats` 里主对话请求 `token_input_cached≈1920`（正好是 55 个工具的量），
+其余 16–18K 全部 miss，命中率 9%–12%。
+
+根因：DeepSeek 缓存是「前缀逐字节匹配」，system prompt 在 messages[0]，**任一处每轮改动
+system 就让整段历史失效**。三处每轮漂移的注入：
+
+1. `astrbot_plugin_affection/main.py` 情绪面板：想写 `req.messages` 但钩子阶段该字段还是空的
+   → 永远兜底写进 `system_prompt`，数字每轮变；
+2. `astrbot_plugin_private_companion/tts_enhancement.py` TTS 规则块：直接
+   `materialize_system_block(placement=PLACEMENT_DYNAMIC_SYSTEM)` 绕过注入位置配置，
+   且 `_strip_registered_materialized_blocks` 跳过 `ExactText` → system 里 3 份重复；
+3. `astrbot_plugin_memory_companion/core/service.py` 三个工具契约：按消息语义决定是否注入、
+   还带本轮数字，用户一句「今天…」system 就变。
+
+修法：system 只留逐字节稳定内容，其余全走消息尾部（`extra_user_content_parts` /
+`PLACEMENT_TURN_TAIL`）。详见 `docs/CACHE-HIT-FINDINGS.md`（含 diag 工具、注入脚本、
+SQL 复核语句、回归测试命令）。
+
+效果：同一会话 4 轮 system 长度与 sha 完全一致（`sys_len=8165 sha=a6563117520068dd`），
+命中率 57.0%（修前）→ 85.0%（修后整体，含重启冷启动）→ 稳态 86%–89%。
+
+---
+
 ### 附：可直接粘贴给新对话的开场白
 > 这是一个「微信小号 AI 伴侣」项目，工作目录 `C:\Users\<YOU>\Documents\<WORKSPACE>`。
 > 先读 `wechat-ai-stack\docs\HANDOVER-NEXT-DEEPSEEK.md`，那是完整交接（架构、接口、流程、排障）。

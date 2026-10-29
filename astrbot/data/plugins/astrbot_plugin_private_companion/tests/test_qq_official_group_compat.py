@@ -135,24 +135,24 @@ class QqOfficialGroupPageTests(unittest.IsolatedAsyncioTestCase):
         async with self.app.test_request_context(
             "/group/update",
             method="POST",
-            json={"group_id": OFFICIAL_GROUP_UMO, "group_name": "官方测试群", "enabled": True},
+            json={"group_id": OFFICIAL_GROUP_UMO, "group_name": "官方示例群聊D", "enabled": True},
         ):
             result = await self.api.update_group()
 
         self.assertTrue(result["success"])
         self.assertEqual(OFFICIAL_GROUP_ID, result["data"]["group_id"])
         group = self.plugin.data["groups"][OFFICIAL_GROUP_ID]
-        self.assertEqual("官方测试群", group["manual_group_name"])
-        self.assertEqual("官方测试群", group["name"])
+        self.assertEqual("官方示例群聊D", group["manual_group_name"])
+        self.assertEqual("官方示例群聊D", group["name"])
         self.assertEqual("manual", group["group_name_source"])
 
     async def test_clear_observation_preserves_manual_name(self) -> None:
         self.plugin.data["groups"][OFFICIAL_GROUP_ID] = {
             "group_id": OFFICIAL_GROUP_ID,
             "enabled": True,
-            "manual_group_name": "官方测试群",
-            "name": "官方测试群",
-            "group_name": "官方测试群",
+            "manual_group_name": "官方示例群聊D",
+            "name": "官方示例群聊D",
+            "group_name": "官方示例群聊D",
             "recent_messages": [{"text": "旧消息"}],
         }
         async with self.app.test_request_context(
@@ -164,8 +164,8 @@ class QqOfficialGroupPageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["success"])
         group = self.plugin.data["groups"][OFFICIAL_GROUP_ID]
-        self.assertEqual("官方测试群", group["manual_group_name"])
-        self.assertEqual("官方测试群", group["name"])
+        self.assertEqual("官方示例群聊D", group["manual_group_name"])
+        self.assertEqual("官方示例群聊D", group["name"])
         self.assertEqual([], group["recent_messages"])
 
     async def test_manual_group_name_can_be_cleared(self) -> None:

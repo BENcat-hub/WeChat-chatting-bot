@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..packs.protocol import validate_pack_id
 from .caption import generate_caption
 from .index import (
     EmbeddingAdapter,
@@ -567,10 +567,7 @@ class SemanticTaskManager:
 
     @staticmethod
     def _validate_pack_id(pack_id: str) -> str:
-        value = str(pack_id or "").strip()
-        if not value or not re.fullmatch(r"[A-Za-z0-9._-]{2,64}", value):
-            raise ValueError("pack_id 无效")
-        return value
+        return validate_pack_id(pack_id)
 
     def _state_path(self, pack_id: str) -> Path:
         return (
@@ -1599,6 +1596,18 @@ class SemanticTaskManager:
     async def rebuild_index(
         self, pack_id: str, *, force: bool = False
     ) -> dict[str, Any]:
+        """Build vectors for ready descriptions, reusing the current index by default.
+
+        Args:
+            pack_id: Pack to update.
+            force: Regenerate every vector; requires all descriptions to be complete.
+
+        Returns:
+            Index generation statistics.
+
+        Raises:
+            RuntimeError: The pack is busy, the provider changed, or no images are ready.
+        """
         pack_id = self._validate_pack_id(pack_id)
         pack_dir = self._pack_dir(pack_id)
         if not pack_dir.is_dir():
@@ -1620,7 +1629,23 @@ class SemanticTaskManager:
                 raise RuntimeError(
                     f"资源包正在执行“{external_operation}”，暂时不能建立向量索引"
                 )
+            state = self._load_state(pack_id)
+            if state.get("task_status") in {"paused", "running"}:
+                raise RuntimeError(
+                    "资源包存在暂停或中断的语义队列，请先继续完成或清空任务队列"
+                )
             provider = self._require_embedding_provider(pack_id, "建立向量索引")
+            manifest = load_index_manifest(self.plugin_data_dir, pack_id)
+            if (
+                not force
+                and manifest.get("items")
+                and (
+                    manifest.get("embedding_provider_id") != provider.provider_id
+                    or manifest.get("embedding_model", "") != provider.model_name
+                    or manifest.get("embedding_dimension") != provider.dimension
+                )
+            ):
+                raise RuntimeError("向量模型或维度已变化，请使用全量重建")
             metadata = load_metadata(pack_dir)
             images = metadata.get("images", {})
             if not isinstance(images, dict) or not images:
@@ -1632,7 +1657,7 @@ class SemanticTaskManager:
                     not isinstance(item, dict) or not semantic_caption_is_complete(item)
                 )
             )
-            if incomplete:
+            if incomplete and force:
                 raise RuntimeError(
                     f"还有 {incomplete} 个图片描述未完成，请先完成全部描述后再建立向量索引"
                 )
@@ -1659,7 +1684,12 @@ class SemanticTaskManager:
             try:
                 await self._verify_embedding_dimension(pack_id, provider, force=force)
                 result = await build_index(
-                    pack_dir, self.plugin_data_dir, pack_id, provider, force=force
+                    pack_dir,
+                    self.plugin_data_dir,
+                    pack_id,
+                    provider,
+                    force=force,
+                    incremental_only=not force,
                 )
                 latest = load_metadata(pack_dir)
                 has_errors = any(

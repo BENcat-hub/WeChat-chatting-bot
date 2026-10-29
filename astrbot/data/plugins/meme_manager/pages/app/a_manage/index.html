@@ -75,13 +75,13 @@
 
     <dialog
       id="collection-review-dialog"
-      class="collection-review-dialog"
+      class="collection-review-dialog ui-dialog"
       aria-labelledby="collection-review-title"
     >
       <div class="collection-review-heading">
         <div>
           <p class="eyebrow">Collection Review</p>
-          <h2 id="collection-review-title" class="text-h3 pa-4 pb-0 pl-6">
+          <h2 id="collection-review-title" class="ui-dialog-title text-h3 pa-4 pb-0 pl-6">
             审核收集到的表情包
           </h2>
           <p id="collection-review-pack"></p>
@@ -367,6 +367,14 @@
             <span id="pack-vector-status-text">正在读取向量维度…</span>
           </span>
           <button
+            id="increment-pack-vectors-btn"
+            type="button"
+            class="secondary vector-rebuild-btn hidden"
+            disabled
+          >
+            <i class="fas fa-plus icon"></i>增量处理
+          </button>
+          <button
             id="rebuild-pack-vectors-btn"
             type="button"
             class="secondary vector-rebuild-btn hidden"
@@ -517,7 +525,7 @@
       aria-hidden="true"
     >
       <div
-        class="move-target-modal-card"
+        class="move-target-modal-card dialog-card"
         role="dialog"
         aria-modal="true"
         aria-labelledby="move-target-modal-title"
@@ -549,7 +557,7 @@
       aria-hidden="true"
     >
       <div
-        class="category-edit-modal-card"
+        class="category-edit-modal-card dialog-card"
         role="dialog"
         aria-modal="true"
         aria-labelledby="category-edit-modal-title"
@@ -587,7 +595,7 @@
       inert
     >
       <div
-        class="confirm-modal-card"
+        class="confirm-modal-card dialog-card"
         role="dialog"
         aria-modal="true"
         aria-labelledby="confirm-modal-title"
@@ -608,7 +616,7 @@
       aria-hidden="true"
     >
       <div
-        class="danger-modal-card"
+        class="danger-modal-card dialog-card"
         role="dialog"
         aria-modal="true"
         aria-labelledby="danger-modal-title"
@@ -679,8 +687,12 @@
         </button>
       </div>
     </div>
-    <dialog id="pack-transfer-dialog" aria-labelledby="pack-transfer-title">
-      <h2 id="pack-transfer-title">移到其他表情包</h2>
+    <dialog
+      id="pack-transfer-dialog"
+      class="ui-dialog"
+      aria-labelledby="pack-transfer-title"
+    >
+      <h2 id="pack-transfer-title" class="ui-dialog-title text-h3 pa-4 pb-0 pl-6">移到其他表情包</h2>
       <p>选定目标表情包，再决定这些图片如何归类。</p>
       <fieldset id="pack-transfer-fields">
         <label>目标表情包<select id="pack-transfer-pack"></select></label>
@@ -987,9 +999,13 @@
       </div>
     </div>
 
-    <dialog id="create-pack-dialog" aria-labelledby="create-pack-title">
+    <dialog
+      id="create-pack-dialog"
+      class="ui-dialog"
+      aria-labelledby="create-pack-title"
+    >
       <form id="create-pack-form">
-        <h2 id="create-pack-title" class="text-h3 pa-4 pb-0 pl-6">
+        <h2 id="create-pack-title" class="ui-dialog-title text-h3 pa-4 pb-0 pl-6">
           创建新表情包
         </h2>
         <p>创建后会自动切换到新包，可立即上传表情或从其他包移入。</p>
@@ -1001,6 +1017,16 @@
               required
               maxlength="80"
               placeholder="例如：我的日常表情"
+              autocomplete="off"
+          /></label>
+          <label
+            >表情包 ID（可选）
+            <input
+              name="pack_id"
+              maxlength="64"
+              pattern="[a-z0-9._\-]{2,64}"
+              title="使用 2–64 个小写字母、数字、点、下划线或短横线，不能以点开头"
+              placeholder="例如：my-daily-pack，留空自动生成"
               autocomplete="off"
           /></label>
           <label

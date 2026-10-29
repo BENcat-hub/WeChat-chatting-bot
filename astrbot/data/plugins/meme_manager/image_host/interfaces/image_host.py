@@ -20,7 +20,12 @@ class ImageInfo(TypedDict, total=False):
 
 
 class ImageHostInterface(ABC):
-    """Keep provider-specific paths and HTTP behavior outside the sync engine."""
+    """Keep provider-specific paths and HTTP behavior outside the sync engine.
+
+    Provider methods perform blocking network I/O. Run them in the sync worker
+    process, or offload the complete operation with asyncio.to_thread when
+    calling from an async handler, including inventory and status queries.
+    """
 
     @abstractmethod
     def upload_image(self, file_path: Path) -> ImageInfo:

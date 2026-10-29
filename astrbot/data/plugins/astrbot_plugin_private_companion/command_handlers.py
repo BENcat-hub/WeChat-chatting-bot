@@ -4689,7 +4689,7 @@ class CommandHandlersMixin:
     def _natural_photo_prompt_is_pure_scene(prompt: Any) -> bool:
         """True when the request is about animals / objects / food / scenery.
 
-        2026-10-22 用户反馈：跟陈奥琦聊小猫时，图又变成二次元插画了。
+        2026-10-22 用户反馈：跟用户A聊小猫时，图又变成二次元插画了。
         「没有人物出现的画面一律要写实风」——所以除了风景食物桌面，
         动物（猫狗鸟）也算纯场景，走手机实拍质感而不是平涂插画。
         """

@@ -248,12 +248,13 @@
           </section>
           <dialog
             id="config-flow-dialog"
+            class="ui-dialog ui-dialog-sectioned"
             aria-labelledby="config-flow-dialog-title"
           >
-            <div class="flow-dialog-heading">
+            <div class="flow-dialog-heading ui-dialog-heading">
               <h3
                 id="config-flow-dialog-title"
-                class="text-h3 pa-4 pb-0 pl-6"
+                class="ui-dialog-title text-h3 pa-4 pb-0 pl-6"
                 tabindex="-1"
               ></h3>
               <div class="flow-dialog-heading-actions">
@@ -275,8 +276,8 @@
                 </button>
               </div>
             </div>
-            <div id="config-flow-dialog-body"></div>
-            <div class="flow-dialog-actions">
+            <div id="config-flow-dialog-body" class="ui-dialog-body"></div>
+            <div class="flow-dialog-actions ui-dialog-actions">
               <p id="config-flow-dialog-status" role="status"></p>
               <button type="button" class="ghost" data-flow-dialog-close>
                 关闭
@@ -316,7 +317,7 @@
               role="status"
             ></p>
             <p class="workflow-fallback">
-              自动检查重复图片；收录后如需用于语义检索，仍需到「语义化」页面手动生成索引。
+              自动检查重复图片；启用语义检索后，默认在入包时自动增量生成向量，可在「审核与入包」关闭。描述未完成的图片需先到「语义化」页面处理。
             </p>
           </section>
           <div id="config-sections"></div>
@@ -335,10 +336,14 @@
         </form>
         <dialog
           id="rules-flow-dialog"
+          class="ui-dialog ui-dialog-sectioned"
           aria-labelledby="rules-flow-dialog-title"
         >
-          <div class="flow-dialog-heading">
-            <h3 id="rules-flow-dialog-title" class="text-h3 pa-4 pb-0 pl-6">
+          <div class="flow-dialog-heading ui-dialog-heading">
+            <h3
+              id="rules-flow-dialog-title"
+              class="ui-dialog-title text-h3 pa-4 pb-0 pl-6"
+            >
               表情包使用规则
             </h3>
             <button
@@ -350,8 +355,8 @@
               ×
             </button>
           </div>
-          <div id="rules-flow-dialog-body"></div>
-          <div class="flow-dialog-actions">
+          <div id="rules-flow-dialog-body" class="ui-dialog-body"></div>
+          <div class="flow-dialog-actions ui-dialog-actions">
             <button type="button" class="ghost" data-rules-dialog-close>
               关闭
             </button>
@@ -613,7 +618,10 @@
         aria-labelledby="storage-guide-title"
       >
         <header class="storage-guide-header">
-          <h3 id="storage-guide-title" class="text-h3 pa-4 pb-0 pl-6">
+          <h3
+            id="storage-guide-title"
+            class="ui-dialog-title text-h3 pa-4 pb-0 pl-6"
+          >
             图床配置教程
           </h3>
         </header>

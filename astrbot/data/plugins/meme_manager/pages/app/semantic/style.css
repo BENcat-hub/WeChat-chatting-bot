@@ -5,42 +5,42 @@
 }
 .panel-hint {
   color: var(--muted);
-  font-size: 13px;
+  font-size: var(--font-label);
   line-height: 1.7;
 }
 .control-fields {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 140px;
-  gap: 16px;
+  gap: var(--space-16);
 }
 .field-row small {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-caption);
   line-height: 1.6;
 }
 .action-row {
-  margin-top: 20px;
+  margin-top: var(--space-20);
 }
 .advanced-actions {
-  margin-top: 20px;
+  margin-top: var(--space-20);
   border-top: 1px solid var(--line);
 }
 .advanced-actions > summary {
-  padding: 16px 0 2px;
+  padding: var(--space-16) 0 var(--space-4);
   cursor: pointer;
-  font-size: 13px;
+  font-size: var(--font-label);
   font-weight: 600;
   color: var(--muted);
 }
 .advanced-actions > summary span {
   margin-left: 8px;
   font-weight: 400;
-  font-size: 12px;
+  font-size: var(--font-caption);
 }
 .maintenance-group {
   display: grid;
-  gap: 12px;
-  margin-top: 18px;
+  gap: var(--space-12);
+  margin-top: var(--space-20);
 }
 .destructive-actions {
   padding-top: 16px;
@@ -51,10 +51,10 @@
 }
 .control-panel .result.warning {
   white-space: pre-wrap;
-  color: #926321;
+  color: var(--warning-fg);
 }
 .auto-inbox-panel {
-  border-color: #e5daba;
+  border-color: var(--warning-border);
 }
 .auto-inbox-panel h2 {
   display: flex;
@@ -65,21 +65,21 @@
 .auto-inbox-items {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
-  gap: 10px;
-  margin-top: 16px;
+  gap: var(--space-12);
+  margin-top: var(--space-16);
 }
 .auto-inbox-item {
   display: grid;
   gap: 6px;
-  padding: 12px 14px;
-  border: 1px solid #ece5d6;
-  border-radius: 12px;
-  background: #fdfcf8;
+  padding: var(--space-12) var(--space-16);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-md);
+  background: var(--warning-bg);
 }
 .auto-inbox-item span,
 .auto-inbox-item time {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-caption);
   overflow-wrap: anywhere;
 }
 .status-header-tools,
@@ -94,23 +94,23 @@
 .filter-label,
 .page-label {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-caption);
 }
 .page-label {
   white-space: nowrap;
 }
 .status-error {
-  margin-top: 16px;
-  padding: 12px 14px;
-  border-radius: 10px;
-  background: #fff3f0;
-  color: var(--danger);
-  font-size: 13px;
+  margin-top: var(--space-16);
+  padding: var(--space-12) var(--space-16);
+  border-radius: var(--radius-md);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  font-size: var(--font-label);
   line-height: 1.6;
   overflow-wrap: anywhere;
 }
 .task-overview {
-  margin: 18px 0 16px;
+  margin: var(--space-20) 0 var(--space-16);
 }
 .task-overview-heading {
   display: flex;
@@ -118,35 +118,35 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
+  font-size: var(--font-body);
 }
 #task-progress-label {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-caption);
 }
 #task-progress {
   display: block;
   appearance: none;
   width: 100%;
   height: 7px;
-  margin: 12px 0;
+  margin: var(--space-12) 0;
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   overflow: hidden;
-  background: #edf3ef;
+  background: var(--surface-muted);
   accent-color: var(--brand);
 }
 #task-progress::-webkit-progress-bar {
-  background: #edf3ef;
-  border-radius: 999px;
+  background: var(--surface-muted);
+  border-radius: var(--radius-pill);
 }
 #task-progress::-webkit-progress-value {
   background: var(--brand);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
 }
 #task-progress::-moz-progress-bar {
   background: var(--brand);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
 }
 .status-grid {
   display: grid;
@@ -154,14 +154,14 @@
 }
 .metric-group {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   overflow: hidden;
 }
 .metric-group summary {
-  padding: 12px 14px;
+  padding: var(--space-12) var(--space-16);
   cursor: pointer;
   color: var(--ink);
-  font-size: 13px;
+  font-size: var(--font-label);
   font-weight: 600;
 }
 .metric-group summary::marker {
@@ -170,37 +170,37 @@
 .metric-group-content {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(150px, 100%), 1fr));
-  gap: 10px;
-  padding: 0 12px 12px;
+  gap: var(--space-12);
+  padding: 0 var(--space-12) var(--space-12);
 }
 .metric {
   min-height: 76px;
   min-width: 0;
-  padding: 12px;
-  border-radius: 8px;
-  background: #f7faf8;
+  padding: var(--space-12);
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
 }
 .metric span {
   display: block;
   margin-bottom: 8px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--font-caption);
   overflow-wrap: anywhere;
 }
 .metric strong {
   display: block;
-  font-size: 18px;
+  font-size: var(--font-section);
   font-weight: 600;
   overflow-wrap: anywhere;
 }
 .records-filter {
   width: auto;
   min-width: 115px;
-  font-size: 13px;
+  font-size: var(--font-label);
 }
 .page-button {
   padding: 8px 11px;
-  font-size: 12px;
+  font-size: var(--font-caption);
 }
 .records {
   display: grid;
@@ -220,14 +220,14 @@
   border-bottom: 0;
 }
 .record-path {
-  font-size: 13px;
+  font-size: var(--font-label);
   font-weight: 600;
   overflow-wrap: anywhere;
 }
 .record-copy,
 .record-state {
   color: var(--muted);
-  font-size: 13px;
+  font-size: var(--font-label);
   line-height: 1.7;
   overflow-wrap: anywhere;
 }
@@ -237,25 +237,27 @@
   white-space: pre-wrap;
 }
 .record-reclassification {
-  margin-top: 8px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  background: #eef5f0;
-  color: var(--brand-strong);
+  margin-top: var(--space-8);
+  padding: var(--space-4) var(--space-8);
+  border-radius: var(--radius-sm);
+  background: var(--primary-soft);
+  color: var(--link);
 }
 .record-preview-button {
   width: 88px;
   height: 76px;
   padding: 0;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   overflow: hidden;
-  background: #f7faf8;
-  color: var(--muted);
+  background: var(--surface-inset);
+  color: var(--text-muted);
+  box-shadow: none;
 }
 .record-preview-button:hover:not(:disabled) {
   transform: none;
   border-color: var(--brand);
+  background: var(--surface-hover);
 }
 .record-preview-button img {
   width: 100%;
@@ -269,34 +271,30 @@
   width: 100%;
   height: 100%;
   padding: 6px;
-  font-size: 11px;
+  font-size: var(--font-caption);
 }
 .empty {
-  padding: 32px 16px;
+  padding: var(--space-32) var(--space-16);
   text-align: center;
   color: var(--muted);
-  font-size: 13px;
+  font-size: var(--font-label);
   line-height: 1.7;
 }
 .image-preview-card {
   width: min(900px, 100%);
   max-height: 94vh;
   overflow: auto;
-  padding: 18px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--panel);
-  box-shadow: var(--shadow-md);
 }
 .image-preview-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 14px;
+  gap: var(--space-12);
+  margin-bottom: var(--space-12);
 }
 .image-preview-header h3 {
-  font-size: 16px;
+  margin: 0;
+  font-size: var(--font-section);
   overflow-wrap: anywhere;
 }
 .image-preview-stage {
@@ -306,8 +304,8 @@
   min-height: 240px;
   max-height: calc(94vh - 120px);
   overflow: auto;
-  border-radius: 10px;
-  background: #f3f6f4;
+  border-radius: var(--radius-md);
+  background: var(--surface-inset);
 }
 .image-preview-stage img {
   display: block;
@@ -320,14 +318,14 @@
 }
 .image-preview-stage span {
   position: absolute;
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.92);
-  color: var(--muted);
-  font-size: 13px;
+  padding: var(--space-8) var(--space-12);
+  border-radius: var(--radius-sm);
+  background: var(--surface-elevated);
+  color: var(--text-muted);
+  font-size: var(--font-label);
 }
 #image-preview-retry {
-  margin-top: 14px;
+  margin-top: var(--space-16);
 }
 @media (max-width: 980px) {
   .control-panel > .panel-header {
@@ -366,8 +364,5 @@
   }
   .maintenance-group .button-row button {
     width: 100%;
-  }
-  .image-preview-card {
-    padding: 14px;
   }
 }

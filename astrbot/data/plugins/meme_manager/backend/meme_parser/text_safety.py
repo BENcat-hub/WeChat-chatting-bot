@@ -170,10 +170,26 @@ def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
-def _protected_reference_spans(text: str) -> list[tuple[int, int]]:
+def _protected_reference_spans(
+    text: str, *, protect_inline_code: bool = True
+) -> list[tuple[int, int]]:
+    """Locate references and optionally same-line code examples.
+
+    Args:
+        text: Source text to inspect.
+        protect_inline_code: Include approximate code spans for legacy callers.
+            Stateful scanners handle backtick runs themselves instead.
+
+    Returns:
+        Merged protected source intervals.
+    """
     spans = [
         match.span()
-        for pattern in (_MARKDOWN_LINK_RE, _INLINE_CODE_RE, _URI_RE)
+        for pattern in (
+            (_MARKDOWN_LINK_RE, _INLINE_CODE_RE, _URI_RE)
+            if protect_inline_code
+            else (_MARKDOWN_LINK_RE, _URI_RE)
+        )
         for match in pattern.finditer(text)
     ]
 

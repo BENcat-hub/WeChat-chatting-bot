@@ -1,7 +1,7 @@
-﻿# 一键启动 wechat-ai-stack（顺序：微信 → WeFlow → AstrBot → bridge）
+# 一键启动 wechat-ai-stack（顺序：微信 → WeFlow → AstrBot → bridge）
 #
 # 用法（在任意终端里执行，无需管理员）：
-#     pwsh -File C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack\scripts\start-all.ps1
+#     pwsh -File <REPO_ROOT>\scripts\start-all.ps1
 # 常用变体：
 #     ... start-all.ps1 -FixWeFlowAnchor      # WeFlow 起不来（5031 不监听）时先把 -105 anchor 修一遍
 #     ... start-all.ps1 -SkipWeChat           # 微信已经开着
@@ -39,7 +39,7 @@ $pids = @{}
 $WECHAT_EXE = 'C:\Program Files\Tencent\Weixin\Weixin.exe'
 $WEFLOW_EXE = 'C:\Program Files\WeFlow\WeFlow.exe'          # 6.3.2：组件已到期，仅用于识别/清理
 $WEFLOW_LAUNCHER = Join-Path $PSScriptRoot 'start-weflow50.cmd'
-$WEFLOW50_ROOT = 'C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\weflow-old\WeFlow-main'
+$WEFLOW50_ROOT = '<WEFLOW_ROOT>'
 
 function Test-Port([int]$port) {
     try { return [bool](Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) }
@@ -238,4 +238,4 @@ foreach ($pair in @(@(5031, 'WeFlow 读消息'), @(6185, 'AstrBot 面板'), @(11
     Write-Host ("  {0,-6} {1,-20} {2}" -f $pair[0], $pair[1], $(if ($ok) { '在听' } else { '未监听' })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Yellow' })
 }
 Write-Host '  9877   WeeMessenger         未启动（设计如此：文字/图片走 wxui）' -ForegroundColor DarkGray
-Write-Host "`n下一步：确认微信已扫码登录 → 发消息给鱼宝🐳 验证被动回复/表情包；停止用 stop-all.ps1。" -ForegroundColor Green
+Write-Host "`n下一步：确认微信已扫码登录 → 发消息给用户E 验证被动回复/表情包；停止用 stop-all.ps1。" -ForegroundColor Green

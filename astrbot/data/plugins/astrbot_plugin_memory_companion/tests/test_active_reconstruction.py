@@ -73,7 +73,7 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
             user_id=user_id,
             user_name="小王" if user_id == "u1" else "小李",
             group_id="g1",
-            group_name="测试群",
+            group_name="示例群聊D",
             bot_id="b1",
             message_id=message_id,
             message_text="你还记得我喜欢什么咖啡吗？" if user_id == "u1" else "小王喜欢什么咖啡？",

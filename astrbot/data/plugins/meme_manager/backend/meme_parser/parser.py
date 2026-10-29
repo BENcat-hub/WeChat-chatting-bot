@@ -1,5 +1,6 @@
 """Incremental, source-preserving parsing of meme markers in chat text."""
 
+import copy
 import re
 
 from .context import ContextScanner, is_escaped
@@ -21,7 +22,8 @@ class MemeParser:
         filter_all: Finally strip all marker forms without changing selections.
 
     Notes:
-        Ambiguous Markdown is buffered until a line boundary. Oversized lines
+        Unconfirmed inline code is buffered until it closes or the reply ends.
+        Oversized lines or pending inline spans
         and the remaining response are preserved without interpretation. This is a chat protocol scanner,
         not a complete CommonMark renderer. No network or filesystem IO occurs.
     """
@@ -60,6 +62,11 @@ class MemeParser:
         self._emitted = 0
         self._offset = 0
         self._context = ContextScanner()
+        self._pending_lines: list[str] = []
+        self._pending_size = 0
+        self._pending_context: ContextScanner | None = None
+        self._pending_emitted = 0
+        self._inline_limit = False
         self.diagnostics: list[str] = []
         self._passthrough = False
         self._finished = False
@@ -108,13 +115,35 @@ class MemeParser:
                 self._offset += len(part)
                 continue
             self._line += part
-            if len(self._line) > self.MAX_LINE and not self.filter_all:
-                output.append(self._line[self._emitted :])
-                self._offset += len(self._line)
+            pending_limit = (
+                self._pending_size > 0
+                and self._pending_size + len(self._line) > self.MAX_LINE
+            )
+            if pending_limit and self.filter_all:
+                # Keep final tag filtering active after abandoning inline speculation.
+                self._inline_limit = True
+                self.diagnostics.append("inline_code_limit_exceeded")
+                output.append(self._flush_pending())
+            if (
+                pending_limit or len(self._line) > self.MAX_LINE
+            ) and not self.filter_all:
+                output.append(
+                    "".join(self._pending_lines)[self._pending_emitted :]
+                    + self._line[self._emitted :]
+                )
+                self._offset += self._pending_size + len(self._line)
+                self._pending_lines.clear()
+                self._pending_size = 0
+                self._pending_context = None
+                self._pending_emitted = 0
                 self._line = ""
                 self._emitted = 0
                 self._passthrough = True
-                self.diagnostics.append("line_limit_exceeded")
+                self.diagnostics.append(
+                    "inline_code_limit_exceeded"
+                    if pending_limit
+                    else "line_limit_exceeded"
+                )
                 continue
             if complete:
                 output.append(self._consume_line())
@@ -157,17 +186,101 @@ class MemeParser:
         if self._finished:
             return ""
         self._finished = True
-        return self._consume_line() if self._line else ""
+        if self._line:
+            if not self._pending_lines:
+                self._pending_context = copy.deepcopy(self._context)
+                self._pending_emitted = self._emitted
+            self._pending_lines.append(self._line)
+            self._line = ""
+            self._emitted = 0
+        return self._flush_pending(final=not self._inline_limit)
 
-    def _consume_line(self) -> str:
+    def _flush_pending(self, *, final: bool = False) -> str:
+        """Replay deferred lines once code protection can be resolved safely.
+
+        Args:
+            final: Treat runs without a later equal-length run as literal text.
+
+        Returns:
+            Resolved text that has not already been emitted.
+        """
+        if not self._pending_lines:
+            return ""
+        lines = self._pending_lines
+        emitted = self._pending_emitted
+        assert self._pending_context is not None
+        self._context = self._pending_context
+        self._pending_lines = []
+        self._pending_size = 0
+        self._pending_context = None
+        self._pending_emitted = 0
+        literal_ticks = set()
+        if final:
+            text = "".join(lines)
+            runs = list(ContextScanner._ticks.finditer(text))
+            last_ticks = {len(match[0]): match.start() for match in runs}
+            literal_ticks.update(last_ticks.values())
+            for match in runs:
+                # Outside code, an escape consumes only the first tick of a run.
+                # Closers inside code must still match a complete raw run.
+                if (
+                    len(match[0]) > 1
+                    and is_escaped(text, match.start())
+                    and last_ticks.get(len(match[0]) - 1, -1) < match.start() + 1
+                ):
+                    literal_ticks.add(match.start() + 1)
+        trailing_line, trailing_emitted = self._line, self._emitted
+        output = []
+        offset = 0
+        positions = iter(sorted(literal_ticks))
+        position = next(positions, None)
+        for line in lines:
+            line_ticks = set()
+            while position is not None and position < offset + len(line):
+                line_ticks.add(position - offset)
+                position = next(positions, None)
+            self._line, self._emitted = line, emitted
+            if self._passthrough:
+                output.append(line[emitted:])
+                self._offset += len(line)
+            else:
+                output.append(self._consume_line(literal_ticks=line_ticks))
+            offset += len(line)
+            emitted = 0
+        self._line, self._emitted = trailing_line, trailing_emitted
+        return "".join(output)
+
+    def _consume_line(self, *, literal_ticks: set[int] | None = None) -> str:
         """Resolve one bounded line and update cross-line protection state.
+
+        Args:
+            literal_ticks: Known literal backtick positions when replaying a
+                resolved block. None allows unfinished inline code to be deferred.
 
         Returns:
             The un-emitted part of the line after recognized marker edits.
         """
         line = self._line
+        checkpoint = (
+            copy.deepcopy(self._context)
+            if literal_ticks is None and not self._pending_lines and "`" in line
+            else None
+        )
         continued_context = self._context.active
-        protected = self._context.scan(line)
+        protected = self._context.scan(line, literal_ticks=literal_ticks)
+        if (
+            literal_ticks is None
+            and not self._inline_limit
+            and (self._pending_lines or self._context.ticks)
+        ):
+            if not self._pending_lines:
+                self._pending_context = checkpoint
+                self._pending_emitted = self._emitted
+            self._pending_lines.append(line)
+            self._pending_size += len(line)
+            self._line = ""
+            self._emitted = 0
+            return self._flush_pending() if not self._context.ticks else ""
         if self._context.overflow and not self.filter_all:
             self._passthrough = True
             self.diagnostics.append("context_limit_exceeded")

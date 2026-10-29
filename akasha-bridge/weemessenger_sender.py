@@ -124,6 +124,15 @@ class WeMessengerSender(BaseSender):  # type: ignore[misc]
         self._settle()
         return ok
 
+    def send_file(self, contact: str, file_path: str) -> bool:
+        """WeeMessenger 通道没有「发文件」指令（只有文本/语音/表情包），这里明确拒绝。
+
+        发文件请用 sender_backend=wxui：scripts/wxui.py 的 send-file 会把文件放到剪贴板
+        再 Ctrl+V，微信落成 appmsg 文件卡片并能回读验证。
+        """
+        log.error("[WeMessenger] 该通道不支持发送文件: %s（请改用 sender_backend=wxui）", file_path)
+        return False
+
     def send_sticker(self, contact: str, gif_path: str) -> bool:
         """通过 WeeMessenger 表情包通道发送 GIF（base64 内联）。"""
         if not gif_path or not os.path.exists(gif_path):

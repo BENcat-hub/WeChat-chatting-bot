@@ -365,6 +365,42 @@ def foreground_info():
     return hwnd, title, cls.value
 
 
+WS_CAPTION = 0x00C00000      # 有标题栏的窗口不可能是独占全屏
+_GWL_STYLE = -16
+_SM_XVIRTUALSCREEN, _SM_YVIRTUALSCREEN, _SM_CXVIRTUALSCREEN, _SM_CYVIRTUALSCREEN = 76, 77, 78, 79
+_SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "SysShadow"}
+
+
+def fullscreen_app(exclude=()):
+    """(hwnd, title) of the borderless-fullscreen window that owns the desktop, else (0, "").
+
+    2026-10-24：用户开《三角洲行动》（无边框全屏，rect 正好等于屏幕、无 WS_CAPTION）时，
+    ForegroundWindow 永远是游戏，`focus()` 一次都抢不到前台、截图也只是游戏画面。以前
+    这种状态只表现为「could not bring WeChat to the foreground」，一等 60 秒照样失败，
+    重发队列还把每条消息都算成一次失败 → 打游戏期间聊天全是丢消息。把它显式认出来，
+    调用方就能「等桌面空出来再发」而不是消耗重试次数。
+    """
+    hwnd, title, cls = foreground_info()
+    if not hwnd or cls in _SHELL_CLASSES or hwnd in exclude:
+        return 0, ""
+    try:
+        if user32.GetWindowLongW(hwnd, _GWL_STYLE) & WS_CAPTION:
+            return 0, ""
+        rect = wt.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return 0, ""
+        vx = user32.GetSystemMetrics(_SM_XVIRTUALSCREEN)
+        vy = user32.GetSystemMetrics(_SM_YVIRTUALSCREEN)
+        vw = user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN)
+        vh = user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN)
+        if not (rect.left <= vx and rect.top <= vy
+                and rect.right >= vx + vw and rect.bottom >= vy + vh):
+            return 0, ""
+    except Exception:
+        return 0, ""
+    return hwnd, title or cls
+
+
 if __name__ == "__main__":
     # tiny self-check: grab the whole screen and report sizes/timings
     out = os.path.join(os.environ.get("TEMP") or ".", "winio-selfcheck.png")
@@ -374,43 +410,109 @@ if __name__ == "__main__":
     print("grab %dx%d in %.0f ms -> %s" % (w, h, (time.perf_counter() - t0) * 1000, out))
     print("idle=%.2fs human_busy=%s" % (_idle_seconds(), human_busy()))
 
-def close_detached_chat(title=None, main_title="微信"):
+def list_wechat_chat_windows(main_title="微信"):
+    """列出微信除主窗口以外的窗口（悬浮会话窗/工具窗），供诊断与清理报告。"""
+    rows = []
+    try:
+        u = ctypes.windll.user32
+    except Exception:
+        return rows
+    CB = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+
+    def _cb(hwnd, lparam):
+        try:
+            cls = ctypes.create_unicode_buffer(256)
+            u.GetClassNameW(hwnd, cls, 256)
+            if not cls.value.startswith("Qt51514"):
+                return True
+            n = u.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            u.GetWindowTextW(hwnd, buf, n + 1)
+            name = (buf.value or "").strip()
+            if not name or name == main_title:
+                return True
+            r = ctypes.wintypes.RECT()
+            u.GetWindowRect(hwnd, ctypes.byref(r))
+            rows.append({"hwnd": int(hwnd), "title": name, "class": cls.value,
+                         "visible": bool(u.IsWindowVisible(hwnd)),
+                         "rect": [r.left, r.top, r.right, r.bottom]})
+        except Exception:
+            pass
+        return True
+
+    u.EnumWindows(CB(_cb), 0)
+    return rows
+
+
+def close_detached_chat(title=None, main_title="微信", force=True):
     """关掉微信「独立会话窗口」。
 
     微信 4.x 里双击 / 拖拽会话行会把它弹成一个独立窗口（ClassName 同为
     Qt51514QWindowIcon，标题是联系人名）。这种窗口会让定位与打字落到错误的
-    窗口上，所以在定位前把「标题等于目标」的那类窗口关掉；title=None 时关掉
-    除主窗口以外的全部微信会话窗口。
+    窗口上，而且用户反馈「关也关不掉，只能退出微信」。
+
+    2026-10-27：force=True 时如果 WM_CLOSE 被无视，就再发 SC_CLOSE，最后
+    ShowWindow(SW_HIDE) + 挪到屏幕外（WeChat 某些悬浮会话窗是工具窗口，
+    只认隐藏，不认关闭）。
     """
     closed = []
     try:
         u = ctypes.windll.user32
+        runtimes = ctypes.windll.user32
     except Exception:
         return closed
     EnumWindows = u.EnumWindows
     CB = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    targets = []
 
     def _cb(hwnd, lparam):
-        if not u.IsWindowVisible(hwnd):
-            return True
-        name_len = u.GetWindowTextLengthW(hwnd)
-        buf = ctypes.create_unicode_buffer(name_len + 1)
-        u.GetWindowTextW(hwnd, buf, name_len + 1)
-        cls = ctypes.create_unicode_buffer(256)
-        u.GetClassNameW(hwnd, cls, 256)
-        if not cls.value.startswith("Qt51514"):
-            return True
-        name = (buf.value or "").strip()
-        if not name or name == main_title:
-            return True
-        if title is not None:
-            if name != str(title).strip():
+        try:
+            if not u.IsWindowVisible(hwnd):
                 return True
-        u.PostMessageW(hwnd, 0x0010, 0, 0)      # WM_CLOSE
-        closed.append(name)
+            name_len = u.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(name_len + 1)
+            u.GetWindowTextW(hwnd, buf, name_len + 1)
+            cls = ctypes.create_unicode_buffer(256)
+            u.GetClassNameW(hwnd, cls, 256)
+            if not cls.value.startswith("Qt51514"):
+                return True
+            if "TrayIcon" in cls.value:
+                return True
+            name = (buf.value or "").strip()
+            if not name or name == main_title:
+                return True
+            if title is not None and name != str(title).strip():
+                return True
+            targets.append((hwnd, name))
+        except Exception:
+            pass
         return True
 
     EnumWindows(CB(_cb), 0)
+    for hwnd, name in targets:
+        try:
+            u.PostMessageW(hwnd, 0x0010, 0, 0)          # WM_CLOSE
+            time.sleep(0.20)
+            if not u.IsWindow(hwnd) or not u.IsWindowVisible(hwnd):
+                closed.append(name)
+                continue
+            if force:
+                u.PostMessageW(hwnd, 0x0112, 0xF060, 0)  # WM_SYSCOMMAND / SC_CLOSE
+                time.sleep(0.20)
+            if not u.IsWindow(hwnd) or not u.IsWindowVisible(hwnd):
+                closed.append(name)
+                continue
+            if force:
+                r = ctypes.wintypes.RECT()
+                u.GetWindowRect(hwnd, ctypes.byref(r))
+                wpx, hpx = max(200, r.right - r.left), max(200, r.bottom - r.top)
+                u.ShowWindow(hwnd, 0)                    # SW_HIDE
+                u.SetWindowPos(hwnd, 0, -20000, -20000, wpx, hpx, 0x0014)  # NOZORDER|NOACTIVATE
+                closed.append(name + "（已强制隐藏）")
+            else:
+                closed.append(name + "（关闭失败）")
+        except Exception:
+            continue
     return closed
 
 

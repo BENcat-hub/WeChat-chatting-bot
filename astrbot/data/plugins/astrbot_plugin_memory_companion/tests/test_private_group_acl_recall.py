@@ -81,7 +81,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             user_id=user_id,
             user_name="小王" if user_id == "u1" else "小李",
             group_id="g1",
-            group_name="测试群",
+            group_name="示例群聊D",
             bot_id=bot_id,
             message_text=message_text,
         )
@@ -627,7 +627,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
                 id="all-slots-stable",
                 memory_type="timeline_event",
                 subject=EntityRef(kind="user", id="u1", name="小王"),
-                object=EntityRef(kind="group", id="g1", name="测试群"),
+                object=EntityRef(kind="group", id="g1", name="示例群聊D"),
                 scope="group",
                 session_id="qq:GroupMessage:g1",
                 platform="qq",

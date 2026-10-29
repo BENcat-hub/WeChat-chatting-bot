@@ -36,20 +36,16 @@ async def test_search_memes_requires_metadata_and_complete_index(monkeypatch):
     assert result["reason"] == "资源包没有语义元数据"
 
     monkeypatch.setattr(query, "load_metadata", lambda pack_dir: {"images": {"a": {}}})
-    monkeypatch.setattr(
-        query, "semantic_metadata_is_complete", lambda *args, **kwargs: False
-    )
+    monkeypatch.setattr(query, "index_is_ready", lambda *args, **kwargs: False)
     result = await query.search_memes("pack", "data", "pack-id", "cat", object())
-    assert "尚未完成100%语义化" in result["reason"]
+    assert "没有可用的语义向量索引" in result["reason"]
 
 
 @pytest.mark.asyncio
 async def test_search_memes_strips_internal_candidate_fields(monkeypatch):
     metadata = {"images": {ENTRY_ID: {"caption": "猫"}}}
     monkeypatch.setattr(query, "load_metadata", lambda pack_dir: metadata)
-    monkeypatch.setattr(
-        query, "semantic_metadata_is_complete", lambda *args, **kwargs: True
-    )
+    monkeypatch.setattr(query, "index_is_ready", lambda *args, **kwargs: True)
     search_index = AsyncMock(
         return_value=[
             {
@@ -78,15 +74,17 @@ async def test_search_memes_strips_internal_candidate_fields(monkeypatch):
         "candidates": [{"id": "meme:123456789abc", "caption": "猫"}],
         "max_selectable": 1,
     }
-    assert search_index.await_args.kwargs == {"top_k": 3, "min_score": 0.5}
+    assert search_index.await_args.kwargs == {
+        "top_k": 3,
+        "min_score": 0.5,
+        "pack_dir": "pack",
+    }
 
 
 @pytest.mark.asyncio
 async def test_search_memes_reports_no_matches(monkeypatch):
     monkeypatch.setattr(query, "load_metadata", lambda pack_dir: {"images": {"a": {}}})
-    monkeypatch.setattr(
-        query, "semantic_metadata_is_complete", lambda *args, **kwargs: True
-    )
+    monkeypatch.setattr(query, "index_is_ready", lambda *args, **kwargs: True)
     monkeypatch.setattr(query, "search_index", AsyncMock(return_value=[]))
     result = await query.search_memes("pack", "data", "pack-id", "cat", object())
     assert result["reason"] == "没有找到足够匹配的表情包"

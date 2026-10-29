@@ -1388,15 +1388,14 @@ def build_daily_plan_prompt_section(
                 key="background.schedule.daily_plan.hard_constraints",
                 title="A｜硬约束",
                 source="planning",
-                content=f"""当前时间：{now}
-    Bot 名字：{runtime_persona_setting(plugin, 'bot_name', '小星')}
+                content=f"""Bot 名字：{runtime_persona_setting(plugin, 'bot_name', '小星')}
     目标时间点数量：{_safe_int(runtime_persona_setting(plugin, 'daily_plan_item_count', 10), 10, 1)}
-
-日期与当天性质：
-{calendar_context}
 
 角色身份、生活背景与世界观：
 {identity_context}
+
+日期与当天性质：
+{calendar_context}
 
 用户今天明确造成的有效日程偏移：
 {schedule_adjustments}""".strip(),
@@ -1540,6 +1539,9 @@ Bot 自身连续记忆：
 {continuity_block}
 
 {inspiration_block}
+
+请求时间戳（只用于判断昼夜、作息节奏和今天已经过到几点，不要写进任何输出字段）：
+{now}
 """.strip()
     )
 

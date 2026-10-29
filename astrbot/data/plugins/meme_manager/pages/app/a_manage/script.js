@@ -29,6 +29,7 @@ async function initApp() {
         "meme_image_data",
         "meme_image_semantic",
         "semantic/reviews",
+        "sync/status",
         "img_host/sync/status",
         "img_host/sync/task_status",
       ].includes(endpoint)
@@ -50,13 +51,12 @@ async function initApp() {
     ).trim();
     if (
       selectedPackId &&
-      defaultManagePackId &&
-      selectedPackId !== defaultManagePackId &&
-      ["emoji/", "category/"].some((prefix) => endpoint.startsWith(prefix))
+      ["emoji/", "category/", "sync/"].some((prefix) =>
+        endpoint.startsWith(prefix),
+      )
     ) {
-      throw new Error(
-        "当前为管理视图模式，仅支持浏览。请切回默认管理包后再执行编辑操作。",
-      );
+      // 写接口按当前管理的表情包定位目标目录，避免误改默认包。
+      mergedBody.managed_pack_id = selectedPackId;
     }
     if (selectedPackId && endpoint.startsWith("img_host/sync/")) {
       mergedBody.managed_pack_id = selectedPackId;
@@ -724,6 +724,9 @@ async function initApp() {
   const packVectorStatusText = document.getElementById(
     "pack-vector-status-text",
   );
+  const incrementPackVectorsBtn = document.getElementById(
+    "increment-pack-vectors-btn",
+  );
   const rebuildPackVectorsBtn = document.getElementById(
     "rebuild-pack-vectors-btn",
   );
@@ -774,12 +777,17 @@ async function initApp() {
     "pack-import-confirm-btn",
   );
   const packImportResult = document.getElementById("pack-import-result");
-  let defaultManagePackId = "";
   let activeManagePackId = "";
   let managePacksById = new Map();
   let pendingPackImportToken = "";
   let exportCapabilityRequestId = 0;
+  let exportCapabilityPackId = "";
+  let exportDownloadInFlight = false;
   let managePackVectorStatusRequestId = 0;
+  let managePackSummaryRequestId = 0;
+  let managePageActive = true;
+  let vectorStatusPollInFlight = false;
+  const vectorOperations = new Set();
   let latestManagePackVectorStatus = null;
   let latestManagePackVectorStatusId = "";
   let confirmResolver = null;
@@ -932,7 +940,7 @@ async function initApp() {
       option?.classList.toggle("selected", input.checked);
       option?.classList.toggle("disabled", input.disabled);
     });
-    if (exportPackDownloadBtn) {
+    if (exportPackDownloadBtn && !exportDownloadInFlight) {
       exportPackDownloadBtn.innerHTML =
         selectedExportMode() === "backup"
           ? '<i class="fas fa-download icon"></i>下载自用备份'
@@ -942,8 +950,21 @@ async function initApp() {
 
   async function refreshPackExportCapability(packId = activeManagePackId) {
     const normalizedPackId = String(packId || "").trim();
+    if (
+      !managePageActive ||
+      exportDownloadInFlight ||
+      normalizedPackId !== String(activeManagePackId || "").trim()
+    ) {
+      return;
+    }
     const requestId = ++exportCapabilityRequestId;
     const pack = managePacksById.get(normalizedPackId);
+    const samePack = normalizedPackId === exportCapabilityPackId;
+    const isCurrentRequest = () =>
+      requestId === exportCapabilityRequestId &&
+      !exportDownloadInFlight &&
+      managePageActive &&
+      normalizedPackId === String(activeManagePackId || "").trim();
     if (transferCurrentPack) {
       transferCurrentPack.textContent = pack
         ? `当前：${pack.name || pack.id}（${Number(pack.image_count || 0)} 张）`
@@ -952,6 +973,7 @@ async function initApp() {
           : "暂无可导出的表情包";
     }
     if (!normalizedPackId) {
+      exportCapabilityPackId = "";
       if (exportPackDownloadBtn) exportPackDownloadBtn.disabled = true;
       if (exportModeBackup) exportModeBackup.disabled = true;
       if (vectorBackupHint)
@@ -960,14 +982,16 @@ async function initApp() {
       return;
     }
 
-    if (exportPackDownloadBtn) exportPackDownloadBtn.disabled = false;
-    if (exportModeBackup) {
-      if (exportModeBackup.checked) {
-        const shareInput = document.getElementById("export-mode-share");
-        if (shareInput) shareInput.checked = true;
-      }
-      exportModeBackup.disabled = true;
+    if (!samePack) {
+      // A backup selection belongs to one pack; reset new packs to share.
+      exportCapabilityPackId = normalizedPackId;
+      const shareInput = document.getElementById("export-mode-share");
+      if (shareInput) shareInput.checked = true;
     }
+    // Capability is unknown while loading: block backup and its download path.
+    if (exportModeBackup) exportModeBackup.disabled = true;
+    if (exportPackDownloadBtn)
+      exportPackDownloadBtn.disabled = Boolean(exportModeBackup?.checked);
     if (vectorBackupHint)
       vectorBackupHint.textContent = "正在检查当前表情包的向量状态…";
     updateExportModeAppearance();
@@ -975,7 +999,7 @@ async function initApp() {
       const status = await apiGet("packs/export/status", {
         pack_id: normalizedPackId,
       });
-      if (requestId !== exportCapabilityRequestId) {
+      if (!isCurrentRequest()) {
         return;
       }
       const available = Boolean(status?.vector_backup_available);
@@ -984,6 +1008,7 @@ async function initApp() {
         const shareInput = document.getElementById("export-mode-share");
         if (shareInput) shareInput.checked = true;
       }
+      if (exportPackDownloadBtn) exportPackDownloadBtn.disabled = false;
       if (vectorBackupHint) {
         const modelHint = [
           String(status?.embedding_model || "").trim(),
@@ -1000,27 +1025,37 @@ async function initApp() {
           : "当前没有完整向量；完成语义化并建立索引后才可导出。";
       }
     } catch (error) {
-      if (requestId !== exportCapabilityRequestId) {
+      if (!isCurrentRequest()) {
         return;
       }
       if (exportModeBackup) exportModeBackup.disabled = true;
+      const shareInput = document.getElementById("export-mode-share");
+      if (shareInput) shareInput.checked = true;
+      if (exportPackDownloadBtn) exportPackDownloadBtn.disabled = false;
       if (vectorBackupHint) {
         vectorBackupHint.textContent = "暂时无法读取向量状态，请稍后重试。";
       }
     } finally {
-      if (requestId === exportCapabilityRequestId) {
+      if (isCurrentRequest()) {
         updateExportModeAppearance();
       }
     }
   }
 
   async function downloadCurrentPack() {
+    if (exportDownloadInFlight) return;
     const packId = String(activeManagePackId || "").trim();
     if (!packId) {
       showToast("当前没有可导出的表情包。", "warning", "无法导出");
       return;
     }
     const mode = selectedExportMode();
+    if (mode === "backup" && exportModeBackup?.disabled) {
+      showToast("当前表情包暂无可用向量备份。", "warning", "无法导出");
+      return;
+    }
+    exportDownloadInFlight = true;
+    exportCapabilityRequestId += 1;
     setButtonBusy(exportPackDownloadBtn, "正在生成压缩包…");
     setPackTransferResult(
       exportPackResult,
@@ -1047,8 +1082,10 @@ async function initApp() {
       );
       showToast(error?.message || String(error), "error", "导出失败");
     } finally {
+      exportDownloadInFlight = false;
       restoreButton(exportPackDownloadBtn);
       updateExportModeAppearance();
+      await refreshPackExportCapability(activeManagePackId);
     }
   }
 
@@ -1060,6 +1097,7 @@ async function initApp() {
   function hideManagePackVectorStatus() {
     packVectorStatus?.classList.add("hidden");
     rebuildPackVectorsBtn?.classList.add("hidden");
+    incrementPackVectorsBtn?.classList.add("hidden");
     latestManagePackVectorStatus = null;
     latestManagePackVectorStatusId = "";
   }
@@ -1080,6 +1118,16 @@ async function initApp() {
       "vector-loading",
     );
     rebuildPackVectorsBtn?.classList.remove("hidden");
+    incrementPackVectorsBtn?.classList.remove("hidden");
+    if (incrementPackVectorsBtn) {
+      incrementPackVectorsBtn.disabled =
+        state !== "ready" ||
+        !status?.embedding_provider_ready ||
+        vectorOperations.has(normalizedPackId) ||
+        ["running", "paused"].includes(String(status?.task_status || ""));
+      incrementPackVectorsBtn.title =
+        "复用有效向量，仅处理已完成描述的新增或变化图片；模型或维度变化时需要重建。";
+    }
 
     if (state === "loading") {
       packVectorStatus?.classList.add("vector-loading");
@@ -1119,7 +1167,9 @@ async function initApp() {
     );
     const indexDimension = Number(status.index_embedding_dimension || 0);
     const taskStatus = String(status.task_status || "idle");
-    const taskBusy = ["running", "paused"].includes(taskStatus);
+    const taskBusy =
+      vectorOperations.has(normalizedPackId) ||
+      ["running", "paused"].includes(taskStatus);
     const currentDimensionLabel = configuredDimension
       ? `${configuredDimension} 维`
       : "维度待检测";
@@ -1195,40 +1245,55 @@ async function initApp() {
       rebuildPackVectorsBtn.title = taskBusy
         ? "语义任务进行中，结束后才能重建向量。"
         : !captionComplete
-          ? "请先完成当前包的全部语义描述。"
-          : "使用当前向量模型重新建立本机向量索引。";
+        ? "请先完成当前包的全部语义描述。"
+        : "使用当前向量模型重新建立本机向量索引。";
       rebuildPackVectorsBtn.innerHTML = taskBusy
         ? '<i class="fas fa-spinner fa-spin icon"></i>正在处理'
         : !captionComplete
-          ? '<i class="fas fa-clock icon"></i>等待语义描述'
-          : `<i class="fas fa-arrows-rotate icon"></i>按${
-              configuredDimension ? ` ${configuredDimension} 维` : "当前维度"
-            }重建`;
+        ? '<i class="fas fa-clock icon"></i>等待语义描述'
+        : `<i class="fas fa-arrows-rotate icon"></i>按${
+            configuredDimension ? ` ${configuredDimension} 维` : "当前维度"
+          }重建`;
     }
   }
 
   async function refreshManagePackVectorStatus(packId = activeManagePackId) {
     const normalizedPackId = String(packId || "").trim();
-    const requestId = ++managePackVectorStatusRequestId;
+    if (!managePageActive) return null;
+    const updateCurrentPack = normalizedPackId === activeManagePackId;
+    const requestId = updateCurrentPack
+      ? ++managePackVectorStatusRequestId
+      : null;
     if (!normalizedPackId || !packSupportsVectorStatus(normalizedPackId)) {
-      hideManagePackVectorStatus();
+      if (updateCurrentPack) hideManagePackVectorStatus();
       return null;
     }
 
-    renderManagePackVectorStatus(normalizedPackId, null, "loading");
+    if (updateCurrentPack) {
+      renderManagePackVectorStatus(normalizedPackId, null, "loading");
+    }
     try {
       const status = await apiGet("semantic/status", {
         pack_id: normalizedPackId,
       });
-      if (requestId !== managePackVectorStatusRequestId) {
-        return null;
+      if (
+        managePageActive &&
+        updateCurrentPack &&
+        normalizedPackId === activeManagePackId &&
+        requestId === managePackVectorStatusRequestId
+      ) {
+        latestManagePackVectorStatus = status;
+        latestManagePackVectorStatusId = normalizedPackId;
+        renderManagePackVectorStatus(normalizedPackId, status);
       }
-      latestManagePackVectorStatus = status;
-      latestManagePackVectorStatusId = normalizedPackId;
-      renderManagePackVectorStatus(normalizedPackId, status);
       return status;
     } catch (error) {
-      if (requestId === managePackVectorStatusRequestId) {
+      if (
+        managePageActive &&
+        updateCurrentPack &&
+        normalizedPackId === activeManagePackId &&
+        requestId === managePackVectorStatusRequestId
+      ) {
         latestManagePackVectorStatus = null;
         latestManagePackVectorStatusId = "";
         renderManagePackVectorStatus(normalizedPackId, null, "error");
@@ -1238,7 +1303,11 @@ async function initApp() {
     }
   }
 
-  async function performVectorRebuild(packId, knownStatus = null) {
+  async function performVectorRebuild(
+    packId,
+    knownStatus = null,
+    incremental = false,
+  ) {
     const normalizedPackId = String(packId || "").trim();
     if (!normalizedPackId || !packSupportsVectorStatus(normalizedPackId)) {
       showToast("旧版表情包不支持向量重建。", "warning", "无法重建");
@@ -1262,7 +1331,7 @@ async function initApp() {
       );
       return false;
     }
-    if (!status.semantic_caption_complete) {
+    if (!incremental && !status.semantic_caption_complete) {
       showToast("请先完成当前包的全部语义描述。", "warning", "暂不能重建");
       return false;
     }
@@ -1270,23 +1339,46 @@ async function initApp() {
       showToast("当前语义任务尚未结束。", "warning", "暂不能重建");
       return false;
     }
+    if (vectorOperations.has(normalizedPackId)) return false;
+    vectorOperations.add(normalizedPackId);
 
-    setButtonBusy(rebuildPackVectorsBtn, "正在重建…");
+    const button = incremental
+      ? incrementPackVectorsBtn
+      : rebuildPackVectorsBtn;
+    setButtonBusy(button, incremental ? "正在增量处理…" : "正在重建…");
+    if (incrementPackVectorsBtn) incrementPackVectorsBtn.disabled = true;
+    if (rebuildPackVectorsBtn) rebuildPackVectorsBtn.disabled = true;
     try {
-      showToast("正在按当前向量模型建立索引…", "info", "开始重建");
+      showToast(
+        incremental ? "正在增量更新向量索引…" : "正在按当前向量模型建立索引…",
+        "info",
+        incremental ? "增量处理" : "开始重建",
+      );
       const result = await apiPost("semantic/rebuild-index", {
         pack_id: normalizedPackId,
-        force: true,
+        force: !incremental,
       });
       await refreshManagePackSummaries();
-      showToast(result?.message || "向量索引已建立。", "success", "重建完成");
+      showToast(
+        result?.message || "向量索引已建立。",
+        "success",
+        incremental ? "增量处理完成" : "重建完成",
+      );
       return true;
     } catch (error) {
-      showToast(error?.message || String(error), "error", "向量重建失败", 5000);
+      showToast(
+        error?.message || String(error),
+        "error",
+        incremental ? "增量处理失败" : "向量重建失败",
+        5000,
+      );
       return false;
     } finally {
-      restoreButton(rebuildPackVectorsBtn);
-      await refreshManagePackVectorStatus(normalizedPackId);
+      vectorOperations.delete(normalizedPackId);
+      if (managePageActive && normalizedPackId === activeManagePackId) {
+        restoreButton(button);
+        await refreshManagePackVectorStatus(normalizedPackId);
+      }
     }
   }
 
@@ -1407,7 +1499,7 @@ async function initApp() {
     }
     if (packImportVectorState) {
       packImportVectorState.textContent = data?.vectors_present
-        ? "包含，将校验"
+        ? "包含，导入后需在本机重建"
         : "不包含";
     }
     const warnings = Array.isArray(data?.warnings) ? data.warnings : [];
@@ -1437,10 +1529,13 @@ async function initApp() {
     packImportDropzone?.classList.add("checking");
     setPackTransferResult(packImportResult, "正在检查压缩包结构和兼容性…", "");
     try {
-      const data = await window.AstrBotPluginPage.upload(
-        "packs/import/stage",
-        file,
-      );
+      const data = await window.MemeUI.uploadPackArchiveInChunks(file, {
+        onProgress: (received, total) => {
+          if (packImportFileLabel) {
+            packImportFileLabel.textContent = `正在上传 ${file.name}（${received}/${total}）…`;
+          }
+        },
+      });
       pendingPackImportToken = String(data?.import_token || "").trim();
       if (!pendingPackImportToken) {
         throw new Error("服务器没有返回导入凭证");
@@ -1586,8 +1681,12 @@ async function initApp() {
   }
 
   async function refreshManagePackSummaries() {
+    const requestId = ++managePackSummaryRequestId;
     try {
       const response = await apiGet("packs");
+      if (requestId !== managePackSummaryRequestId || !managePageActive) {
+        return [];
+      }
       const packs = Array.isArray(response?.packs) ? response.packs : [];
       managePacksById = new Map(
         packs.map((pack) => [String(pack?.id || "").trim(), pack]),
@@ -1599,9 +1698,10 @@ async function initApp() {
         }
       });
       updateManagePackSemanticAppearance(activeManagePackId);
+      const selectedPackId = activeManagePackId;
       await Promise.all([
-        refreshPackExportCapability(activeManagePackId),
-        refreshManagePackVectorStatus(activeManagePackId),
+        refreshPackExportCapability(selectedPackId),
+        refreshManagePackVectorStatus(selectedPackId),
       ]);
       return packs;
     } catch (error) {
@@ -1692,7 +1792,6 @@ async function initApp() {
       }
 
       let selectedPackId = "";
-      defaultManagePackId = "";
       packs.forEach((pack) => {
         const option = document.createElement("option");
         option.value = String(pack.id || "").trim();
@@ -1700,15 +1799,9 @@ async function initApp() {
         if (!selectedPackId) {
           selectedPackId = option.value;
         }
-        if (!defaultManagePackId && pack?.is_default) {
-          defaultManagePackId = option.value;
-        }
         managePackSelect.appendChild(option);
       });
 
-      if (!defaultManagePackId) {
-        defaultManagePackId = selectedPackId;
-      }
       managePackSelect.add(new Option("＋ 创建新表情包…", "__create__"));
 
       managePackSelect.disabled = false;
@@ -3845,10 +3938,6 @@ async function initApp() {
     if (
       moveBusy ||
       event.isPrimary === false ||
-      (event.pointerType === "mouse" &&
-        activeManagePackId &&
-        defaultManagePackId &&
-        activeManagePackId !== defaultManagePackId) ||
       (event.pointerType === "mouse" && event.button !== 0) ||
       event.target.closest(".delete-btn")
     ) {
@@ -4028,7 +4117,9 @@ async function initApp() {
         return;
       }
 
-      const state = uploadStateByCategory.get(uploadBlock.dataset.category);
+      const state = uploadStateByCategory.get(
+        `${activeManagePackId}::${uploadBlock.dataset.category}`,
+      );
 
       if (!state) {
         uploadBlock.classList.remove("uploading");
@@ -4077,10 +4168,12 @@ async function initApp() {
   }
 
   function isCategoryUploading(category) {
-    return uploadStateByCategory.has(category);
+    return uploadStateByCategory.has(`${activeManagePackId}::${category}`);
   }
 
   async function uploadFilesToCategory(category, fileList) {
+    const packId = activeManagePackId;
+    const uploadKey = `${packId}::${category}`;
     const { validFiles, invalidCount } = normalizeUploadFiles(fileList);
 
     if (invalidCount > 0) {
@@ -4126,7 +4219,7 @@ async function initApp() {
       currentFileName: uniqueFiles[0]?.name || "",
       refreshing: false,
     };
-    uploadStateByCategory.set(category, uploadState);
+    uploadStateByCategory.set(uploadKey, uploadState);
     refreshUploadDropzones(category);
 
     showToast(
@@ -4146,7 +4239,7 @@ async function initApp() {
       refreshUploadDropzones(category);
 
       try {
-        await uploadEmoji(category, file);
+        await uploadEmoji(category, file, packId);
         uploadState.completed += 1;
       } catch (error) {
         if (error.code === "duplicate_emoji" || error.status === 409) {
@@ -4161,14 +4254,14 @@ async function initApp() {
       refreshUploadDropzones(category);
     }
 
-    if (uploadState.completed > 0) {
+    if (uploadState.completed > 0 && activeManagePackId === packId) {
       uploadState.refreshing = true;
       uploadState.currentFileName = "";
       refreshUploadDropzones(category);
       await refreshUi({ emojis: true });
     }
 
-    uploadStateByCategory.delete(category);
+    uploadStateByCategory.delete(uploadKey);
     refreshUploadDropzones(category);
 
     if (uploadState.failed === 0 && uploadState.duplicates === 0) {
@@ -4528,11 +4621,8 @@ async function initApp() {
   async function moveEmojiItemsToCategory(targetCategory, items, undo = false) {
     if (moveBusy) return;
     const packId = activeManagePackId;
-    if (
-      (packId && defaultManagePackId && packId !== defaultManagePackId) ||
-      (undo && lastMove?.packId !== packId)
-    ) {
-      showToast("请切回执行移动时的默认管理包。", "warning", "无法移动");
+    if (undo && lastMove?.packId !== packId) {
+      showToast("请切回执行移动时的表情包后再撤销。", "warning", "无法移动");
       return;
     }
     if (!targetCategory) {
@@ -4570,7 +4660,7 @@ async function initApp() {
     try {
       for (const [sourceCategory, imageFiles] of groupedItems.entries()) {
         try {
-          if (activeManagePackId !== packId || defaultManagePackId !== packId)
+          if (activeManagePackId !== packId)
             throw new Error("管理包已变化，请重新加载后操作");
           const data = await apiPost("emoji/batch_move", {
             source_category: undo ? targetCategory : sourceCategory,
@@ -5399,10 +5489,6 @@ async function initApp() {
   function updateSelectionToolbar() {
     const selectedCount = selectionState.items.size;
     const availableMoveTargets = getAvailableMoveTargets();
-    const readOnlyPack =
-      activeManagePackId &&
-      defaultManagePackId &&
-      activeManagePackId !== defaultManagePackId;
 
     selectionDock.classList.toggle("hidden", !selectionState.enabled);
     document.body.classList.toggle(
@@ -5411,12 +5497,9 @@ async function initApp() {
     );
     selectionDockSummary.textContent = `已选 ${selectedCount} 张`;
     selectionDockMove.disabled =
-      moveBusy ||
-      readOnlyPack ||
-      !selectedCount ||
-      !availableMoveTargets.length;
+      moveBusy || !selectedCount || !availableMoveTargets.length;
     selectionDockMove.textContent = moveBusy ? "移动中…" : "移动分类";
-    selectionDockDelete.disabled = moveBusy || readOnlyPack || !selectedCount;
+    selectionDockDelete.disabled = moveBusy || !selectedCount;
     selectionDockPack.disabled =
       moveBusy || !selectedCount || !activeManagePackId;
   }
@@ -5684,11 +5767,16 @@ async function initApp() {
   }
 
   // 上传表情包
-  async function uploadEmoji(category, file) {
-    return await window.AstrBotPluginPage.upload(
-      "emoji/add/" + encodeURIComponent(category),
-      file,
-    );
+  async function uploadEmoji(
+    category,
+    file,
+    packId = activeManagePackId || managePackSelect?.value || "",
+  ) {
+    // The host bridge encodes each path segment once.
+    const endpoint = packId
+      ? `emoji/add/${packId}/${category}`
+      : `emoji/add/${category}`;
+    return await window.AstrBotPluginPage.upload(endpoint, file);
   }
 
   // 删除表情包
@@ -6547,7 +6635,7 @@ async function initApp() {
     statusDiv.innerHTML = "";
 
     const errorText = document.createElement("p");
-    errorText.style.color = "red";
+    errorText.style.color = "var(--danger-fg)";
     errorText.textContent = `检查同步状态失败: ${message}`;
     statusDiv.appendChild(errorText);
 
@@ -6905,6 +6993,9 @@ async function initApp() {
   packImportConfirmBtn?.addEventListener("click", () => {
     void confirmPackImport();
   });
+  incrementPackVectorsBtn?.addEventListener("click", () => {
+    void performVectorRebuild(activeManagePackId, null, true);
+  });
   rebuildPackVectorsBtn?.addEventListener("click", () => {
     const packId = String(activeManagePackId || "").trim();
     const status =
@@ -6935,13 +7026,40 @@ async function initApp() {
     !collectionReview.open.hidden
   )
     collectionReview.open.click();
-  window.setInterval(() => {
+  window.addEventListener("pagehide", () => {
+    managePageActive = false;
+    managePackVectorStatusRequestId++;
+    managePackSummaryRequestId++;
+    exportCapabilityRequestId++;
+  });
+  window.addEventListener("pageshow", () => {
+    managePageActive = true;
+  });
+  window.setInterval(async () => {
     if (
+      managePageActive &&
       !document.hidden &&
       !collectionReview.dialog.open &&
       !collectionReview.busy
     )
       void loadCollectionReview();
+    if (
+      managePageActive &&
+      !document.hidden &&
+      !collectionReview.busy &&
+      !vectorStatusPollInFlight &&
+      !vectorOperations.has(activeManagePackId) &&
+      activeManagePackId
+    ) {
+      vectorStatusPollInFlight = true;
+      try {
+        await refreshManagePackSummaries();
+      } catch (error) {
+        console.warn("Failed to refresh pack summaries", error);
+      } finally {
+        vectorStatusPollInFlight = false;
+      }
+    }
   }, 30000);
   semanticReviewStats?.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-review-filter]");
@@ -7015,6 +7133,7 @@ async function initApp() {
       try {
         const result = await apiPost("packs/create", {
           name: String(data.get("name") || "").trim(),
+          pack_id: String(data.get("pack_id") || "").trim(),
           description: data.get("description") || "",
         });
         createPackDialog.close();

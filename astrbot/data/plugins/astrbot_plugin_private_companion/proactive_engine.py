@@ -5241,8 +5241,14 @@ class ProactiveEngineMixin:
             )
         if not is_troubleshooting and not self._is_reason_allowed_now(planned_reason, user):
             if self._is_sticky_greeting_reason(planned_reason):
-                self._reschedule_greeting_within_window(user, planned_reason, now=now)
-                return False, "问候仍在窗口内,稍后再试"
+                if self._reschedule_greeting_within_window(user, planned_reason, now=now):
+                    return False, "问候仍在窗口内,稍后再试"
+                # 窗口尾部剩余时间已不足以放入新的发送时刻：继续返回“稍后再试”
+                # 会让 next_proactive_at 停在过期时刻，之后每个 tick 都重复同一
+                # 个跳过，该用户从此再也收不到主动消息。这里作废本轮问候并重新
+                # 排程，让调度回到可发送窗口。
+                self._abandon_expired_greeting_plan(user, planned_reason, now=now)
+                return False, "问候窗口已过,已重新排程"
             replaced = self._defer_or_replace_planned_impulse(
                 user,
                 now=now,
@@ -9141,6 +9147,50 @@ class ProactiveEngineMixin:
             return True
         return False
 
+    def _abandon_expired_greeting_plan(
+        self,
+        user: dict[str, Any],
+        reason: str,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """作废已经塞不进新发送时刻的问候计划，并把调度往前推。
+
+        `_reschedule_greeting_within_window` 在窗口只剩几分钟时会返回 False，
+        此时若仍保留旧的 `next_proactive_at`，tick 会一直判定“到点但被跳过”，
+        既发不出消息也不重新排程。
+        """
+        current_ts = now or _now_ts()
+        previous_at = _safe_float(user.get("next_proactive_at"), 0)
+        try:
+            self._clear_pending_proactive_plan(user)
+        except Exception as exc:
+            logger.warning(
+                "清理过期问候计划失败: user=%s reason=%s err=%s",
+                _single_line(user.get("user_id") or user.get("umo"), 80),
+                _single_line(reason, 40),
+                _single_line(exc, 120),
+            )
+            return
+        try:
+            self._schedule_next_proactive(user, now=current_ts)
+        except Exception as exc:
+            logger.warning(
+                "过期问候重新排程失败,回退固定间隔: user=%s reason=%s err=%s",
+                _single_line(user.get("user_id") or user.get("umo"), 80),
+                _single_line(reason, 40),
+                _single_line(exc, 120),
+            )
+            user["next_proactive_at"] = current_ts + 45 * 60
+        next_at = _safe_float(user.get("next_proactive_at"), 0)
+        logger.info(
+            "问候窗口已过,作废并重新排程: user=%s reason=%s prev_at=%s next_at=%s",
+            _single_line(user.get("user_id") or user.get("umo"), 80),
+            _single_line(reason, 40),
+            self._environment_fromtimestamp(previous_at).strftime("%m-%d %H:%M:%S") if previous_at > 0 else "-",
+            self._environment_fromtimestamp(next_at).strftime("%m-%d %H:%M:%S") if next_at > 0 else "unscheduled",
+        )
+
     def _is_now_in_reason_window(
         self,
         reason: str,
@@ -10595,7 +10645,18 @@ class ProactiveEngineMixin:
             "meal_care": [(7 * 60 + 50, 20 * 60 + 35)],
             "meal_care_followup": [(8 * 60 + 5, 22 * 60)],
         }.get(reason, [(9 * 60, 22 * 60)])
-        if reason in {"special_day_greeting", "birthday_celebration", "insomnia_night"}:
+        if reason in {
+            "special_day_greeting",
+            "birthday_celebration",
+            "insomnia_night",
+            # 每日问候是固定的日程仪式槽位：计划生成（_pick_daily_greeting_event /
+            # _reschedule_greeting_within_window）用的都是未平移的原始槽位，
+            # 若这里再按作息画像平移，计划就会落在「允许窗口」之外，
+            # 于是每次 tick 都判不允许、又不断在原始槽位内重排，形成永不发信的死循环。
+            "morning_greeting",
+            "noon_greeting",
+            "evening_greeting",
+        }:
             return windows
         return self._apply_chronotype_shift_to_windows(windows, user)
 

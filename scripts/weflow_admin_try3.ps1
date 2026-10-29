@@ -1,8 +1,8 @@
-﻿#Requires -RunAsAdministrator
+#Requires -RunAsAdministrator
 # WeFlow -101 方案 3：核查并临时停用 MuMu 虚拟化驱动 / 腾讯 ACE 反作弊驱动，再看 DLL 与 App 是否放行
 # 结束后把停掉的东西恢复。
 $ErrorActionPreference = 'Continue'
-$root = 'C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack'
+$root = '<REPO_ROOT>'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $log = Join-Path $root "logs\weflow-try3-$stamp.log"
 Start-Transcript -Path $log -Force | Out-Null

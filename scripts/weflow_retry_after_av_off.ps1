@@ -1,7 +1,7 @@
-﻿# WeFlow -101 方案 1 复测：前提是火绒已退出（火绒自我保护导致管理员也停不掉它）
+# WeFlow -101 方案 1 复测：前提是火绒已退出（火绒自我保护导致管理员也停不掉它）
 # 用法（普通权限即可）: pwsh -File scripts/weflow_retry_after_av_off.ps1
 $ErrorActionPreference = 'Continue'
-$root = 'C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack'
+$root = '<REPO_ROOT>'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $logDir = Join-Path $root 'logs'
 $result = Join-Path $logDir "weflow-retry-$stamp.result.txt"

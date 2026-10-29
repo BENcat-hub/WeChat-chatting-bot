@@ -23,6 +23,10 @@ import time
 
 EXE = r"C:\Users\<YOU>\.local\bin\windows-mcp.exe"
 PROTOCOL = "2025-06-18"
+# 2026-10-29：wxui.py 现在由 bridge 用 CREATE_NO_WINDOW 启动（没有控制台），它再拉起
+# windows-mcp.exe 时如果不带这个标志，Windows 会为这个 console 子系统进程新建控制台窗口
+# ——用户看到的就是「点开微信闪一个黑框」。这里保持一致，纯 stdio 通信不需要控制台。
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
 class Client:
@@ -37,6 +41,7 @@ class Client:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            creationflags=_CREATE_NO_WINDOW,
         )
         self.next_id = 0
         init = self.rpc(

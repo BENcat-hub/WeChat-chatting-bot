@@ -11172,7 +11172,7 @@ Output:
         try:
             import traceback as _tb
             _frames = [f"{fr.filename.split(chr(92))[-1]}:{fr.lineno}:{fr.function}" for fr in _tb.extract_stack()[-6:-1]]
-            with open(r"C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack\logs\fmt_probe.log", "a", encoding="utf-8") as _f:
+            with open(r"<REPO_ROOT>\logs\fmt_probe.log", "a", encoding="utf-8") as _f:
                 _f.write("%s mode=%s cp=%s photo=%s head=%r stack=%s\n" % (
                     time.strftime("%H:%M:%S"), prompt_format, character_present, photographic,
                     prompt[:90], " <- ".join(_frames)))
@@ -20043,7 +20043,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         platform = self._resolved_external_image_api_platform()
         prompt_text = self._strip_persona_for_pure_scene(str(prompt_text or ""))
         try:
-            with open(r"C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack\logs\strip_probe.log", "a", encoding="utf-8") as _sf:
+            with open(r"<REPO_ROOT>\logs\strip_probe.log", "a", encoding="utf-8") as _sf:
                 _sf.write("%s head=%r\n" % (time.strftime("%H:%M:%S"), prompt_text[:150]))
         except Exception:
             pass

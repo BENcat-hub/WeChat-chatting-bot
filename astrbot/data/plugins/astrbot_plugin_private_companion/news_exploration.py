@@ -3891,6 +3891,11 @@ class NewsExplorationMixin:
             return bool(settings.get("websearch_firecrawl_key"))
         if provider == "baidu_ai_search":
             return bool(settings.get("websearch_baidu_app_builder_key"))
+        if provider == "deepseek":
+            checker = getattr(self, "_meme_lookup_available", None)
+            if callable(checker):
+                return bool(checker(umo))
+            return bool(settings.get("websearch_deepseek_key"))
         return False
 
     def _web_search_candidate_umos(self) -> list[str]:
@@ -4281,6 +4286,25 @@ class NewsExplorationMixin:
                 cleaned_query,
             )
             return []
+        if provider == "deepseek":
+            count = max(1, min(10, runtime_persona_setting(self, "web_exploration_max_results", 6)))
+            try:
+                deepseek_items = await self._deepseek_search(cleaned_query, count=count, umo=umo)
+            except Exception as exc:
+                self._last_web_search_error = _single_line(str(exc), 240)
+                self._mark_web_search_cooldown(provider, exc)
+                logger.warning("AstrBot 网页搜索失败: provider=deepseek query=%s err=%s", cleaned_query, exc)
+                return []
+            results: list[dict[str, Any]] = []
+            for item in deepseek_items or []:
+                title = _single_line(item.get("title"), 140)
+                url = _single_line(item.get("url"), 420)
+                snippet = _single_line(item.get("snippet"), 360)
+                if not title and not snippet:
+                    continue
+                key = hashlib.sha1(f"{title}|{url}|{snippet}".encode("utf-8", errors="ignore")).hexdigest()[:16]
+                results.append({"key": key, "title": title, "url": url, "snippet": snippet, "provider": "deepseek"})
+            return results[: runtime_persona_setting(self, "web_exploration_max_results", 6)]
         for key in (
             "websearch_tavily_key",
             "websearch_bocha_key",
@@ -4793,12 +4817,22 @@ class NewsExplorationMixin:
         state["last_probe_at"] = now
         query_info = await self._choose_web_exploration_query()
         results: list[dict[str, Any]] = []
-        results = await self._run_astrbot_web_search(
-            str(query_info.get("query") or ""),
-            umo=search_umo,
-            topic=str(query_info.get("topic") or "general"),
-            usage="web_exploration",
-        )
+        meme_terms = self._meme_terms_from_query(str(query_info.get("query") or ""))
+        if meme_terms:
+            # 探索到的若是「某个梗是什么意思」，走梗速查（B站→梗wiki→梗百科），
+            # 拿到释义就不再退回普通网页搜索。
+            for term in meme_terms:
+                results.extend(await self._meme_lookup_search_results(term, umo=search_umo))
+            if results:
+                query_info["used_meme_lookup"] = True
+                query_info["meme_terms"] = meme_terms
+        if not results:
+            results = await self._run_astrbot_web_search(
+                str(query_info.get("query") or ""),
+                umo=search_umo,
+                topic=str(query_info.get("topic") or "general"),
+                usage="web_exploration",
+            )
         if not results:
             error_text = _single_line(getattr(self, "_last_web_search_error", ""), 240)
             state["last_status"] = "search_failed" if error_text else "no_results"

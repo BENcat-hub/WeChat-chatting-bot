@@ -29,7 +29,7 @@ class _RelayHarness(LlmToolActionsMixin, AtRelayMixin):
             "groups": {
                 OPAQUE_GROUP_ID: {
                     "group_id": OPAQUE_GROUP_ID,
-                    "name": "官方测试群",
+                    "name": "官方示例群聊D",
                 }
             },
             "worldbook_group_profiles": {},
@@ -153,7 +153,7 @@ class OpaqueGroupRelayTests(unittest.IsolatedAsyncioTestCase):
 
         known = await harness._resolve_atrelay_target_group(event, OPAQUE_GROUP_ID)
         umo = await harness._resolve_atrelay_target_group(event, GROUP_UMO)
-        by_name = await harness._resolve_atrelay_target_group(event, "官方测试群")
+        by_name = await harness._resolve_atrelay_target_group(event, "官方示例群聊D")
         unknown_name = await harness._resolve_atrelay_target_group(event, "随便一个群名")
 
         self.assertEqual(

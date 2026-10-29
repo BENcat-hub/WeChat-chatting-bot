@@ -59,7 +59,7 @@ class _SafetyHarness(GroupMemberSafetyMixin):
             "groups": {
                 "group-1": {
                     "group_id": "group-1",
-                    "members": {"user-1": {"name": "测试群友", "last_seen": time.time()}},
+                    "members": {"user-1": {"name": "示例群聊D友", "last_seen": time.time()}},
                     "member_safety": {},
                     "recent_messages": [],
                 }
@@ -106,7 +106,7 @@ class _SafetyHarness(GroupMemberSafetyMixin):
 
     @staticmethod
     def _sender_display_name(_event) -> str:
-        return "测试群友"
+        return "示例群聊D友"
 
     @staticmethod
     def _group_observation_event_text(event) -> str:
@@ -130,7 +130,7 @@ class _SafetyHarness(GroupMemberSafetyMixin):
 
     @staticmethod
     def _format_group_recent_flow_for_review(_group, **_kwargs) -> str:
-        return "测试群友：当前消息"
+        return "示例群聊D友：当前消息"
 
     def _is_plugin_manager_user_id(self, user_id: str) -> bool:
         return user_id in self.manager_ids
@@ -157,7 +157,7 @@ class GroupMemberSafetyTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "message_id": message_id,
                     "sender_id": "user-1",
-                    "name": "测试群友",
+                    "name": "示例群聊D友",
                     "text": text,
                     "talking_to": self.harness.scene.get("talking_to", "group"),
                     "scene_trigger": self.harness.scene.get("trigger", "group_message"),
@@ -167,7 +167,7 @@ class GroupMemberSafetyTests(unittest.IsolatedAsyncioTestCase):
             _SafetyEvent(message_id),
             group_id="group-1",
             sender_id="user-1",
-            sender_name="测试群友",
+            sender_name="示例群聊D友",
             text=text,
         )
 
@@ -316,14 +316,14 @@ class GroupMemberSafetyTests(unittest.IsolatedAsyncioTestCase):
             event,
             group_id="group-1",
             sender_id="user-1",
-            sender_name="测试群友",
+            sender_name="示例群聊D友",
             text=event.message_str,
         )
         hidden = await self.harness._record_group_member_safety_decision(
             event,
             group_id="group-1",
             sender_id="user-1",
-            sender_name="测试群友",
+            sender_name="示例群聊D友",
             text=event.message_str,
             decision={
                 "malicious": True,
@@ -379,14 +379,14 @@ class GroupMemberSafetyTests(unittest.IsolatedAsyncioTestCase):
             event,
             group_id="group-1",
             sender_id="user-1",
-            sender_name="测试群友",
+            sender_name="示例群聊D友",
             text=event.message_str,
         )
         hidden = await self.harness._record_group_member_safety_decision(
             event,
             group_id="group-1",
             sender_id="user-1",
-            sender_name="测试群友",
+            sender_name="示例群聊D友",
             text=event.message_str,
             decision=self.harness.llm_payload,
             source="reply_hidden_marker",
@@ -472,7 +472,7 @@ class GroupMemberSafetyTests(unittest.IsolatedAsyncioTestCase):
             {
                 "message_id": "member-prior-1",
                 "sender_id": "user-1",
-                "name": "测试群友",
+                "name": "示例群聊D友",
                 "text": "更早一次定向贬损",
                 "talking_to": "user-2",
                 "scene_trigger": "reply_other",
@@ -515,7 +515,7 @@ class GroupMemberSafetyTests(unittest.IsolatedAsyncioTestCase):
             event,
             group_id="group-1",
             sender_id="user-1",
-            sender_name="测试群友",
+            sender_name="示例群聊D友",
             text=event.message_str,
             decision={
                 "malicious": True,
@@ -602,7 +602,7 @@ class GroupMemberSafetyTests(unittest.IsolatedAsyncioTestCase):
     def test_unblock_forgives_old_events_and_expired_block_recovers(self) -> None:
         now = time.time()
         group = self.harness.data["groups"]["group-1"]
-        member = self.harness._group_member_safety_member(group, "user-1", name="测试群友")
+        member = self.harness._group_member_safety_member(group, "user-1", name="示例群聊D友")
         member["events"] = [{"ts": now - 10, "counted": True, "reason": "旧记录"}]
         member["blocked_at"] = now - 20
         member["blocked_until"] = now - 1

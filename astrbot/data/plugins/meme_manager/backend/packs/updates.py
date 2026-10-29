@@ -144,6 +144,10 @@ def prepare_update(
 ) -> dict:
     """Download an isolated candidate without modifying installed files.
 
+    This synchronous operation includes HTTP downloads and archive processing.
+    Async callers must offload the entire operation with asyncio.to_thread;
+    the WebUI does this through _run_guarded_pack_file_operation.
+
     Args:
         pack_id: Catalog and installed pack ID.
         github_accelerator_url: Configured download accelerator.

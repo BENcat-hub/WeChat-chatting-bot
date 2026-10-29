@@ -8,11 +8,13 @@ from astrbot.api import logger
 from astrbot.api.all import *
 from astrbot.api.event import AstrMessageEvent, filter
 
+from ..backend.packs.categories import resolve_safe_category_directory
 from ..backend.packs.images import (
     clear_all_emojis,
     clear_category_emojis,
     get_emoji_by_category,
 )
+from ..backend.packs.resolver import get_pack_paths, load_pack_category_mapping
 from ..backend.packs.storage import install_first_official_pack_from_index
 from ..backend.semantic.storage import invalidate_semantic_metadata
 from ..config import COMMUNITY_INDEX_URL
@@ -182,27 +184,84 @@ class CommandMixin:
     @filter.permission_type(filter.PermissionType.ADMIN)
     @meme_manager.command("添加表情")
     async def upload_meme(self, event: AstrMessageEvent, category: str = None):
+        category = str(category or "").strip()
         if not category:
             yield event.plain_result(
-                "📌 若要添加表情，请按照此格式操作：\n/表情管理 添加表情 [类别名称]\n（输入/查看图库 可获取类别列表）"
+                "📌 若要添加表情，请按照此格式操作：\n"
+                "/表情管理 添加表情 [类别名称]\n"
+                "（/表情管理 查看图库 会列出当前可用类别；"
+                "聊天上传仅写入当前会话规则识别出的主表情包）"
             )
             return
-        descriptions = await asyncio.to_thread(self.category_manager.get_descriptions)
-        if category not in descriptions:
-            yield event.plain_result(
-                f"您输入的表情包类别「{category}」是无效的哦。\n可以使用/查看表情包来查看可用的类别。"
-            )
-            return
-        user_key = f"{event.session_id}_{event.get_sender_id()}"
+
         pack_context = self._resolve_runtime_pack_context(event=event)
+        pack_id = str(pack_context.get("pack_id") or "").strip()
+        context_memes_dir = str(pack_context.get("memes_dir") or "").strip()
+        if not pack_id or not context_memes_dir:
+            yield event.plain_result(
+                f"⚠️ 当前没有可用的表情包，无法将表情添加到分类「{category}」。"
+            )
+            return
+        try:
+            pack_paths = get_pack_paths(pack_id)
+            pack_dir = Path(pack_paths["pack_dir"]).resolve()
+            memes_dir = Path(pack_paths["memes_dir"]).resolve()
+            runtime_memes_dir = Path(context_memes_dir).resolve()
+            if memes_dir == pack_dir:
+                raise ValueError("memes directory must be a child of the pack")
+            memes_dir.relative_to(pack_dir)
+        except (OSError, RuntimeError, ValueError):
+            pack_dir = None
+            memes_dir = None
+            runtime_memes_dir = None
+        if (
+            pack_dir is None
+            or memes_dir is None
+            or not pack_dir.is_dir()
+            or memes_dir != runtime_memes_dir
+        ):
+            yield event.plain_result(
+                f"⚠️ 主表情包「{pack_id}」分类「{category}」的路径"
+                "与当前使用规则不一致，请刷新使用规则后重试。"
+            )
+            return
+        try:
+            resolve_safe_category_directory(memes_dir, category)
+        except ValueError:
+            yield event.plain_result(
+                f"您输入的表情包类别「{category}」无效。\n"
+                f"聊天上传只接受主表情包「{pack_id}」内的安全类别名称，"
+                "可使用 /表情管理 查看图库 查看当前可用类别。"
+            )
+            return
+
+        primary_mapping = await asyncio.to_thread(load_pack_category_mapping, pack_id)
+        if category not in primary_mapping and not (memes_dir / category).is_dir():
+            merged_mapping = pack_context.get("category_mapping")
+            if isinstance(merged_mapping, dict) and category in merged_mapping:
+                yield event.plain_result(
+                    f"分类「{category}」属于其他绑定的表情包；"
+                    f"聊天上传只会写入当前主表情包「{pack_id}」。\n"
+                    f"请先在主表情包「{pack_id}」中添加该分类。"
+                )
+            else:
+                yield event.plain_result(
+                    f"主表情包「{pack_id}」中，您输入的表情包类别「{category}」无效。\n"
+                    "可使用 /表情管理 查看图库 查看当前可用类别。"
+                )
+            return
+
+        user_key = f"{event.session_id}_{event.get_sender_id()}"
         self.upload_states[user_key] = {
             "category": category,
-            "pack_id": str(pack_context.get("pack_id") or ""),
-            "memes_dir": str(pack_context.get("memes_dir") or ""),
+            "pack_id": pack_id,
+            "memes_dir": str(memes_dir),
             "expire_time": time.time() + 30,
         }
         yield event.plain_result(
-            f"请在30秒内发送要添加到【{category}】类别的图片（可发送多张图片）。"
+            f"请在30秒内发送要添加到主表情包「{pack_id}」"
+            f"【{category}】类别的图片（可发送多张图片）。\n"
+            "图片只会写入当前主表情包，不会写入其他绑定表情包。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)

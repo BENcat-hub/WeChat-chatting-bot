@@ -53,7 +53,7 @@ class PostGoodnightGroupActivityTests(unittest.TestCase):
         ):
             accepted = harness._maybe_schedule_post_goodnight_group_activity(
                 "group-1",
-                {"name": "测试群"},
+                {"name": "示例群聊D"},
                 sender_id="10001",
                 sender_name="主要用户",
                 text="还没睡，继续聊会儿",

@@ -2978,16 +2978,13 @@ TTS 朗读文本：
                 content=exact_text(f"{marker}\n{rule_prompt}"),
                 metadata=authored_rule_section.metadata,
             )
-            plan = get_conversation_injection_plan(req)
-            if plan is not None:
-                plan.materialize_system_block(
-                    req,
-                    section=rule_section,
-                    marker=marker,
-                    priority=20,
-                    placement=PLACEMENT_DYNAMIC_SYSTEM,
-                )
-            await record_tts_fragment("TTS 基础规则注入", "tts.rule", rule_prompt)
+            placement = append_dynamic_tts_fragment(marker, rule_section, priority=20)
+            await record_tts_fragment(
+                "TTS 基础规则注入",
+                "tts.rule",
+                rule_prompt,
+                placement=placement,
+            )
         elif marker not in prompt and mode == "postprocess" and not strong_block_reason:
             authored_postprocess_section = self._build_tts_postprocess_mode_prompt_section(
                 event,
@@ -3005,16 +3002,16 @@ TTS 朗读文本：
                 content=exact_text(f"{marker}\n{postprocess_prompt}"),
                 metadata=authored_postprocess_section.metadata,
             )
-            plan = get_conversation_injection_plan(req)
-            if plan is not None:
-                plan.materialize_system_block(
-                    req,
-                    section=postprocess_section,
-                    marker=marker,
-                    priority=20,
-                    placement=PLACEMENT_DYNAMIC_SYSTEM,
-                )
-            await record_tts_fragment("TTS 后处理模式注入", "tts.rule", postprocess_prompt, mode="postprocess")
+            placement = append_dynamic_tts_fragment(
+                marker, postprocess_section, priority=20
+            )
+            await record_tts_fragment(
+                "TTS 后处理模式注入",
+                "tts.rule",
+                postprocess_prompt,
+                mode="postprocess",
+                placement=placement,
+            )
         if strong_block_reason:
             reverse_prompt = (
                 f"本轮语音被硬性禁止，原因：{strong_block_reason}。\n"

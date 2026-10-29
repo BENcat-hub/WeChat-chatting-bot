@@ -1,9 +1,9 @@
-﻿#Requires -RunAsAdministrator
+#Requires -RunAsAdministrator
 # WeFlow -101: 管理员权限下的“方案 1”验证（杀软白名单 / 临时停火绒 → 重启 WeFlow 看日志）
 # 结果写到 logs/weflow-admin-test-<stamp>.log
 $ErrorActionPreference = 'Continue'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$outDir = 'C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack\logs'
+$outDir = '<REPO_ROOT>\logs'
 $log = Join-Path $outDir "weflow-admin-test-$stamp.log"
 Start-Transcript -Path $log -Force | Out-Null
 

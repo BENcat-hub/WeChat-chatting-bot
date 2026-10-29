@@ -39,10 +39,10 @@ def test_group_member_safety_json_prompt_uses_body_only_document() -> None:
     document = harness._group_member_safety_judge_prompt_document(
         {},
         sender_id="user-1",
-        sender_name="测试群友",
+        sender_name="示例群聊D友",
         text="当前消息",
         scene={"talking_to": "bot", "trigger": "at_bot"},
-        recent_flow="测试群友：当前消息",
+        recent_flow="示例群聊D友：当前消息",
     )
     rendered = render_prompt_document(
         document,

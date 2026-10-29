@@ -5370,12 +5370,26 @@ class GroupObservationMixin:
         lines: list[str] = []
         term = selected_term
         query = f"群聊环境下的网络用语“{term}”是什么意思？"
-        try:
-            results = await searcher(query, umo=search_umo, topic="general")
-        except Exception as exc:
-            results = []
-            self._last_web_search_error = _single_line(exc, 240)
-            logger.debug("群黑话联网参考搜索失败: group=%s term=%s err=%s", group_id, term, _single_line(exc, 120))
+        meme_evidence = ""
+        meme_lookup = getattr(self, "_meme_lookup_evidence", None)
+        if callable(meme_lookup):
+            try:
+                meme_evidence = await meme_lookup([term], limit=result_limit, umo=search_umo, purpose="group_slang")
+            except Exception as exc:
+                meme_evidence = ""
+                logger.debug("群黑话梗速查失败: group=%s term=%s err=%s", group_id, term, _single_line(exc, 120))
+        results: list[dict[str, Any]] = []
+        if meme_evidence:
+            # 梗速查（B站→梗wiki→梗百科）命中时优先用它的释义，不再退回普通搜索。
+            self._last_web_search_error = ""
+            lines.append(meme_evidence)
+        else:
+            try:
+                results = await searcher(query, umo=search_umo, topic="general")
+            except Exception as exc:
+                results = []
+                self._last_web_search_error = _single_line(exc, 240)
+                logger.debug("群黑话联网参考搜索失败: group=%s term=%s err=%s", group_id, term, _single_line(exc, 120))
         error_text = _single_line(getattr(self, "_last_web_search_error", ""), 240)
         if error_text and not results:
             async with self._data_lock:

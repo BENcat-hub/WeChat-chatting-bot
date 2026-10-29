@@ -13,7 +13,7 @@
   - 校验函数 `verifyToken(req, url, bodyParams)`（`httpService.ts:406-425`）：期望 token = `configService.get('httpApiToken')`；**配置为空则一律拒绝**。
   - 三种传递方式任选其一：请求头 `Authorization: Bearer <token>`、query `?access_token=<token>`、POST body `access_token=<token>`。
   - 仅 `/health` 与 `/api/v1/health` 免鉴权，其余全部校验（`httpService.ts:458-463`），失败返回 `401 Unauthorized: Invalid or missing access_token`。
-  - token 存放：`%APPDATA%\weflow\WeFlow-config.json` 的 `httpApiToken`（`config.ts:88`、`config.ts:235`、`config.ts:291`，配置文件名 `WeFlow-config`）。本机实测值 `<FILL_ME_WEFLOW_TOKEN>`（硬编码于 `scripts\weflow_sessions.py:17`、`scripts\weflow_last_messages.py:17`、`scripts\weflow_add_autodownload.py:39`；bridge 侧对应 `akasha-bridge\config.json` 的 `access_token`，见 `docs\SETUP.zh-CN.md:136`）。
+  - token 存放：`%APPDATA%\weflow\WeFlow-config.json` 的 `httpApiToken`（`config.ts:88`、`config.ts:235`、`config.ts:291`，配置文件名 `WeFlow-config`）。本机实测值 `<FILL_ME>`（硬编码于 `scripts\weflow_sessions.py:17`、`scripts\weflow_last_messages.py:17`、`scripts\weflow_add_autodownload.py:39`；bridge 侧对应 `akasha-bridge\config.json` 的 `access_token`，见 `docs\SETUP.zh-CN.md:136`）。
 - **启动方式**：可执行文件是树内 Electron：`<tree>\node_modules\electron\dist\electron.exe <tree>`。启动器 `scripts\start-weflow50.cmd` 做了四件事：
   1. `set "ELECTRON_RUN_AS_NODE="` —— 不清掉它 electron 会以 Node 模式跑，不启窗口/不启 API；
   2. 若缺则从 `C:\Program Files\WeFlow\resources\app.asar.unpacked\node_modules\ffmpeg-static\ffmpeg.exe` 复制到 `<tree>\node_modules\ffmpeg-static\ffmpeg.exe`；

@@ -39,6 +39,7 @@ def create_sender():
             retry_queue_path=config.WXUI_RETRY_QUEUE,
             queue_interval=config.WXUI_QUEUE_INTERVAL,
             queue_max_attempts=config.WXUI_QUEUE_MAX_ATTEMPTS,
+        queue_enabled=config.WXUI_QUEUE_ENABLED,
             group_gather_seconds=config.WXUI_GROUP_GATHER_SECONDS,
             warm_worker=config.WXUI_WARM_WORKER,
             whitelist=config.SEND_WHITELIST,
@@ -71,3 +72,4 @@ def create_sender():
     raise ValueError(
         f"未知 sender_backend: {backend}（可选值：weemessenger / uia）"
     )
+

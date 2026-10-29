@@ -22,7 +22,7 @@ import shutil
 import urllib.parse
 import urllib.request
 
-TOKEN = "<FILL_ME_WEFLOW_TOKEN>"
+TOKEN = "<FILL_ME>"
 BASE = "http://127.0.0.1:5031"
 CONFIG_PATH = os.path.join(os.environ.get("APPDATA", ""), "weflow", "WeFlow-config.json")
 

@@ -1,0 +1,742 @@
+"""
+wxui 文本发送后端（推荐）
+=========================
+把 bridge 的文本发送交给 scripts/wxui.py：它用 Windows-MCP 驱动微信窗口
+（物理像素坐标点击 + 键盘），用 Windows OCR 从侧边栏按**名称**定位会话行
+（WeFlow 的会话表缺服务号，索引对不上，所以不能按索引点），最后通过 WeFlow
+的 /api/v1/messages 回读消息，只有读到才返回成功。
+
+为什么不用 WeeMessenger/UIA 的文本通道：
+    两者都是 Ctrl+F → 粘贴 → 回车；实测微信 4.x 搜索下拉第一行是"搜索网络结果"，
+    回车会打开网页结果，消息静默丢失（或把搜索词当消息发出去）。所以文本默认走
+    wxui；图片仍走剪贴板贴图（UIA），表情包仍走 WeeMessenger 指令通道。
+
+失败恢复（本模块的第二层保险）：
+    wxui.py 自己会在一次调用里重试 3 轮（每轮都清空输入框并回读校验）。真正的
+    长时故障——RDP 断连、微信被最小化、屏幕锁屏——会超过它的等待窗口，这时消息
+    会被写进 wxui_pending.jsonl（重发队列），后台线程每隔几十秒重发一次。重发前
+    一律先做只读的回读校验，所以"其实已经送到、只是回读慢"的消息不会被重复发送。
+
+出站护栏（白名单/黑名单/限频/dry_run/长度）由父类统一执行，本类只替换传输层。
+"""
+
+import collections
+import json
+import logging
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+from weemessenger_sender import WeMessengerSender
+
+log = logging.getLogger("ob11-bridge")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+class WxuiSender(WeMessengerSender):
+    """文本/图片走 wxui.py（已验证送达），失败进重发队列；表情包沿用父类通道。"""
+
+    def __init__(self, script: str, python_exe: str = "", wxui_timeout: float = 90.0,
+                 retry_queue_path: str = "", queue_interval: float = 20.0,
+                 queue_max_attempts: int = 5, group_gather_seconds: float = 1.2,
+                 warm_worker: bool = True, queue_enabled: bool = True, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.script = script
+        self.python_exe = python_exe or sys.executable
+        self.wxui_timeout = max(10.0, wxui_timeout)
+        self.retry_queue_path = retry_queue_path or os.path.join(HERE, "wxui_pending.jsonl")
+        # 图片进队列时必须先复制一份：AstrBot 发图用的是临时文件，bridge 发完就删，
+        # 否则队列里的重发会指向一个已经消失的路径。
+        self.queue_asset_dir = os.path.join(HERE, "wxui_queue_assets")
+        self.queue_interval = max(5.0, float(queue_interval))
+        self.queue_max_attempts = max(1, int(queue_max_attempts))
+        # 用户手动操作微信时，重发队列会和 Windows-MCP 抢桌面控制，必须能一把关掉
+        self.queue_enabled = bool(queue_enabled)
+        # 只有一个进程能驱动微信窗口：正常发送和队列重发共用这把锁，避免两路 UI 动作打架
+        self._ui_lock = threading.Lock()
+        # 出站按联系人成组：同时有好几个会话要回复时（AstrBot 会并发回复），如果每条
+        # 消息各自抢 UI，微信窗口会在两个人之间来回跳，观感很差、还多花 OCR。这里把
+        # 出站消息按联系人排队，一个人的消息连发完才轮到下一个人。
+        # 这个调度器统一驱动所有 UI 发送：正常调用、图片、以及重发队列。
+        self.group_gather_seconds = max(0.0, float(group_gather_seconds))
+        self._sched_cv = threading.Condition()
+        self._sched_queues = collections.OrderedDict()   # 联系人 → deque[job]
+        self._sched_stop = threading.Event()
+        self._sched_thread = None
+        self._sched_current = ""   # 当前轮到的联系人（UI 现在停在他的会话窗口上）
+        self._sched_turn_sent = 0  # 本轮已发条数：>0 表示下一条可以走「省一次 OCR」快路径
+        # 2026-10-20 分段乱序事故：某个联系人的某条消息进了重发队列后，后面几条（同一次
+        # 回复的其它分段）仍会继续直发，于是 2、3 段先到、第 1 段几分钟后才到，用户看到
+        # 的是「吞了一段、顺序还乱了」。这里记住「有未送达消息的联系人」，它后面的消息
+        # 一律先排队，等队列里这个联系人的都送完再恢复直发（顺序保持不变）。
+        self._blocked_contacts: set[str] = set()
+        self._queue_lock = threading.Lock()
+        self._queue_stop = threading.Event()
+        self._queue_thread = None
+        # 常驻 worker：一个 wxui.py 进程长期活着，复用同一个 Windows-MCP 客户端
+        # （省掉每条消息约 3 秒的 windows-mcp 启动），也让它记住「微信窗口停在谁的会话上」。
+        self.warm_worker = bool(warm_worker)
+        self._worker = None
+        self._worker_lines = None
+        self._worker_reader = None
+        self._worker_lock = threading.Lock()
+        self._worker_seq = 0
+        self._warm_announced = False
+        if not script or not os.path.exists(script):
+            log.error("[wxui] 找不到脚本: %r —— 文本发送会失败", script)
+        log.info(
+            "[wxui] 发送后端已加载 | 脚本=%s | 解释器=%s | dry_run=%s",
+            self.script,
+            self.python_exe,
+            self.dry_run,
+        )
+        if not self.dry_run and self.queue_enabled:
+            self._start_queue_worker()
+        elif not self.queue_enabled:
+            log.info("[wxui] 重发队列已禁用（wxui_queue_enabled=false），失败消息只入队不自动重发")
+        self._start_scheduler()
+
+    # ==================== 传输层 ====================
+
+    def _post(self, payload: dict) -> bool:
+        if self.dry_run:  # 复用父类的 dry_run 日志格式
+            return super()._post(payload)
+
+        if payload.get("type") != "send_message":
+            log.error("[wxui] 只负责文本；%s 请改用 weemessenger/uia 通道", payload.get("type"))
+            return False
+
+        target = str(payload.get("target") or "")
+        text = str(payload.get("message") or "")
+        if self._is_blocked(target):
+            # 这个联系人还有更早的消息没送达：本条也排队，绝不越过它先发出去
+            self._enqueue("send", {"target": target, "text": text}, target,
+                          {"retryable": True,
+                           "error": "queued behind earlier undelivered message"})
+            return False
+        ok, data = self._scheduled_run("send", {"target": target, "text": text}, target)
+        if not ok and self._retryable(data) and not data.get("_enqueued"):
+            self._block_contact(target)
+            self._enqueue("send", {"target": target, "text": text}, target, data)
+        return ok
+
+    def send_image(self, contact: str, image_path: str) -> bool:
+        """图片也走 wxui（剪贴板贴图，同样有焦点保护与回读验证）。
+
+        image_mode=sticker 时保留父类的 WeeMessenger 表情包通道（真 GIF 表情）。
+        """
+        if not image_path or not os.path.exists(image_path):
+            log.error("[wxui] 图片不存在: %s", image_path)
+            return False
+        if self.dry_run or self.image_mode == "sticker":
+            return super().send_image(contact, image_path)
+        # 2026-10-22：插件会把 WebP 字节存成 .gif 发过来，微信按后缀解析失败、聊天里
+        # 只剩一个解不开的文件卡片。转码放在护栏/排队之前，保证重发队列里存的也是
+        # 转换后的路径。
+        normalized = image_path
+        try:
+            from imgutil import normalize_image_for_wechat
+            normalized = normalize_image_for_wechat(image_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[wxui] 图片转码失败，按原样发送: %s", exc)
+        image_path = normalized
+        if not self._guard(contact, kind="图片"):
+            return False
+        spec = {"target": contact, "path": os.path.abspath(image_path)}
+        if self._is_blocked(contact):
+            self._enqueue("send-image", spec, contact,
+                          {"retryable": True,
+                           "error": "queued behind earlier undelivered message"})
+            return False
+        ok, data = self._scheduled_run("send-image", spec, contact)
+        self._settle()
+        if not ok and self._retryable(data) and not data.get("_enqueued"):
+            self._block_contact(contact)
+            self._enqueue("send-image", spec, contact, data)
+        return ok
+
+    def send_file(self, contact: str, file_path: str) -> bool:
+        """发送任意文件（AI 点歌翻唱 mp3）。剪贴板文件 + Ctrl+V，微信落成 appmsg 文件卡片。
+
+        与 send_image 同样的护栏/排队/回读验证：只有 WeFlow 从微信 DB 里回读到这张文件
+        卡片才算成功，失败进重发队列，绝不静默丢弃。
+        """
+        if not file_path or not os.path.exists(file_path):
+            log.error("[wxui] 文件不存在: %s", file_path)
+            return False
+        if self.dry_run:
+            log.warning("[wxui] dry_run：跳过发送文件 %s -> %s", file_path, contact)
+            return True
+        if not self._guard(contact, kind="文件"):
+            return False
+        spec = {"target": contact, "path": os.path.abspath(file_path)}
+        if self._is_blocked(contact):
+            self._enqueue("send-file", spec, contact,
+                          {"retryable": True,
+                           "error": "queued behind earlier undelivered message"})
+            return False
+        ok, data = self._scheduled_run("send-file", spec, contact)
+        self._settle()
+        if not ok and self._retryable(data) and not data.get("_enqueued"):
+            self._block_contact(contact)
+            self._enqueue("send-file", spec, contact, data)
+        return ok
+
+    def _run(self, subcmd: str, spec: dict, target: str, quiet: bool = False,
+             assume_current: bool = False):
+        """Run one wxui.py subcommand. Returns (ok, data).
+
+        For send/send-image, ok is True only when the message was read back out of WeChat's
+        own database. For the read-only `verify` subcommand, ok means "the check ran" and
+        `data["verified"]` carries the answer.
+
+        `assume_current=True` tells wxui.py the target's chat is already open (this is the
+        2nd+ message of a burst to the same contact), so it only OCRs the small chat-header
+        region instead of scanning the whole sidebar; a header mismatch falls back to the
+        normal scan, so this only ever saves time — it cannot send to the wrong person.
+
+        2026-10-16 提速：优先走常驻 worker（`wxui.py worker`）。一个进程里复用同一个
+        Windows-MCP 客户端，省掉每条消息约 3 秒的 windows-mcp 启动；「微信窗口现在停在谁
+        身上」这个状态也能跨消息复用，所以同一联系人的第 2 条起连头部 OCR 都免了。
+        worker 起不来 / 超时 / 中途退出时自动回退到逐条起进程的老路径（行为与过去完全
+        一致），消息不会因此丢：失败的那一步照旧进重发队列。
+        """
+        if assume_current:
+            spec = {**spec, "assume_current": True}
+
+        data = self._worker_call(subcmd, spec, target)
+        stdout_tail = ""
+        if data is None:
+            data, fatal = self._run_oneshot(subcmd, spec, target)
+            if fatal is not None:
+                return False, fatal
+            stdout_tail = data.pop("_stdout_tail", "")
+
+        if isinstance(data, dict) and data.get("control_preempted"):
+            # 2026-10-18: windows-mcp 会以 CONTROL_PREEMPTED 拒绝所有工具（连 Screenshot 都拒），
+            # 直到拿到一个“没被接管过”的客户端为止。以前它被误报成「屏幕截不到/锁屏」，
+            # 而且常驻 worker 会一直卡着不重试——这里直接丢弃 worker，下一条用全新客户端。
+            self._worker_kill("windows-mcp 拒绝驱动桌面（CONTROL_PREEMPTED）")
+            log.warning("[wxui] ⚠️ windows-mcp 桌面控制被接管（CONTROL_PREEMPTED），已丢弃常驻 worker；"
+                        "下一条消息使用全新的 MCP 客户端 | 原因=%s",
+                        str(data.get("error") or data.get("session_reason") or "")[:200])
+
+        if subcmd == "verify":
+            if not quiet and data.get("verified"):
+                log.info("[wxui] ✅ 回读确认已送达 %s（localId=%s）", target, data.get("localId"))
+            return True, data
+
+        if data.get("verified"):
+            log.info(
+                "[wxui] ✅ 已验证送达 %s（localId=%s, createTime=%s, 尝试=%s | %s%s）| 明细=%s",
+                target,
+                data.get("localId"),
+                data.get("createTime"),
+                data.get("attempts"),
+                "常驻worker " if data.get("warm_worker") else "单进程 ",
+                data.get("claimed") or "open_chat",
+                json.dumps(data.get("attempt_log") or [], ensure_ascii=False)[:600],
+            )
+            return True, data
+
+        log.error(
+            "[wxui] ❌ 未能验证送达 %s | 原因=%s | 可重试=%s | 尝试=%s | 键盘焦点=%s | 桌面控制=%s | 明细=%s | stdout=%s",
+            target,
+            data.get("error") or "unknown",
+            data.get("retryable"),
+            data.get("attempts"),
+            data.get("keyboard_target"),
+            data.get("control_state"),
+            json.dumps(data.get("attempt_log") or [], ensure_ascii=False)[:600],
+            (stdout_tail or "")[:300],
+        )
+        return False, data
+
+    def _run_oneshot(self, subcmd: str, spec: dict, target: str):
+        """老路径：这条动作单起一个 wxui.py 进程。Returns (data, fatal)。
+
+        走 --spec（UTF-8 文件）而不是 argv：子进程的 argv 用系统 ANSI 代码页传递，
+        中文/emoji 会变成乱码，导致 wxui 报 unrecognized arguments。
+        """
+        spec_path = ""
+        with self._ui_lock:  # 同一时刻只允许一路 UI 自动化（正常发送 / 队列重发）
+            try:
+                fd, spec_path = tempfile.mkstemp(prefix="wxui-spec-", suffix=".json")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({**spec, "commit": True}, fh, ensure_ascii=False)
+                cmd = [self.python_exe, self.script, subcmd, "--spec", spec_path]
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self.wxui_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                log.error("[wxui] %s 超时（%.0fs）→ %s（消息进重发队列，重发前会先回读校验）",
+                          subcmd, self.wxui_timeout, target)
+                return None, {"retryable": True, "error_kind": "timeout",
+                              "error": "wxui timeout after %.0fs" % self.wxui_timeout}
+            except Exception as e:
+                log.error("[wxui] 调用 wxui 失败: %s", e)
+                return None, {"retryable": True, "error_kind": "spawn",
+                              "error": "wxui spawn failed: %s" % e}
+            finally:
+                if spec_path:
+                    try:
+                        os.unlink(spec_path)
+                    except OSError:
+                        pass
+
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except Exception:
+            data = {}
+        if not data:
+            # 连 JSON 都没输出：状态未知，交给重发队列（它会先回读校验再决定是否重发）
+            data = {"retryable": True, "error_kind": "no-output",
+                    "error": "wxui printed no JSON", "stdout_tail": (proc.stdout or "")[-300:]}
+            log.error("[wxui] ❌ %s 无 JSON 输出 → %s | stdout=%s", subcmd, target,
+                      (proc.stdout or "")[:300].replace("\n", " "))
+            return None, data
+
+        data["_stdout_tail"] = (proc.stdout or "")[:300].replace("\n", " ")
+        return data, None
+
+    # ==================== 常驻 worker（分段发送提速） ====================
+
+    def _worker_start(self) -> bool:
+        """拉起常驻 `wxui.py worker` 进程（已活着就什么都不做）。"""
+        if self._worker is not None and self._worker.poll() is None:
+            return True
+        if self._worker is not None:
+            self._worker_kill("已退出")
+        try:
+            self._worker = subprocess.Popen(
+                [self.python_exe, self.script, "worker"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                cwd=HERE,
+            )
+        except Exception as e:
+            log.warning("[wxui] 常驻 worker 启动失败，本条回退逐条起进程: %s", e)
+            self._worker = None
+            return False
+        self._worker_lines = queue.Queue()
+        self._worker_reader = threading.Thread(
+            target=self._worker_pump, args=(self._worker, self._worker_lines),
+            name="wxui-worker-read", daemon=True)
+        self._worker_reader.start()
+        self._worker_seq = 0
+        self._warm_announced = False
+        log.info("[wxui] 🚀 常驻 worker 已启动（复用 Windows-MCP 客户端；"
+                 "同一联系人连发不再重复验证窗口与名字）")
+        return True
+
+    def _worker_pump(self, proc, out) -> None:
+        """把 worker 的 stdout 逐行搬进队列（None 表示进程结束）。"""
+        try:
+            for line in proc.stdout:
+                out.put(line)
+        except Exception:
+            pass
+        finally:
+            out.put(None)
+
+    def _worker_kill(self, reason: str) -> None:
+        proc, self._worker = self._worker, None
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        log.warning("[wxui] 常驻 worker 已回收（%s），本条回退逐条起进程", reason)
+
+    def _worker_call(self, subcmd: str, spec: dict, target: str):
+        """一次 worker 请求。返回 None ⇒ 调用方回退到逐条起进程。"""
+        # 没用 __init__ 构造出来的实例（单测 shim）没有这个属性：直接用老路径，别让它抛异常
+        if not getattr(self, "warm_worker", False):
+            return None
+        if subcmd == "verify" and spec.get("timeout"):
+            # 纯回读不碰 UI，给它一点余量而不是跟着整条发送的超时走
+            spec = {**spec, "timeout": min(float(spec["timeout"]) + 2.0, 10.0)}
+        with self._worker_lock:
+            if not self._worker_start():
+                return None
+            self._worker_seq += 1
+            req = {"id": self._worker_seq, "cmd": subcmd, "spec": {**spec, "commit": True}}
+            try:
+                self._worker.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+                self._worker.stdin.flush()
+            except Exception as e:
+                self._worker_kill("写入失败: %s" % e)
+                return None
+
+            deadline = time.time() + self.wxui_timeout
+            while True:
+                remain = deadline - time.time()
+                if remain <= 0:
+                    self._worker_kill("%s 超过 %.0fs 无响应" % (subcmd, self.wxui_timeout))
+                    return None
+                try:
+                    line = self._worker_lines.get(timeout=min(remain, 1.0))
+                except queue.Empty:
+                    continue
+                if line is None:
+                    self._worker_kill("进程退出")
+                    return None
+                try:
+                    resp = json.loads(line)
+                except Exception:
+                    continue
+                if resp.get("id") != req["id"]:
+                    continue
+                data = resp.get("data")
+                if not isinstance(data, dict):
+                    data = {"retryable": True, "error_kind": "worker-bad-response",
+                            "error": "worker 返回异常: %s" % (resp.get("error") or resp)}
+                data["warm_worker"] = True
+                data.pop("_stdout_tail", None)
+                return data
+
+    # ==================== 按联系人成组调度 ====================
+
+    def _start_scheduler(self) -> None:
+        if self._sched_thread:
+            return
+        self._sched_thread = threading.Thread(target=self._sched_loop, name="wxui-grouped",
+                                              daemon=True)
+        self._sched_thread.start()
+        log.info("[wxui] 出站已按联系人成组 | 一个人的消息发完再换下一个人 | 换人前聚集窗口=%.1fs "
+                 "| 同一人连发的第 2 条起省一次侧边栏 OCR", self.group_gather_seconds)
+
+    def _is_blocked(self, target: str) -> bool:
+        with self._sched_cv:
+            return target in self._blocked_contacts
+
+    def _block_contact(self, target: str) -> None:
+        with self._sched_cv:
+            if target not in self._blocked_contacts:
+                self._blocked_contacts.add(target)
+                log.warning("[wxui] ⏸ 联系人「%s」有消息未送达，后续消息先排队（保证顺序不颠倒）",
+                            target)
+
+    def _cascade_queued_jobs(self, contact: str) -> None:
+        """把这个联系人已经排进调度器的后续任务按原顺序转入重发队列。
+
+        起因（2026-10-20 13:22 桃桃那三条）：第 1 段发送被 windows-mcp 的
+        CONTROL_PREEMPTED 拒了、进了重发队列，第 2/3 段仍照常直发并成功，于是
+        用户先看到后两段、第 1 段三分钟后才到。这里让「后面几段」跟着一起排队，
+        重发队列会按入队顺序逐条送达。
+        """
+        with self._sched_cv:
+            queued = list(self._sched_queues.pop(contact, ()))
+            self._sched_current = ""
+            self._sched_turn_sent = 0
+        for job in queued:
+            self._enqueue(job["subcmd"], job["spec"], contact,
+                          {"retryable": True,
+                           "error": "queued behind earlier undelivered message"})
+            job["ok"] = False
+            job["data"] = {"retryable": True, "error_kind": "queued", "_enqueued": True,
+                           "error": "queued behind earlier undelivered message"}
+            job["event"].set()
+        if queued:
+            log.warning("[wxui] ⏸ 同一联系人的 %d 条后续消息跟着排队，等前一条送达后再按序发出",
+                        len(queued))
+
+    def _scheduled_run(self, subcmd: str, spec: dict, target: str):
+        """Queue one UI action behind the current contact's turn and wait for its result.
+
+        Callers keep the same blocking contract as `_run` — the OneBot API reply still
+        carries the real result — but the ordering guarantee fixes "好几个人同时找我":
+        出站不会再在几个人的窗口之间来回跳。
+        """
+        job = {"subcmd": subcmd, "spec": spec, "event": threading.Event(),
+               "ok": False, "data": {}}
+        with self._sched_cv:
+            self._sched_queues.setdefault(target, collections.deque()).append(job)
+            self._sched_cv.notify_all()
+        # 给一点宽裕量：这个任务可能排在别的联系人后面（最坏 = 对方一次发送超时）。
+        if not job["event"].wait(timeout=self.wxui_timeout + 120):
+            log.error("[wxui] 调度超时，未执行: %s → %s", subcmd, target)
+            return False, {"retryable": True, "error_kind": "timeout",
+                           "error": "grouped scheduler did not run the job in time"}
+        return job["ok"], job["data"]
+
+    def _sched_loop(self) -> None:
+        while True:
+            with self._sched_cv:
+                while not self._sched_queues and not self._sched_stop.is_set():
+                    self._sched_cv.wait()
+                if self._sched_stop.is_set() and not self._sched_queues:
+                    return
+                contact = next(iter(self._sched_queues))
+                job = self._sched_queues[contact].popleft()
+                same_turn = (contact == self._sched_current and self._sched_turn_sent > 0)
+                self._sched_current = contact
+                self._sched_turn_sent = self._sched_turn_sent + 1 if same_turn else 1
+            # UI 动作放在调度锁外：一次发送可能几十秒，不能占着锁
+            try:
+                ok, data = self._run(job["subcmd"], job["spec"], contact,
+                                     assume_current=same_turn)
+            except Exception as e:  # 调度线程绝不能因单条消息崩掉
+                log.error("[wxui] 调度发送异常: %s", e)
+                ok, data = False, {"retryable": True, "error_kind": "scheduler",
+                                   "error": "scheduler run failed: %s" % e}
+            job["ok"], job["data"] = ok, data
+            if not ok and self._retryable(data):
+                # 先让「失败的那条」入队，再把同一联系人排在后面的任务也排到它后面：
+                # 顺序在这里保证（调用方看到 _enqueued 就不再重复入队）。
+                self._block_contact(contact)
+                self._enqueue(job["subcmd"], job["spec"], contact, data)
+                job["data"] = {**data, "_enqueued": True}
+                self._cascade_queued_jobs(contact)
+            job["event"].set()
+            # 同一个人后面可能还跟着（LLM 分段的）下一条：给一个很短的聚集窗口，
+            # 等到就继续发他，等不到才换下一个人。
+            with self._sched_cv:
+                if not self._sched_queues.get(contact):
+                    deadline = time.monotonic() + self.group_gather_seconds
+                    while not self._sched_queues.get(contact) and time.monotonic() < deadline:
+                        self._sched_cv.wait(max(0.0, deadline - time.monotonic()))
+                    if not self._sched_queues.get(contact):
+                        self._sched_queues.pop(contact, None)
+                        self._sched_current = ""
+                        self._sched_turn_sent = 0
+
+    def stop(self) -> None:
+        """Stop the retry-queue and grouping workers (clean shutdown / tests)."""
+        self._queue_stop.set()
+        with self._sched_cv:
+            self._sched_stop.set()
+            self._sched_cv.notify_all()
+        self._worker_kill("bridge 停止")
+
+    # ==================== 重发队列 ====================
+
+    @staticmethod
+    def _retryable(data: dict) -> bool:
+        """True when the message may simply not have been delivered yet."""
+        if not data:
+            return True
+        if data.get("retryable") is True:
+            return True
+        if data.get("error_kind") in ("timeout", "spawn", "no-output"):
+            return True
+        text = str(data.get("error") or "")
+        return any(s in text for s in (
+            "session unavailable",
+            "not capturable",          # RDP 断连 / 锁屏
+            "desktop input refused",   # 用户在动键鼠，windows-mcp 拒绝注入
+            "user is using the desktop",
+            "minimized/hidden",
+            "not read back",           # 进了输入框但没回读到（可能发晚、也可能没发）
+            "could not locate target row",
+            "did not take focus",
+            "not WeChat",
+            "could not bring WeChat",
+            "WeChat window not found",
+        ))
+
+    def _enqueue(self, kind: str, spec: dict, target: str, data: dict) -> None:
+        if kind == "send-image":
+            # 复制一份到队列自己的目录：调用方的图片多为临时文件，发完就删
+            src = str(spec.get("path") or "")
+            if not src or not os.path.exists(src):
+                log.error("[wxui] 图片入队失败（源文件不存在）: %s", src)
+                return
+            try:
+                os.makedirs(self.queue_asset_dir, exist_ok=True)
+                ext = os.path.splitext(src)[1] or ".png"
+                dst = os.path.join(self.queue_asset_dir,
+                                   "%d-%d%s" % (int(time.time() * 1000), os.getpid(), ext))
+                shutil.copy2(src, dst)
+                spec = {**spec, "path": dst}
+            except OSError as e:
+                log.error("[wxui] 图片入队失败（复制到 %s 出错）: %s", self.queue_asset_dir, e)
+                return
+        item = {
+            "kind": kind,
+            "spec": spec,
+            "target": target,
+            "created": time.time(),
+            "attempts": 0,
+            "since_local_id": int(data.get("before_local_id") or 0),
+            "last_error": data.get("error") or data.get("error_kind") or "unknown",
+        }
+        with self._queue_lock:
+            try:
+                with open(self.retry_queue_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+            except OSError as e:
+                log.error("[wxui] 写重发队列失败: %s", e)
+                return
+        log.warning("[wxui] ⏳ 已加入重发队列 %s → %s | 原因=%s | 队列=%s",
+                    kind, target, item["last_error"], self.retry_queue_path)
+
+    def _drop_asset(self, item: dict) -> None:
+        """删掉为队列复制出来的图片副本（只删队列目录里的，不动原图）。"""
+        path = str((item.get("spec") or {}).get("path") or "")
+        if not path:
+            return
+        try:
+            if os.path.dirname(os.path.abspath(path)) == os.path.abspath(self.queue_asset_dir):
+                os.unlink(path)
+        except OSError:
+            pass
+
+    def _load_queue(self) -> list:
+        if not os.path.exists(self.retry_queue_path):
+            return []
+        items = []
+        try:
+            with open(self.retry_queue_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        items.append(json.loads(line))
+                    except ValueError:
+                        continue
+        except OSError as e:
+            log.error("[wxui] 读重发队列失败: %s", e)
+        return items
+
+    def _save_queue(self, items: list) -> None:
+        tmp = self.retry_queue_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                for it in items:
+                    fh.write(json.dumps(it, ensure_ascii=False) + "\n")
+            os.replace(tmp, self.retry_queue_path)
+        except OSError as e:
+            log.error("[wxui] 保存重发队列失败: %s", e)
+
+    def pending_count(self) -> int:
+        with self._queue_lock:
+            return len(self._load_queue())
+
+    def _start_queue_worker(self) -> None:
+        if self._queue_thread:
+            return
+        self._queue_thread = threading.Thread(target=self._queue_loop, name="wxui-retry",
+                                              daemon=True)
+        self._queue_thread.start()
+        log.info("[wxui] 重发队列已启动 | 文件=%s | 待重发=%d | 间隔=%.0fs | 上限=%d 次",
+                 self.retry_queue_path, self.pending_count(), self.queue_interval,
+                 self.queue_max_attempts)
+
+    def _queue_loop(self) -> None:
+        while not self._queue_stop.wait(self.queue_interval):
+            try:
+                self.drain_queue()
+            except Exception as e:  # 队列线程绝不能因单条消息崩掉
+                log.error("[wxui] 重发队列处理异常: %s", e)
+
+    def drain_queue(self) -> dict:
+        """Resend what failed。重发前先做只读回读校验，已送达的直接丢弃（不重复发）。"""
+        with self._queue_lock:
+            items = self._load_queue()
+        if not items:
+            return {"checked": 0, "delivered": 0, "resent": 0, "failed": 0, "dropped": 0}
+
+        remaining, stat = [], {"checked": len(items), "delivered": 0, "resent": 0,
+                               "failed": 0, "dropped": 0}
+        # 本联系人还有更早的没送达时，后面的不许本轮越序发送
+        blocked_this_round: set[str] = set()
+        for it in items:
+            spec = dict(it.get("spec") or {})
+            target = str(it.get("target") or spec.get("target") or "")
+            since = int(it.get("since_local_id") or 0)
+            if target in blocked_this_round:
+                stat["failed"] += 1
+                remaining.append(it)
+                continue
+            # 1) 只读校验：这条是不是其实已经发出去了？是 → 丢弃，绝不重发
+            _, vdata = self._run("verify", {**spec, "since_local_id": since, "timeout": 3},
+                                 target, quiet=True)
+            if vdata.get("verified"):
+                stat["delivered"] += 1
+                log.info("[wxui] ✅ 重发队列：%s 其实已送达（localId=%s），丢弃不重发",
+                         target, vdata.get("localId"))
+                self._drop_asset(it)
+                continue
+            # 2) 确实没送到 → 重发
+            it["attempts"] = int(it.get("attempts") or 0) + 1
+            subcmd = "send-image" if it.get("kind") == "send-image" else "send"
+            ok, data = self._scheduled_run(subcmd, {**spec, "commit": True}, target)
+            if ok:
+                stat["resent"] += 1
+                continue
+            it["last_error"] = data.get("error") or data.get("error_kind") or "unknown"
+            if it["attempts"] >= self.queue_max_attempts or not self._retryable(data):
+                stat["dropped"] += 1
+                log.error("[wxui] ❌ 重发放弃（尝试 %d 次，原因=%s）→ %s",
+                          it["attempts"], it["last_error"], target)
+                self._drop_asset(it)
+                continue
+            stat["failed"] += 1
+            remaining.append(it)
+            blocked_this_round.add(target)
+
+        with self._queue_lock:
+            self._save_queue(remaining)
+        # 队列里这个联系人的都送完了 → 恢复直发
+        still_queued = {str(it.get("target") or "") for it in remaining}
+        with self._sched_cv:
+            for target in list(self._blocked_contacts):
+                if target and target not in still_queued:
+                    self._blocked_contacts.discard(target)
+                    log.info("[wxui] ▶ 联系人「%s」没有待重发消息了，恢复正常直发", target)
+        log.info("[wxui] 重发队列本轮：检查 %d，已送达丢弃 %d，重发成功 %d，仍失败 %d，放弃 %d，剩余 %d",
+                 stat["checked"], stat["delivered"], stat["resent"], stat["failed"],
+                 stat["dropped"], len(remaining))
+        return stat
+
+    # ==================== 诊断 ====================
+
+    def health(self) -> dict:
+        info = {"script": self.script, "python": self.python_exe, "backend": "wxui",
+                "pending_retries": self.pending_count(), "retry_queue": self.retry_queue_path,
+                "group_gather_seconds": self.group_gather_seconds,
+                "warm_worker": self.warm_worker,
+                "worker_alive": bool(self._worker is not None and self._worker.poll() is None),
+                "worker_requests": self._worker_seq}
+        if not os.path.exists(self.script or ""):
+            info.update(ok=False, error="script missing")
+            return info
+        try:
+            proc = subprocess.run(
+                [self.python_exe, self.script, "info"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+            )
+            data = json.loads(proc.stdout or "{}")
+            info.update(ok=bool(data.get("hwnd")), hwnd=data.get("hwnd"),
+                        rect=data.get("rect") or data.get("rect_restored"),
+                        session_ok=data.get("session_ok"),
+                        session_reason=data.get("session_reason"),
+                        control_state=data.get("control_state"))
+        except Exception as e:
+            info.update(ok=False, error=str(e))
+        return info
+

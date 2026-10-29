@@ -519,31 +519,43 @@ class AffectionPlugin(Star):
     @staticmethod
     def _inject_emotion_content(req, emotion_prompt: str):
         """
-        将情绪提示追加到倒数第一条 user 消息（KV Cache 友好模式）。
-        兼容 content=str 和 content=list（OpenAI 多模态格式）。
-        如果找不到 user 消息，兜底写入 system_prompt。
-        """
-        if not hasattr(req, "messages") or not isinstance(req.messages, list):
-            if hasattr(req, "system_prompt"):
-                req.system_prompt = (
-                    req.system_prompt + "\n\n" + emotion_prompt
-                    if req.system_prompt
-                    else emotion_prompt
-                )
-            return
+        把情绪提示注入到本轮用户消息的末尾（KV Cache 友好模式）。
 
-        for msg in reversed(req.messages):
+        优先级（前两种都落在 prompt 尾部，system 前缀保持逐字节稳定）：
+        1. req.messages 里最后一条 user 消息（部分版本在钩子里已构建好）
+        2. req.extra_user_content_parts（AstrBot 4.29 的标准尾部通道）
+        3. 兜底 system_prompt —— 只在上面两条通道都不可用时使用，因为
+           写进 system 会让整段 system 每轮漂移，直接打掉 DeepSeek 的
+           前缀缓存（实测命中率从 ~90% 掉到 ~10%）。
+        """
+        messages = getattr(req, "messages", None)
+        if isinstance(messages, list):
+            for msg in reversed(messages):
+                try:
+                    if isinstance(msg, dict) and msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        msg["content"] = _append_to_content(content, emotion_prompt)
+                        return "messages"
+                    if hasattr(msg, "role") and msg.role == "user":
+                        content = getattr(msg, "content", "")
+                        msg.content = _append_to_content(content, emotion_prompt)
+                        return "messages"
+                except Exception:
+                    continue
+
+        parts = getattr(req, "extra_user_content_parts", None)
+        if isinstance(parts, list):
             try:
-                if isinstance(msg, dict) and msg.get("role") == "user":
-                    content = msg.get("content", "")
-                    msg["content"] = _append_to_content(content, emotion_prompt)
-                    return
-                if hasattr(msg, "role") and msg.role == "user":
-                    content = getattr(msg, "content", "")
-                    msg.content = _append_to_content(content, emotion_prompt)
-                    return
+                from astrbot.core.agent.message import TextPart
+
+                part = TextPart(text=emotion_prompt)
+                marker = getattr(part, "mark_as_temp", None)
+                if callable(marker):
+                    part = marker()
+                parts.append(part)
+                return "extra_user_content_parts"
             except Exception:
-                continue
+                pass
 
         # 兜底：写入 system_prompt
         if hasattr(req, "system_prompt"):
@@ -552,6 +564,8 @@ class AffectionPlugin(Star):
                 if req.system_prompt
                 else emotion_prompt
             )
+            return "system_prompt"
+        return "none"
 
 
 # ====================================================================

@@ -44,7 +44,7 @@ class EpistemicCalibrationTests(unittest.TestCase):
             id="group-summary",
             memory_type="conversation_summary",
             subject=EntityRef.bot_self("bot-1", "轻语"),
-            object=EntityRef(kind="group", id="g1", name="测试群"),
+            object=EntityRef(kind="group", id="g1", name="示例群聊D"),
             scope="group",
             session_id="qq:GroupMessage:g1",
             group_id="g1",
@@ -685,7 +685,7 @@ class VerifiedGroupBotFactTests(unittest.IsolatedAsyncioTestCase):
             scope="group",
             platform="qq",
             group_id="g1",
-            group_name="测试群",
+            group_name="示例群聊D",
             bot_id="bot-1",
         )
         rows = [

@@ -433,3 +433,22 @@ def test_status_allows_index_rebuild_for_completed_old_prompt_caption(
     assert status["can_rebuild_index"] is True
     assert status["queued_caption_tasks"] == 0
     assert status["queued_embedding_tasks"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("queue_status", ["paused", "running"])
+async def test_rebuild_preserves_paused_or_interrupted_queue(manager, tmp_path, monkeypatch, queue_status):
+    from unittest.mock import Mock
+
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    monkeypatch.setattr(manager, "_pack_dir", lambda pack_id: pack)
+    provider = Mock()
+    monkeypatch.setattr(manager, "_require_embedding_provider", provider)
+    state = {"task_status": queue_status, "task_phase": "captioning", "mode": "full"}
+    manager._save_state("pack", state)
+    with pytest.raises(RuntimeError, match="暂停或中断"):
+        await manager.rebuild_index("pack", force=False)
+    assert manager._load_state("pack") == state
+    assert not manager._index_tasks
+    provider.assert_not_called()

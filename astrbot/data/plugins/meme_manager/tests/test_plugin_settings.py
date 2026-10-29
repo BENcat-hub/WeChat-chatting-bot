@@ -522,3 +522,24 @@ async def test_custom_quantity_template_is_shared_without_changing_hard_limit(
         == "AstrBot edited template"
     )
     assert fields["generation.prompt.quantity_guidance_enabled"]["default"] is False
+
+
+def test_collection_embedding_setting_defaults_and_runtime_wiring(
+    shared_config, start_plugin, monkeypatch
+):
+    snapshot, values = describe_settings(shared_config)
+    field = next(
+        item for item in snapshot["fields"]
+        if item["path"] == "semantic.auto_collect_embedding"
+    )
+    assert field["default"] is True
+    assert shared_config.schema["semantic"]["items"]["auto_collect_embedding"]["condition"] == {"enabled": True}
+    manager = Mock(return_value=SimpleNamespace())
+    monkeypatch.setattr(plugin_main, "AutoCollectManager", manager)
+    start_plugin(values)
+    assert manager.call_args.args[1]["auto_embedding"] is True
+    updated = validate_settings_changes(
+        values, snapshot["fields"], {field["path"]: False}, shared_config.schema
+    )
+    start_plugin(updated)
+    assert manager.call_args.args[1]["auto_embedding"] is False

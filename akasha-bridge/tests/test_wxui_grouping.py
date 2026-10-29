@@ -181,7 +181,9 @@ class WxuiFastPathSourceTest(unittest.TestCase):
             self.src = fh.read()
 
     def test_flag_is_exposed_on_both_send_commands(self):
-        self.assertEqual(2, self.src.count('"--assume-current"'))
+        # send / send-image 各一次；2026-10-20 加了 send-file（翻唱 mp3）后是三次。
+        self.assertGreaterEqual(self.src.count('"--assume-current"'), 3)
+        self.assertIn('pf.add_argument("--assume-current", action="store_true")', self.src)
 
     def test_spec_field_is_honoured(self):
         self.assertIn('spec.get("assume_current", assume_current)', self.src)

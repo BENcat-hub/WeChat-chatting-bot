@@ -1,9 +1,10 @@
 export function setupCatalogUpdates({ apiGet, apiPost, onDone, onBusy }) {
   const dialog = document.createElement("dialog");
   dialog.id = "update-dialog";
+  dialog.className = "ui-dialog";
   dialog.setAttribute("aria-labelledby", "update-title");
   dialog.innerHTML = `
-    <h2 id="update-title" class="text-h3 pa-4 pb-0 pl-6">更新表情包</h2>
+    <h2 id="update-title" class="ui-dialog-title text-h3 pa-4 pb-0 pl-6">更新表情包</h2>
     <p id="update-status" role="status" aria-live="polite"></p>
     <div id="update-review" hidden>
       <fieldset id="update-fields">

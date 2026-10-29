@@ -62,10 +62,3 @@ secrets/weflow-token.txt
 Thumbs.db
 desktop.ini
 .DS_Store
-# ---- Bert-VITS2 权重与上游仓库（体积大、可再下载）----
-bertvits2/pretrained/
-bertvits2/repo/
-bertvits2/logs/
-bertvits2/*.pth
-bertvits2/*.pt
-providers/*.wav

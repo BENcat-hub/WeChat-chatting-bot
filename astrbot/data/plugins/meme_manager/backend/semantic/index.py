@@ -12,6 +12,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from ..packs.protocol import validate_pack_id
 from .models import (
     REVIEW_CATEGORY,
     SCHEMA_VERSION,
@@ -22,7 +23,13 @@ from .models import (
     text_hash,
     utc_now,
 )
-from .storage import file_sha256, load_metadata, safe_relative_path, save_metadata
+from .storage import (
+    file_sha256,
+    load_metadata,
+    refresh_metadata_inventory_snapshot,
+    safe_relative_path,
+    save_metadata,
+)
 
 INDEX_FORMAT = "faiss-indexflatip-v1"
 QUERY_CACHE_SIZE = 128
@@ -202,9 +209,7 @@ class EmbeddingAdapter:
 
 
 def index_dir(plugin_data_dir: Path | str, pack_id: str) -> Path:
-    value = str(pack_id or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9._-]{2,64}", value):
-        raise ValueError("pack_id 无效")
+    value = validate_pack_id(pack_id)
     return Path(plugin_data_dir).resolve() / "semantic_indexes" / value
 
 
@@ -349,7 +354,23 @@ def index_is_ready(
     embedding_provider_id: str | None = None,
     embedding_model: str | None = None,
     embedding_dimension: int | None = None,
+    *,
+    allow_partial: bool = False,
 ) -> bool:
+    """Check whether the saved index matches the current semantic records.
+
+    Args:
+        plugin_data_dir: Directory containing local indexes.
+        pack_id: Pack identifier.
+        metadata: Current semantic records.
+        embedding_provider_id: Expected provider identifier, if specified.
+        embedding_model: Expected model name, if specified.
+        embedding_dimension: Expected vector dimension, if specified.
+        allow_partial: Accept an index with at least one unchanged, completed entry.
+
+    Returns:
+        Whether the index has the required matching entries and provider signature.
+    """
     manifest = load_index_manifest(plugin_data_dir, pack_id)
     if manifest.get("index_format") != INDEX_FORMAT:
         return False
@@ -381,6 +402,12 @@ def index_is_ready(
     manifest_items = manifest.get("items", {})
     if not isinstance(manifest_items, dict) or len(manifest_items) != item_count:
         return False
+    if not allow_partial and any(
+        not semantic_caption_is_complete(item) or item.get("embedding_status") != "done"
+        for item in images.values()
+        if isinstance(item, dict) and item.get("category") != REVIEW_CATEGORY
+    ):
+        return False
     indexable = {
         digest: item
         for digest, item in images.items()
@@ -392,15 +419,21 @@ def index_is_ready(
         and item.get("tags")
         and item.get("text_hash")
     }
-    if not indexable or len(indexable) != item_count:
+    if not indexable or (not allow_partial and len(indexable) != item_count):
         return False
+    valid_count = 0
     for digest, item in indexable.items():
         current_hash = text_hash(SemanticImage.from_dict(item).vector_text)
-        if str(item.get("text_hash") or "") != current_hash:
+        manifest_item = manifest_items.get(digest)
+        matches = (
+            str(item.get("text_hash") or "") == current_hash
+            and isinstance(manifest_item, dict)
+            and str(manifest_item.get("text_hash") or "") == current_hash
+        )
+        if not matches and not allow_partial:
             return False
-        if str(manifest_items.get(digest, {}).get("text_hash") or "") != current_hash:
-            return False
-    return True
+        valid_count += int(matches)
+    return valid_count > 0
 
 
 def _reconstruct_reusable_vectors(
@@ -446,12 +479,28 @@ async def build_index(
     embedding: EmbeddingAdapter,
     *,
     force: bool = False,
+    incremental_only: bool = False,
     target_entry_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    """建立真实 FAISS 精确索引，只重新向量化新增或语义变化的图片。
+    """Build a FAISS index while reusing compatible vectors.
 
-    ``target_entry_ids`` 用于主页单图更新。设置后，若旧索引无法复用任意
-    非目标图片的向量，会在调用模型前拒绝，绝不会退化成整包请求。
+    Args:
+        pack_dir: Directory containing the pack's images and semantic records.
+        plugin_data_dir: Plugin runtime directory containing local indexes.
+        pack_id: Pack identifier.
+        embedding: Provider adapter used to generate missing vectors.
+        force: Regenerate all vectors instead of reusing the saved index.
+        incremental_only: Reject damaged existing indexes instead of regenerating
+            unchanged entries through the embedding provider.
+        target_entry_ids: Restrict generation to these entries; reject updates
+            that would require embedding other entries.
+
+    Returns:
+        Saved index manifest and generation statistics.
+
+    Raises:
+        RuntimeError: No descriptions are ready or existing vectors cannot be
+            reused within the requested update scope.
     """
     if not embedding.ready:
         raise RuntimeError("未配置 AstrBot 核心向量模型")
@@ -487,6 +536,22 @@ async def build_index(
         old_index = await _run_blocking(
             _read_faiss_index, plugin_data_dir, pack_id, old_manifest
         )
+    if (
+        incremental_only
+        and (
+            old_manifest
+            or index_manifest_path(plugin_data_dir, pack_id).exists()
+            or any(index_dir(plugin_data_dir, pack_id).glob("index*.faiss"))
+        )
+        and (
+            old_index is None
+            or int(old_index.d) != embedding.dimension
+            or int(old_index.ntotal) != _manifest_int(old_manifest.get("item_count"))
+            or not isinstance(old_manifest.get("items"), dict)
+            or len(old_manifest["items"]) != int(old_index.ntotal)
+        )
+    ):
+        raise RuntimeError("现有向量索引无法复用，请使用全量重建")
     vectors = {}
     if old_index is not None:
         vectors = await _run_blocking(
@@ -494,6 +559,16 @@ async def build_index(
         )
 
     pending = [(digest, item) for digest, item in candidates if digest not in vectors]
+    old_items = old_manifest.get("items", {})
+    old_text_hashes = {
+        str(item.get("text_hash"))
+        for item in (old_items.values() if isinstance(old_items, dict) else ())
+        if isinstance(item, dict) and item.get("text_hash")
+    }
+    if incremental_only and any(
+        item.get("text_hash") in old_text_hashes for _, item in pending
+    ):
+        raise RuntimeError("现有索引中的未变更向量无法读取，请使用全量重建")
     target_ids = {str(value) for value in (target_entry_ids or set()) if str(value)}
     if target_entry_ids is not None:
         candidate_ids = {digest for digest, _ in candidates}
@@ -585,6 +660,9 @@ async def build_index(
         Returns:
             已写入磁盘的索引清单。
         """
+        # Validate the inventory before publishing a new index snapshot. A path
+        # enumeration failure must leave the previous manifest untouched.
+        refresh_metadata_inventory_snapshot(pack_dir, metadata)
         successful = [
             (digest, item)
             for digest, item in sorted(candidates)
@@ -645,8 +723,24 @@ async def search_index(
     *,
     top_k: int = 5,
     min_score: float = 0.25,
+    pack_dir: Path | str | None = None,
 ) -> list[dict[str, Any]]:
-    manifest = load_index_manifest(plugin_data_dir, pack_id)
+    """Search valid entries, checking current files when a pack directory is supplied.
+
+    Args:
+        plugin_data_dir: Directory containing local semantic indexes.
+        pack_id: Pack identifier.
+        query: Text to embed and search.
+        embedding: Configured embedding provider adapter.
+        metadata: Semantic records corresponding to the pack.
+        top_k: Maximum number of valid results.
+        min_score: Minimum cosine similarity score.
+        pack_dir: Pack root used to exclude deleted or replaced candidate files.
+
+    Returns:
+        Ranked entries whose semantic content and optional files remain valid.
+    """
+    manifest = await _run_blocking(load_index_manifest, plugin_data_dir, pack_id)
     if manifest.get("index_format") != INDEX_FORMAT:
         return []
     manifest_dimension = _manifest_int(manifest.get("embedding_dimension", 0))
@@ -656,54 +750,94 @@ async def search_index(
         or manifest_dimension != embedding.dimension
     ):
         return []
-    index = _read_faiss_index(plugin_data_dir, pack_id, manifest)
-    if index is None or int(index.ntotal) <= 0:
+    index = await _run_blocking(_read_faiss_index, plugin_data_dir, pack_id, manifest)
+    if index is None or int(index.ntotal) <= 0 or int(top_k) <= 0:
         return []
-    faiss, np = _import_faiss_modules()
-    query_vector = np.asarray(
-        [await embedding.embed(str(query or ""))], dtype="float32"
-    )
-    faiss.normalize_L2(query_vector)
-    result_limit = min(max(0, int(top_k)), int(index.ntotal))
-    if result_limit <= 0:
-        return []
-    scores, ids = index.search(query_vector, result_limit)
-    id_to_digest = {}
+    data = metadata or {}
     raw_manifest_items = manifest.get("items", {})
     if not isinstance(raw_manifest_items, dict):
         return []
-    for digest, item in raw_manifest_items.items():
-        if not isinstance(item, dict):
-            continue
-        faiss_id = _manifest_int(item.get("faiss_id"))
-        if faiss_id is not None:
-            id_to_digest[faiss_id] = digest
-    data = metadata or {}
-    ranked = []
-    for score, faiss_id in zip(scores[0].tolist(), ids[0].tolist()):
-        digest = id_to_digest.get(int(faiss_id))
-        item = data.get("images", {}).get(digest) if digest else None
-        if (
-            not isinstance(item, dict)
-            or item.get("category") == REVIEW_CATEGORY
-            or not semantic_caption_is_complete(item)
-        ):
-            continue
-        if float(score) < float(min_score):
-            continue
-        ranked.append((float(score), digest, item))
-    # ID 必须针对整个索引检查碰撞，不能只看当前 Top-K。
-    id_map = build_id_map(manifest.get("items", {}).keys())
-    return [
-        {
-            "id": id_map[digest],
-            "entry_id": digest,
-            "content_sha256": str(item.get("content_sha256") or ""),
-            "category": str(item.get("category") or ""),
-            "category_tag": str(item.get("category_tag") or ""),
-            "caption": str(item.get("caption") or ""),
-            "tags": item.get("tags") or [],
-            "score": score,
-        }
-        for score, digest, item in ranked
-    ]
+    query_embedding = await embedding.embed(str(query or ""))
+
+    def rank_candidates() -> list[dict[str, Any]]:
+        """Rank and validate candidates without blocking the event loop.
+
+        Returns:
+            Valid candidates, expanding the search when stale entries are skipped.
+        """
+        id_to_digest = {}
+        for digest, item in raw_manifest_items.items():
+            if not isinstance(item, dict):
+                continue
+            faiss_id = _manifest_int(item.get("faiss_id"))
+            if faiss_id is not None:
+                id_to_digest[faiss_id] = digest
+        faiss, np = _import_faiss_modules()
+        query_vector = np.asarray([query_embedding], dtype="float32")
+        faiss.normalize_L2(query_vector)
+        result_limit = min(int(top_k), int(index.ntotal))
+        checked_ids = set()
+        ranked = []
+        while True:
+            scores, ids = index.search(query_vector, result_limit)
+            for score, faiss_id in zip(scores[0].tolist(), ids[0].tolist()):
+                if float(score) < float(min_score):
+                    break
+                if int(faiss_id) in checked_ids:
+                    continue
+                checked_ids.add(int(faiss_id))
+                digest = id_to_digest.get(int(faiss_id))
+                item = data.get("images", {}).get(digest) if digest else None
+                if (
+                    not isinstance(item, dict)
+                    or item.get("category") == REVIEW_CATEGORY
+                    or not semantic_caption_is_complete(item)
+                    or item.get("embedding_status") != "done"
+                    or str(raw_manifest_items[digest].get("text_hash") or "")
+                    != text_hash(SemanticImage.from_dict(item).vector_text)
+                ):
+                    continue
+                if pack_dir is not None:
+                    try:
+                        source = safe_relative_path(
+                            pack_dir, item.get("relative_path", "")
+                        )
+                        if (
+                            source is None
+                            or not source.is_file()
+                            or file_sha256(source)
+                            != str(item.get("content_sha256") or "")
+                        ):
+                            continue
+                    except OSError:
+                        continue
+                ranked.append((float(score), digest, item))
+                if len(ranked) >= int(top_k):
+                    break
+            if (
+                len(ranked) >= int(top_k)
+                or result_limit >= int(index.ntotal)
+                or float(scores[0][-1]) < float(min_score)
+            ):
+                break
+            # Reuse the query vector and only validate newly exposed candidates.
+            result_limit = min(result_limit * 2, int(index.ntotal))
+        if not ranked:
+            return []
+        # Public IDs must remain unambiguous across the complete saved index.
+        id_map = build_id_map(raw_manifest_items)
+        return [
+            {
+                "id": id_map[digest],
+                "entry_id": digest,
+                "content_sha256": str(item.get("content_sha256") or ""),
+                "category": str(item.get("category") or ""),
+                "category_tag": str(item.get("category_tag") or ""),
+                "caption": str(item.get("caption") or ""),
+                "tags": item.get("tags") or [],
+                "score": score,
+            }
+            for score, digest, item in ranked
+        ]
+
+    return await _run_blocking(rank_candidates)

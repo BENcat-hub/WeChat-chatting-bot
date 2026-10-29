@@ -31,19 +31,28 @@
   "warm_skip_session_probe": true,
   "send_attempts": 3,
   "retry_wait_s": 2.0,
-  "precheck_timeout_s": 3,
+  "precheck_timeout_s": 10,
   "session_wait_s": 60,
   "session_poll_s": 3.0,
   "clear_input_box": true,
   "input_box_y_from_bottom_px": 110,
   "dry_run": true,
   "contact_aliases": {
-    "桃桃真可爱": [
-      "陈铭坚"
+    "用户B": [
+      "用户B别名"
+    ],
+    "用户F": [
+      "用户F别名"
+    ],
+    "用户G": [
+      "用户G别名"
+    ],
+    "用户H": [
+      "用户H别名"
     ]
   },
   "alias_learn_file": "logs/wxui-aliases.json",
-  "_alias_note": "2026-10-18：微信侧改名后 WeFlow 的 displayName 仍是旧名，侧边栏却画新备注，于是「用 API 名字找 UI 行」永远匹配不上（用户把「桃桃真可爱」备注改成「陈铭坚」后消息直接发不出去，侧边栏截图确认 21:37 那波失败时显示的就是「陈铭坚」）。contact_aliases 是手填别名表，键与值互为别名；每次 WeFlow 回读确认成功的发送还会把侧边栏实际命中的名字写进 alias_learn_file（相对 wxui-config.json 的根目录），以后改备注只需在这里补一行。别名只做整行精确匹配、不做包含/模糊——否则「陈铭坚：嗯」这种群预览行也会命中，点开会发错人。",
+  "_alias_note": "2026-10-18：微信侧改名后 WeFlow 的 displayName 仍是旧名，侧边栏却画新备注，于是「用 API 名字找 UI 行」永远匹配不上（用户把「用户B」备注改成「用户B别名」后消息直接发不出去，侧边栏截图确认 21:37 那波失败时显示的就是「用户B别名」）。contact_aliases 是手填别名表，键与值互为别名；每次 WeFlow 回读确认成功的发送还会把侧边栏实际命中的名字写进 alias_learn_file（相对 wxui-config.json 的根目录），以后改备注只需在这里补一行。别名只做整行精确匹配、不做包含/模糊——否则「用户B别名：嗯」这种群预览行也会命中，点开会发错人。",
   "_calibration": "Physical pixels, measured 2026-10-14 on the 3840x2160 desktop (200% scaling) and only used as fallbacks now: the click point comes from the OCR'd session-row box (row_click_x_bias_px / row_click_y_bias_px off its centre), and every capture region is clamped inside the window (clamp_region) so a resized window cannot make the script read or click outside WeChat. sidebar_x_offset_px / first_row_offset_px remain the no-OCR fallback (--no-ocr with assume_row_index); row_pitch_px is only reported in the debug payload.",
   "_click_note": "max_row_clicks + repeat_click_min_interval_s + after_click_wait: the sidebar row is clicked at most this many times, never closer together than the interval, because two quick clicks are a double click and WeChat pops the chat out into its own window. If the target chat is already open (header OCR matches) no click happens at all.",
   "_retry_note": "send_attempts / retry_wait_s: how often one send is retried. session_wait_s + session_poll_s: how long to wait for the window to come back (minimized, or an RDP session that dropped) before the attempt is declared failed. precheck_timeout_s: read-back check done BEFORE each resend, so a message that did arrive late is never sent twice. clear_input_box: click the message box and ctrl+a/delete before pasting, so an interrupted attempt cannot be delivered as 'oldtextnewtext'. input_box_x_offset_px is optional; when absent the x is 72% of the window width, y is input_box_y_from_bottom_px above the bottom edge.",
@@ -54,13 +63,17 @@
   "sidebar_reset_scrolls": 12,
   "sidebar_scroll_pages": 6,
   "sidebar_scroll_wheel_times": 6,
-  "sidebar_search_fallback": false,
+  "sidebar_search_fallback": true,
   "search_focus_wait_s": 0.12,
-  "search_paste_wait_s": 0.28,
-  "search_open_wait_s": 0.3,
+  "search_paste_wait_s": 0.6,
+  "search_open_wait_s": 1.0,
+  "search_panel_wait_s": 1.2,
+  "search_panel_tries": 3,
+  "search_panel_retry_wait_s": 0.5,
+  "search_blind_click": false,
   "search_escape_wait_s": 0.4,
   "search_results_y_offset_px": 100,
-  "sidebar_ocr_scale": 2.0,
+  "sidebar_ocr_scale": 1.0,
   "header_verify_polls": 4,
   "header_verify_wait_s": 0.7,
   "locate_search_first": false,
@@ -71,17 +84,17 @@
   "native_input": true,
   "native_shots": true,
   "header_ocr_scales": [
-    1.0,
-    2.0,
-    3.0
+    1.0
   ],
+  "header_empty_retries": 2,
+  "header_ocr_note": "2026-10-29 RapidOCR 上线后 1x 原图就能读对聊天标题（用户F/用户C/示例群聊D均已实测），不再需要 2x/3x 多档扫描——一次 open_chat 的头像复核从 15 次 OCR 降到 3~5 次。若临时切回 ocr_engine=windows，把这里改回 [1.0, 2.0, 3.0]。",
   "click_safety_note": "1) 同一行只点一次；点完轮询头部复核，认不出就失败返回，绝不补第二下（同点连点会被系统合成双击，微信会把会话弹成独立窗口）。2) 任何输入之前必须确认前台就是微信主窗口：不在前台就自己把微信从最小化/后台唤起到前台，唤不起来就放弃本次发送。3) 绝不在非微信窗口上敲键盘/点鼠标——键会打到用户正在用的窗口里，还会触发系统提示音。",
   "double_click_guard_s": 0.55,
   "double_click_slop_px": 4,
   "sidebar_native_wheel": true,
   "sidebar_reset_notches": 16,
   "sidebar_wheel_wait_s": 0.15,
-  "search_box_disabled_note": "2026-10-21 弃用：点搜索框+粘贴会在搜索框里留下要回复的正文，实测把回复内容打进了搜索框。定位改用「头部 OCR 判当前会话 → 侧栏 OCR + 原生滚轮翻页」。要恢复搜索兜底请同时把 locate_search_first/locate_sidebar_fallback 改回来。",
+  "search_box_disabled_note": "2026-10-29 新策略（用户要求）：**OCR 优先、搜索只做兜底**。侧栏定位先走会话列表 OCR（RapidOCR，1x 原图就能读对「用户F」「示例群聊D」）；只有整张列表扫完仍找不到这一行时，才允许用搜索框（sidebar_search_fallback=true, locate_search_first=false）。搜索路径已禁止盲点：不再按固定坐标点第一行，必须 OCR 读到「整串等于目标名」的联系人/群聊行才点，读不到就 Esc 收工（历史事故：盲点点进视频号/聊天记录页，微信渲染进程随后半冻结）。",
   "locate_reclick_on_mismatch": false,
   "row_click_dedup_s": 20.0,
   "row_click_dedup_probe_s": 2.0,
@@ -91,8 +104,31 @@
   "sidebar_settle_timeout_s": 0.25,
   "sidebar_reset_chunk_notches": 12,
   "locate_settle_note": "翻页后只截一帧：画面和上一页不同即认为已滚到位；最多等 0.25s（原来 0.5s + 额外稳定检测）",
-  "search_disabled_note": "用户明确要求：定位只用侧栏 OCR + 原生滚轮 + 聊天头部校验，绝不用搜索框（会把待发送正文打进搜索框，还会点到聊天记录预览）",
+  "search_disabled_note": "定位顺序：①当前已打开的会话是不是目标（聊天头部 OCR）②侧栏会话列表逐页 OCR（RapidOCR 1x）③只有前两步都失败才用搜索框兜底。搜索框的历史问题（搜不到人 / 跳视频号 / 微信卡死）已由「只点 OCR 确认的精确联系人行 + 不盲点 + 用后 Esc 收起 + 独立窗口清理」兜住。",
   "defer_to_human": false,
   "identity_recheck_before_enter": true,
-  "identity_recheck_note": "2026-10-23：给桃桃的消息被连发三份到陈奥琦——校验时是桃桃，Ctrl+V 时会话已被用户切走。现在粘贴后回车前会再确认一次会话身份，不符就 Ctrl+A/Del 清空并放弃；用户正在用键鼠时（human_busy）直接让路，不抢输入。"
+  "identity_recheck_note": "2026-10-23：给桃桃的消息被连发三份到用户A——校验时是桃桃，Ctrl+V 时会话已被用户切走。现在粘贴后回车前会再确认一次会话身份，不符就 Ctrl+A/Del 清空并放弃；用户正在用键鼠时（human_busy）直接让路，不抢输入。",
+  "dedupe_window_s": 600,
+  "search_first_row_x_px": 250,
+  "search_first_row_y_px": 210,
+  "search_ocr_fallback": true,
+  "ocr_engine": "rapid",
+  "_ocr_note": "2026-10-29：Windows OCR（winsdk）对「用户F」在侧栏/聊天头部任何缩放都读不出（固定读成「丕忄尸」或整行漏掉），导致 07:51-07:53 给用户F的消息全被 identity_recheck 拦死。改用 .venv-ocr 里的 RapidOCR（PP-OCRv4）常驻进程，1x 原图即可读对（用户F score 0.91、示例群聊D正确）。ocr_engine=rapid 走常驻服务；windows 保留给排障；auto 失败时退回 Windows OCR。",
+  "ocr_pipe": "\\\\.\\pipe\\wxui-ocr",
+  "ocr_idle_s": 1800,
+  "ocr_timeout_s": 20,
+  "ocr_spawn_wait_s": 25,
+  "_ui_live_note": "2026-10-29：微信 4.x 的 MMUI 渲染子窗会「半冻结」——WM_NULL 9ms 返回、IsHungAppWindow=False，但侧栏/聊天区不重绘也不收鼠标（搜索/点视频号之后出现过）。ui_render_alive() 用「光标移到会话行上是否整行重绘」判活（正常：53% 像素变化；静止：0）。ensure_ui_live() 带 25s TTL 缓存，判定冻结且 wxui_auto_recover=true 时自动重启微信（10 分钟冷却、每小时最多 3 次），这是唯一验证有效的恢复手段。",
+  "ui_alive_diff_ratio": 0.01,
+  "ui_live_ttl_s": 60,
+  "wxui_auto_recover": true,
+  "wxui_recover_cooldown_s": 600,
+  "wxui_recover_max_per_hour": 3,
+  "wechat_exe": "C:\\Program Files\\Tencent\\Weixin\\Weixin.exe",
+  "wechat_login_width_px": 900,
+  "wechat_login_x_ratio": 0.5,
+  "wechat_login_y_ratio": 0.79,
+  "overlay_dismiss_x_ratio": 0.464,
+  "overlay_dismiss_y_ratio": 0.084,
+  "_overlay_dismiss_note": "2026-10-29 隔离实验（4 个 trial）：微信 4.x **在没有搜索面板时按 Esc 会冻结 MMUI 渲染子窗**（悬停不再重绘、点击/滚轮全无响应，只能重启进程恢复）；面板开着时按 Esc 反而安全。旧版搜索路径在「点完结果（面板已自动关闭）」后补 Esc，正是用户说的『搜索导致微信卡死』的根因。现在清覆盖层一律用 dismiss_overlay()：点聊天头部空白处 (0.464w, 0.084h) —— 面板开着时点在外面会收起面板，没开时点在标题栏空白处无副作用。"
 }

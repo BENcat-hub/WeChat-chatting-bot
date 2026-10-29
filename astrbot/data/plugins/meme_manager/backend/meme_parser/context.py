@@ -44,16 +44,20 @@ class ContextScanner:
             self.fence or self.reasoning or self.ticks or self.comment or self.link
         )
 
-    def scan(self, line: str) -> list[tuple[int, int]]:
+    def scan(
+        self, line: str, *, literal_ticks: set[int] | None = None
+    ) -> list[tuple[int, int]]:
         """Locate protected spans and retain unfinished context for the next line.
 
         Args:
             line: One original source line, including its line ending.
+            literal_ticks: Backtick runs that cannot open a matched code span,
+                expressed as character offsets in this line.
 
         Returns:
             Ordered non-overlapping protected character intervals.
         """
-        spans = _protected_reference_spans(line)
+        spans = _protected_reference_spans(line, protect_inline_code=False)
         fence = self._fence.match(line.rstrip("\r\n"))
         if self.fence:
             if (
@@ -72,6 +76,7 @@ class ContextScanner:
 
         start = 0 if self.active else None
         cursor = 0
+        plain_label_end = 0
         while cursor < len(line):
             if self.comment:
                 end = line.find("-->", cursor)
@@ -141,6 +146,9 @@ class ContextScanner:
                 continue
             if line[cursor] == "`":
                 match = self._ticks.match(line, cursor)
+                if literal_ticks is not None and cursor in literal_ticks:
+                    cursor = match.end()
+                    continue
                 self.ticks = len(match[0])
                 start = cursor
                 cursor += self.ticks
@@ -151,7 +159,7 @@ class ContextScanner:
                 start = cursor
                 cursor = reason.end()
                 continue
-            if line[cursor] == "[":
+            if line[cursor] == "[" and cursor >= plain_label_end:
                 # 成对的标签可保护嵌套标记和目标地址；单独且完整的
                 # [category] 仍交由标记识别器处理。
                 end, depth = cursor + 1, 1
@@ -176,6 +184,12 @@ class ContextScanner:
                     break
                 if "[" in line[cursor + 1 : end - 1]:
                     spans.append((cursor, end))
+                if "`" in line[cursor + 1 : end - 1]:
+                    # Code may start inside a label and close beyond its brackets.
+                    # Skip nested bracket rescans while visiting the label contents.
+                    plain_label_end = end
+                    cursor += 1
+                    continue
                 cursor = end
                 continue
             cursor += 1

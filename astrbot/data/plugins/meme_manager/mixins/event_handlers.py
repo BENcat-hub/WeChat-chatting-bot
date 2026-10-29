@@ -1,17 +1,14 @@
 import asyncio
 import copy
-import io
 import json
 import os
 import random
 import re
-import ssl
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-import aiohttp
 from PIL import Image as PILImage
 
 from astrbot.api import logger
@@ -21,6 +18,7 @@ from astrbot.api.message_components import *
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.core.message.components import Image, Plain
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
+from astrbot.core.platform.message_type import MessageType
 
 from ..backend.meme_parser import MemeParser
 from ..backend.meme_parser.text_safety import (
@@ -28,7 +26,12 @@ from ..backend.meme_parser.text_safety import (
     strip_internal_image_ref_lines,
 )
 from ..backend.packs.categories import resolve_safe_category_directory
-from ..backend.packs.images import IMAGE_EXTENSIONS
+from ..backend.packs.images import (
+    IMAGE_EXTENSIONS,
+    DuplicateEmojiError,
+    save_chat_upload_image,
+)
+from ..backend.packs.resolver import get_pack_paths, load_pack_category_mapping
 from ..backend.semantic.models import (
     REVIEW_CATEGORY,
     compact_semantic_query,
@@ -37,9 +40,9 @@ from ..backend.semantic.models import (
     runtime_category_mapping,
 )
 from ..backend.semantic.query import (
-    candidate_records,
+    candidate_records_multi_pack,
     remember_candidates,
-    search_memes,
+    search_memes_multi_pack,
     validate_selected_id,
 )
 from ..backend.semantic.storage import invalidate_semantic_metadata
@@ -51,15 +54,6 @@ TRIGGER_SCOPE_CHAT_AND_PLUGIN = "chat_and_plugin_llm"
 LLM_REQUEST_ORIGIN_EXTRA_KEY = "meme_manager_llm_request_origin"
 LLM_REQUEST_ORIGIN_CHAT = "chat"
 LLM_REQUEST_ORIGIN_PLUGIN = "plugin"
-
-# 语义检索词缓存与超时（2026-10-19 提速）。实测 deepseek-flash 把一句回复压成
-# 几个字的检索词要 7s 左右，而它是整条回复发送前的最后一个阻塞点：选图不快，
-# 正文就发不出去。这里做两件事：①同一段回复文本重复出现时复用上次检索词；
-# ②单次生成最多等 3.0s，超时退回「截短后的可见回复」，宁可词粗一点也不堵正文。
-EMOTION_QUERY_CACHE: dict[tuple[str, str], tuple[str, float]] = {}
-EMOTION_QUERY_CACHE_TTL_S = 900.0
-EMOTION_QUERY_CACHE_MAX = 256
-EMOTION_QUERY_TIMEOUT_S = 3.0
 
 
 def normalize_trigger_scope(value: Any) -> str:
@@ -583,6 +577,41 @@ class EventHandlerMixin:
         limit = getattr(self, "max_memes_per_message", -1)
         return selections[:limit] if limit >= 0 else selections
 
+    def _get_category_meme_files(
+        self, event: AstrMessageEvent, emotion: str
+    ) -> list[Path]:
+        """Collect category images from all currently bound packs.
+
+        Args:
+            event: Event used to resolve the current pack bindings.
+            emotion: Category name selected for delivery.
+
+        Returns:
+            Image paths from every bound pack, excluding review categories.
+        """
+        if not emotion or emotion == REVIEW_CATEGORY:
+            return []
+        context = self._resolve_runtime_pack_context(event=event)
+        roots = [
+            Path(directory) / "memes"
+            for directory in context.get("pack_dirs", {}).values()
+        ]
+        if not roots:
+            roots = [Path(self._get_runtime_memes_dir_for_event(event))]
+        images = []
+        for root in roots:
+            try:
+                directory = resolve_safe_category_directory(root, emotion)
+            except ValueError:
+                continue
+            if directory.is_dir():
+                images.extend(
+                    path
+                    for path in directory.iterdir()
+                    if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+                )
+        return images
+
     async def _build_emotion_images_for_event(
         self,
         event: AstrMessageEvent,
@@ -596,31 +625,15 @@ class EventHandlerMixin:
         if random_value > self.emotions_probability:
             return [], []
 
-        memes_root = self._get_runtime_memes_dir_for_event(event)
         emotion_images: list[Image] = []
         temp_files: list[str] = []
 
         for emotion in self._limit_meme_selection(emotions):
-            if not emotion or emotion == REVIEW_CATEGORY:
-                continue
-
-            try:
-                emotion_path = resolve_safe_category_directory(memes_root, emotion)
-            except ValueError:
-                continue
-            if not emotion_path.is_dir():
-                continue
-
-            memes = [
-                f
-                for f in os.listdir(emotion_path)
-                if f.lower().endswith(IMAGE_EXTENSIONS)
-            ]
+            memes = self._get_category_meme_files(event, emotion)
             if not memes:
                 continue
 
-            meme = random.choice(memes)
-            meme_file = str(emotion_path / meme)
+            meme_file = str(random.choice(memes))
 
             try:
                 final_meme_file = await asyncio.to_thread(
@@ -733,97 +746,332 @@ class EventHandlerMixin:
         }
 
     async def _handle_upload_image_impl(self, event: AstrMessageEvent):
+        """Save pending chat-upload images into the identified primary pack.
+
+        Args:
+            event: Event carrying the pending upload state and image components.
+
+        Yields:
+            One result chain summarizing saved, duplicate, failed, and
+            unprocessed counts together with any refresh warnings.
+        """
         user_key = f"{event.session_id}_{event.get_sender_id()}"
         upload_state = self.upload_states.get(user_key)
-        if not upload_state or time.time() > upload_state["expire_time"]:
-            if user_key in self.upload_states:
-                del self.upload_states[user_key]
+        try:
+            expired = time.time() > float(upload_state.get("expire_time") or 0)
+        except (AttributeError, TypeError, ValueError):
+            expired = True
+        if not upload_state or expired:
+            if self.upload_states.get(user_key) is upload_state:
+                self.upload_states.pop(user_key, None)
             return
+
         images = [c for c in event.message_obj.message if isinstance(c, Image)]
         if not images:
             yield event.plain_result("请发送图片文件来进行上传哦。")
             return
-        category = upload_state["category"]
+
+        category = str(upload_state.get("category") or "").strip()
         pack_id = str(upload_state.get("pack_id") or "").strip()
-        memes_dir = str(upload_state.get("memes_dir") or "").strip()
-        if not pack_id or not memes_dir:
-            pack_context = self._resolve_runtime_pack_context(event=event)
-            pack_id = str(pack_context.get("pack_id") or "").strip()
-            memes_dir = str(pack_context.get("memes_dir") or "").strip()
-        current_pack_id = str(
-            self._resolve_runtime_pack_context(event=event).get("pack_id") or ""
-        ).strip()
-        if current_pack_id != pack_id:
-            del self.upload_states[user_key]
-            yield event.plain_result("默认资源包已切换，请重新执行添加表情命令。")
+        recorded_memes_dir = str(upload_state.get("memes_dir") or "").strip()
+        state_label = f"主表情包「{pack_id or '未知'}」分类「{category or '未知'}」"
+        if not pack_id or not category or not recorded_memes_dir:
+            if self.upload_states.get(user_key) is upload_state:
+                self.upload_states.pop(user_key, None)
+            yield event.plain_result(
+                f"⚠️ {state_label}的上传状态无效，"
+                "请重新执行 /表情管理 添加表情 [类别名称]。"
+            )
             return
+
+        try:
+            pack_paths = get_pack_paths(pack_id)
+            pack_dir = Path(pack_paths["pack_dir"]).resolve()
+            canonical_memes_dir = Path(pack_paths["memes_dir"]).resolve()
+            recorded_path = Path(recorded_memes_dir).resolve()
+            if canonical_memes_dir == pack_dir:
+                raise ValueError("memes directory must be a child of the pack")
+            canonical_memes_dir.relative_to(pack_dir)
+        except (OSError, RuntimeError, ValueError):
+            pack_dir = None
+            canonical_memes_dir = None
+            recorded_path = None
+        if (
+            pack_dir is None
+            or canonical_memes_dir is None
+            or not pack_dir.is_dir()
+            or canonical_memes_dir != recorded_path
+        ):
+            if self.upload_states.get(user_key) is upload_state:
+                self.upload_states.pop(user_key, None)
+            yield event.plain_result(
+                f"⚠️ {state_label}的记录路径已失效，"
+                "请重新执行 /表情管理 添加表情 [类别名称]。"
+            )
+            return
+
         try:
             self.semantic_task_manager.begin_external_pack_operation(
                 pack_id, "接收并保存表情图片"
             )
         except RuntimeError as exc:
-            yield event.plain_result(f"⚠️ {exc}")
+            # Keep the pending state so the user can retry within its lifetime.
+            yield event.plain_result(
+                f"⚠️ {state_label}暂时无法写入：{exc}\n"
+                "上传请求仍然有效，请在30秒内重新发送图片重试。"
+            )
             return
-        save_dir = os.path.join(memes_dir, category)
-        try:
-            os.makedirs(save_dir, exist_ok=True)
-            saved_files = []
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            for idx, img in enumerate(images, 1):
-                timestamp = int(time.time())
-                try:
-                    if "multimedia.nt.qq.com.cn" in img.url:
-                        insecure_url = img.url.replace("https://", "http://", 1)
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(insecure_url) as resp:
-                                content = await resp.read()
-                    else:
-                        async with aiohttp.ClientSession(
-                            connector=aiohttp.TCPConnector(ssl=ssl_context)
-                        ) as session:
-                            async with session.get(img.url) as resp:
-                                content = await resp.read()
+
+        saved_count = 0
+        duplicate_count = 0
+        failed_count = 0
+        unprocessed_count = 0
+        stop_note = ""
+        refresh_notes: list[str] = []
+
+        def route_problem() -> str:
+            # Re-resolve the captured primary pack and its memes root
+            # synchronously, after routing awaits, immediately before a write.
+            try:
+                current_paths = get_pack_paths(pack_id)
+                current_pack_dir = Path(current_paths["pack_dir"]).resolve()
+                current_memes_dir = Path(current_paths["memes_dir"]).resolve()
+                if current_memes_dir == current_pack_dir:
+                    raise ValueError("memes directory must be a child of the pack")
+                current_memes_dir.relative_to(current_pack_dir)
+                context = self._resolve_runtime_pack_context(event=event)
+                current_pack_id = str(context.get("pack_id") or "").strip()
+                routed_memes_dir = Path(str(context.get("memes_dir") or "")).resolve()
+            except Exception as exc:
+                logger.warning(
+                    "Chat upload could not re-resolve routing for pack %s category %s: %s",
+                    pack_id,
+                    category,
+                    exc,
+                )
+                return "无法确认当前主表情包"
+            if current_pack_id != pack_id:
+                return "主表情包在接收过程中发生了变化"
+            if routed_memes_dir != canonical_memes_dir:
+                return "主表情包路径在接收过程中发生了变化"
+            if current_pack_dir != pack_dir or current_memes_dir != canonical_memes_dir:
+                return "主表情包路径在接收过程中发生了变化"
+            return ""
+
+        async def category_problem() -> str:
+            try:
+                primary_mapping = await asyncio.to_thread(
+                    load_pack_category_mapping, pack_id
+                )
+                category_path = resolve_safe_category_directory(
+                    canonical_memes_dir, category
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Chat upload could not re-check category %s for pack %s: %s",
+                    category,
+                    pack_id,
+                    exc,
+                )
+                return "无法确认分类是否仍属于当前主表情包"
+            if category in primary_mapping or category_path.is_dir():
+                return ""
+            return "分类已被删除或不再属于当前主表情包"
+
+        async def commit_image(content: bytes, index: int) -> None:
+            nonlocal saved_count, duplicate_count, failed_count
+            try:
+                await asyncio.to_thread(
+                    save_chat_upload_image,
+                    canonical_memes_dir,
+                    category,
+                    content,
+                )
+                # Count only after the worker has completed the write.
+                saved_count += 1
+            except DuplicateEmojiError as exc:
+                duplicate_count += 1
+                logger.info(
+                    "Chat upload skipped duplicate in pack %s category %s: %s",
+                    pack_id,
+                    category,
+                    exc.existing_filename,
+                )
+            except Exception as exc:
+                failed_count += 1
+                logger.warning(
+                    "Chat upload image %s/%s could not be saved in pack %s "
+                    "category %s: %s",
+                    index + 1,
+                    len(images),
+                    pack_id,
+                    category,
+                    exc,
+                )
+
+        async def refresh_metadata() -> None:
+            try:
+                await asyncio.to_thread(invalidate_semantic_metadata, pack_dir)
+            except Exception as exc:
+                refresh_notes.append("语义元数据刷新失败，已保存的图片不受影响。")
+                logger.warning(
+                    "Chat upload saved images but semantic invalidation failed "
+                    "for pack %s: %s",
+                    pack_id,
+                    exc,
+                )
+            try:
+                await self.reload_emotions()
+            except Exception as exc:
+                refresh_notes.append("表情配置刷新失败，已保存的图片不受影响。")
+                logger.warning(
+                    "Chat upload saved images but emotion reload failed "
+                    "for pack %s: %s",
+                    pack_id,
+                    exc,
+                )
+
+        async def wait_for_worker(task: asyncio.Task) -> None:
+            """Finish a shielded worker before propagating cancellation.
+
+            Args:
+                task: Image commit or metadata refresh task holding the pack guard.
+
+            Returns:
+                None after the worker finishes.
+
+            Raises:
+                asyncio.CancelledError: Cancellation requested before completion;
+                    propagated only after the worker has finished.
+            """
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # A write or refresh worker cannot be interrupted safely; keep
+                # the pack locked until it returns, then propagate cancellation.
+                while not task.done():
                     try:
-                        with PILImage.open(io.BytesIO(content)) as pil_img:
-                            file_type = pil_img.format.lower()
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
                     except Exception:
-                        file_type = "unknown"
-                    ext_mapping = {
-                        "jpeg": ".jpg",
-                        "png": ".png",
-                        "gif": ".gif",
-                        "webp": ".webp",
-                    }
-                    ext = ext_mapping.get(file_type, ".bin")
-                    filename = f"{timestamp}_{idx}{ext}"
-                    save_path = os.path.join(save_dir, filename)
-                    with open(save_path, "wb") as f:
-                        f.write(content)
-                    saved_files.append(filename)
-                except Exception as e:
-                    logger.error(f"下载图片失败: {str(e)}")
-                    yield event.plain_result(f"文件 {img.url} 下载失败啦: {str(e)}")
-                    continue
-            del self.upload_states[user_key]
-            result_msg = [
-                Plain(
-                    f"✅ 已经成功收录了 {len(saved_files)} 张新表情到「{category}」图库！"
-                )
-            ]
-            if self.img_sync:
-                result_msg.append(
-                    Plain("\n☁️ 检测到已配置图床，如需同步到云端请使用命令：同步到云端")
-                )
-            yield event.chain_result(result_msg)
-            await self.reload_emotions()
-            if saved_files:
-                invalidate_semantic_metadata(Path(memes_dir).parent)
-        except Exception as e:
-            yield event.plain_result(f"保存失败了：{str(e)}")
+                        break
+                if task.done() and not task.cancelled():
+                    task.exception()
+                raise
+
+        try:
+            initial_problem = await category_problem()
+            if not initial_problem:
+                initial_problem = route_problem()
+            if initial_problem:
+                stop_note = initial_problem
+                unprocessed_count = len(images)
+            else:
+                for index, image in enumerate(images):
+                    try:
+                        local_path = Path(
+                            await asyncio.wait_for(
+                                image.convert_to_file_path(), timeout=30
+                            )
+                        )
+                        content = await asyncio.to_thread(local_path.read_bytes)
+                    except asyncio.TimeoutError:
+                        failed_count += 1
+                        logger.warning(
+                            "Chat upload image %s/%s timed out for pack %s category %s",
+                            index + 1,
+                            len(images),
+                            pack_id,
+                            category,
+                        )
+                        continue
+                    except Exception as exc:
+                        failed_count += 1
+                        logger.warning(
+                            "Chat upload image %s/%s could not be read for pack %s "
+                            "category %s: %s",
+                            index + 1,
+                            len(images),
+                            pack_id,
+                            category,
+                            exc,
+                        )
+                        continue
+
+                    problem = await category_problem()
+                    if not problem:
+                        problem = route_problem()
+                    if problem:
+                        stop_note = problem
+                        unprocessed_count = len(images) - index
+                        break
+                    await wait_for_worker(
+                        asyncio.create_task(commit_image(content, index))
+                    )
+
+        except Exception as exc:
+            logger.exception(
+                "Chat upload failed unexpectedly for pack %s category %s: %s",
+                pack_id,
+                category,
+                exc,
+            )
+            unprocessed_count = max(
+                unprocessed_count,
+                len(images) - saved_count - duplicate_count - failed_count,
+            )
+            stop_note = stop_note or "上传过程中发生内部错误，已保存的文件不受影响"
         finally:
-            self.semantic_task_manager.end_external_pack_operation(pack_id)
+            try:
+                if saved_count:
+                    # Refresh while the pack operation guard is still held; a
+                    # cancelled consumer must wait for the metadata worker.
+                    await wait_for_worker(asyncio.create_task(refresh_metadata()))
+            finally:
+                if self.upload_states.get(user_key) is upload_state:
+                    self.upload_states.pop(user_key, None)
+                self.semantic_task_manager.end_external_pack_operation(pack_id)
+
+        if saved_count and not failed_count and not stop_note:
+            if duplicate_count:
+                message = (
+                    f"✅ 已收录 {saved_count} 张新表情到{state_label}；"
+                    f"另有 {duplicate_count} 张重复图片未新增。"
+                )
+            else:
+                message = f"✅ 已经成功收录了 {saved_count} 张新表情到{state_label}！"
+        elif saved_count:
+            message = (
+                f"⚠️ 部分完成：{state_label}新增 {saved_count} 张，"
+                f"重复 {duplicate_count} 张，失败 {failed_count} 张。"
+            )
+        elif duplicate_count and not failed_count and not stop_note:
+            message = (
+                f"ℹ️ 未新增表情：{state_label}已有 {duplicate_count} 张相同图片，"
+                "未写入任何文件。"
+            )
+        elif stop_note:
+            message = (
+                f"❌ 未能写入：{state_label}新增 {saved_count} 张，"
+                f"重复 {duplicate_count} 张，失败 {failed_count} 张。"
+            )
+        else:
+            message = (
+                f"❌ 收录失败：{state_label}新增 {saved_count} 张，"
+                f"重复 {duplicate_count} 张，失败 {failed_count} 张。"
+            )
+        if stop_note:
+            message += (
+                f"\n⚠️ {stop_note}"
+                + (f"，剩余 {unprocessed_count} 张未处理" if unprocessed_count else "")
+                + f"；请重新执行 /表情管理 添加表情 [{category}]。"
+            )
+        for note in refresh_notes:
+            message += f"\n⚠️ {note}"
+        if saved_count and getattr(self, "img_sync", None):
+            message += "\n☁️ 检测到已配置图床，如需同步到云端请使用命令：同步到云端"
+        yield event.plain_result(message)
 
     async def _inject_meme_prompt_impl(
         self, event: AstrMessageEvent, req: ProviderRequest
@@ -924,57 +1172,6 @@ class EventHandlerMixin:
         )
         return provider_id
 
-    def _recent_meme_use_ids(self, event: AstrMessageEvent) -> set[str]:
-        """返回本会话冷却期内已发过的表情 ID（避免连续多轮挑到同一张）。"""
-        cooldown = float(getattr(self, "semantic_recent_cooldown_seconds", 0.0) or 0.0)
-        if cooldown <= 0:
-            return set()
-        session = str(getattr(event, "unified_msg_origin", "") or "")
-        if not session:
-            return set()
-        limit = max(1, int(getattr(self, "semantic_recent_max_items", 12) or 12))
-        store = getattr(self, "_recent_meme_uses", None)
-        if not isinstance(store, dict):
-            store = {}
-            self._recent_meme_uses = store
-        now = time.time()
-        kept: list[tuple[float, str]] = []
-        seen: set[str] = set()
-        for item in store.get(session, []):
-            try:
-                ts = float(item[0])
-                meme_id = str(item[1] or "")
-            except (TypeError, ValueError, IndexError, KeyError):
-                continue
-            if not meme_id or now - ts > cooldown:
-                continue
-            kept.append((ts, meme_id))
-            seen.add(meme_id)
-        store[session] = kept[-limit:]
-        return seen
-
-    def _remember_recent_meme_uses(
-        self, event: AstrMessageEvent, meme_ids: list[str]
-    ) -> None:
-        """记录本轮实际发出的表情 ID，供冷却期去重。"""
-        session = str(getattr(event, "unified_msg_origin", "") or "")
-        ids = [
-            str(item or "").strip()
-            for item in (meme_ids or [])
-            if str(item or "").strip()
-        ]
-        if not session or not ids:
-            return
-        limit = max(1, int(getattr(self, "semantic_recent_max_items", 12) or 12))
-        store = getattr(self, "_recent_meme_uses", None)
-        if not isinstance(store, dict):
-            store = {}
-            self._recent_meme_uses = store
-        now = time.time()
-        bucket = list(store.get(session, []))
-        bucket.extend((now, meme_id) for meme_id in ids)
-        store[session] = bucket[-limit:]
-
     async def _resp_semantic_llm_impl(
         self, event: AstrMessageEvent, response: LLMResponse, text: str
     ):
@@ -988,37 +1185,27 @@ class EventHandlerMixin:
         visible_text = extract_visible_semantic_reply(text)
         query = await self._build_emotion_semantic_query(event, visible_text)
         pack_context = self._resolve_runtime_pack_context(event=event)
-        pack_id = str(pack_context.get("pack_id") or "")
-        verified_pack_id = str(
-            event.get_extra("meme_manager_semantic_verified_pack_id") or ""
-        )
+        pack_ids = pack_context.get("pack_ids", [])
         selected_id = ""
         try:
-            result = await search_memes(
-                pack_context["pack_dir"],
+            if ",".join(pack_ids) != str(
+                event.get_extra("meme_manager_semantic_verified_pack_ids") or ""
+            ):
+                return await self._resp_semantic_impl(event, response, text)
+            pack_contexts = [
+                {"pack_id": pack_id, "pack_dir": get_pack_paths(pack_id)["pack_dir"]}
+                for pack_id in pack_ids
+            ]
+            result = await search_memes_multi_pack(
+                pack_contexts,
                 PLUGIN_DATA_DIR,
-                pack_id,
                 query,
-                self._resolve_embedding_provider(pack_id),
+                self._resolve_embedding_provider,
                 top_k=self.semantic_top_k,
                 min_score=self.semantic_min_score,
-                _verified_complete=pack_id == verified_pack_id,
             )
             candidates = result.get("candidates") or []
-            recent_ids = self._recent_meme_use_ids(event)
-            if recent_ids:
-                fresh_candidates = [
-                    item
-                    for item in candidates
-                    if str(item.get("id") or "") not in recent_ids
-                ]
-                if fresh_candidates and len(fresh_candidates) < len(candidates):
-                    logger.info(
-                        "[meme_manager] 语义候选去重：跳过冷却期内已发过的 %s 张",
-                        len(candidates) - len(fresh_candidates),
-                    )
-                    candidates = fresh_candidates
-            records = candidate_records(pack_context["pack_dir"], candidates)
+            records = candidate_records_multi_pack(pack_contexts, candidates)
             remember_candidates(event, records)
             event.set_extra("meme_manager_semantic_query", query)
             if candidates:
@@ -1095,23 +1282,10 @@ class EventHandlerMixin:
             + json.dumps({"reply": visible_text}, ensure_ascii=False)
             + self._build_emotion_llm_injection_suffix(event)
         )
-        cache_key = (str(provider_id or ""), visible_text)
-        cached = EMOTION_QUERY_CACHE.get(cache_key)
-        if cached and (time.monotonic() - cached[1]) < EMOTION_QUERY_CACHE_TTL_S:
-            return cached[0]
         try:
-            llm_resp = await asyncio.wait_for(
-                self._emotion_llm_generate(event, prompt),
-                timeout=EMOTION_QUERY_TIMEOUT_S,
-            )
+            llm_resp = await self._emotion_llm_generate(event, prompt)
             raw_text = str(getattr(llm_resp, "completion_text", "") or "").strip()
             query = parse_semantic_query_result(raw_text, fallback)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "[meme_manager] 检索词生成超过 %.1fs，改用截短后的可见回复",
-                EMOTION_QUERY_TIMEOUT_S,
-            )
-            query = fallback
         except Exception as exc:
             logger.warning(
                 "[meme_manager] 生成短检索词失败，使用截短后的可见回复: %s",
@@ -1119,10 +1293,6 @@ class EventHandlerMixin:
             )
             query = fallback
 
-        if query and query != fallback:
-            if len(EMOTION_QUERY_CACHE) >= EMOTION_QUERY_CACHE_MAX:
-                EMOTION_QUERY_CACHE.clear()
-            EMOTION_QUERY_CACHE[cache_key] = (query, time.monotonic())
         logger.info(f"[meme_manager] 情感模型语义检索词（{len(query)}字）: {query}")
         return query
 
@@ -1266,38 +1436,18 @@ class EventHandlerMixin:
         parser = self._make_meme_parser((), semantic=True)
         clean_text = parser.feed(text or "") + parser.finish()
         referenced_ids = parser.selections
-        rejected_ids: list[str] = []
         for value in referenced_ids:
-            if validate_selected_id(event, value, pack_context.get("pack_dir")):
+            if validate_selected_id(event, value, pack_context):
                 if value not in selected_ids:
                     selected_ids.append(value)
             else:
-                rejected_ids.append(value)
-        # 模型引用了图片但候选校验没过（最常见：跨轮复用了上一轮的旧 ID）。
-        # 直接静默丢弃会让用户"每次要表情都发不出来"，所以做两级回退。
-        fallback_categories: list[str] = []
-        if rejected_ids and not selected_ids:
-            selected_ids, fallback_categories = await self._recover_rejected_semantic_ids(
-                event, pack_context, rejected_ids
-            )
+                logger.warning("忽略不在本轮候选中的语义图片 ID: %s", value)
         if selected_ids:
             logger.info("[meme_manager] 已选择语义表情：%s", selected_ids)
-        elif fallback_categories:
-            logger.info(
-                "[meme_manager] 语义候选不可用，回退分类随机选图：%s",
-                fallback_categories,
-            )
-        elif rejected_ids:
-            logger.warning(
-                "[meme_manager] 语义表情候选全部被拒且无法回退：%s", rejected_ids
-            )
         else:
             logger.debug("[meme_manager] 本次回复未选择语义表情")
-        if selected_ids:
-            self._remember_recent_meme_uses(event, selected_ids)
         event.set_extra("meme_manager_semantic_selected_ids", selected_ids)
-        event.set_extra("found_emotions", fallback_categories or None)
-        event.set_extra("meme_manager_legacy_probability_hit", bool(fallback_categories))
+        event.set_extra("found_emotions", None)
         if getattr(self, "filter_all_tags", False):
             clean_text = self._clean_outgoing_plain_text(clean_text)
         response.completion_text = clean_text.strip()
@@ -1316,101 +1466,6 @@ class EventHandlerMixin:
                 await event.send(MessageChain([Plain(response.completion_text)]))
             except Exception as exc:
                 logger.error("webchat 语义文本替换失败: %s", exc)
-
-    def _semantic_fallback_categories(
-        self, pack_context: dict, candidates: list
-    ) -> list[str]:
-        """挑选语义检索失败时的分类回退目标（给旧版分类随机选图链路用）。"""
-        for item in candidates:
-            category = str(item.get("category") or "").strip()
-            if category and category != REVIEW_CATEGORY:
-                return [category]
-        mapping = pack_context.get("category_mapping") or {}
-        choices = [
-            str(name).strip()
-            for name in mapping.keys()
-            if str(name).strip() and str(name).strip() != REVIEW_CATEGORY
-        ]
-        if not choices:
-            return []
-        return [random.choice(choices)]
-
-    async def _recover_rejected_semantic_ids(
-        self, event: AstrMessageEvent, pack_context: dict, rejected_ids: list[str]
-    ) -> tuple[list[str], list[str]]:
-        """模型引用了图片但候选校验全部失败时的两级回退。
-
-        第一级：用同一查询词重新检索一次，改用本轮候选里通过校验的 ID
-        （修复模型跨轮复用上一轮旧 ID 导致的静默丢弃）。
-        第二级：重新检索也不可用时（例如资源包语义化未完成），回退分类随机选图。
-
-        安全底线不变：needs_review 分类与文件 sha256 校验仍由 validate_selected_id 执行。
-
-        Returns:
-            (通过校验的语义 ID 列表, 分类回退用的分类列表)，两者至多一个非空。
-        """
-        query = str(event.get_extra("meme_manager_semantic_query") or "").strip()
-        pack_id = str(pack_context.get("pack_id") or "")
-        pack_dir = pack_context.get("pack_dir")
-        fallback_categories: list[str] = []
-        if query and pack_dir:
-            verified_pack_id = str(
-                event.get_extra("meme_manager_semantic_verified_pack_id") or ""
-            )
-            try:
-                result = await search_memes(
-                    pack_dir,
-                    PLUGIN_DATA_DIR,
-                    pack_id,
-                    query,
-                    self._resolve_embedding_provider(pack_id),
-                    top_k=self.semantic_top_k,
-                    min_score=self.semantic_min_score,
-                    _verified_complete=pack_id == verified_pack_id,
-                )
-                candidates = result.get("candidates") or []
-                records = candidate_records(pack_dir, candidates)
-                remember_candidates(event, records)
-                fresh_ids: list[str] = []
-                for item in candidates:
-                    value = str(item.get("id") or "")
-                    if (
-                        value
-                        and value not in fresh_ids
-                        and validate_selected_id(event, value, pack_dir)
-                    ):
-                        fresh_ids.append(value)
-                if fresh_ids:
-                    logger.info(
-                        "[meme_manager] 旧语义 ID 已失效（%s），重新检索后改用本轮候选：%s",
-                        rejected_ids,
-                        fresh_ids,
-                    )
-                    return fresh_ids, []
-                fallback_categories = self._semantic_fallback_categories(
-                    pack_context, candidates
-                )
-                logger.warning(
-                    "[meme_manager] 旧语义 ID 失效且重新检索无可用候选"
-                    "（reason=%s，candidates=%d），回退分类随机选图：%s",
-                    str(result.get("reason") or ""),
-                    len(candidates),
-                    fallback_categories,
-                )
-            except Exception as exc:
-                logger.error(
-                    "[meme_manager] 语义候选回退检索失败：%s", exc, exc_info=True
-                )
-        if not fallback_categories:
-            fallback_categories = self._semantic_fallback_categories(pack_context, [])
-            if fallback_categories:
-                logger.warning(
-                    "[meme_manager] 旧语义 ID 全部失效（%s）且无可用查询词，"
-                    "回退分类随机选图：%s",
-                    rejected_ids,
-                    fallback_categories,
-                )
-        return [], fallback_categories
 
     async def _on_decorating_result_impl(self, event: AstrMessageEvent):
         """在消息发送前清理文本中的表情标签，并添加表情图片"""
@@ -1463,14 +1518,11 @@ class EventHandlerMixin:
                 and semantic_selected_ids
                 and self._semantic_mode_active(event)
             ):
-                memes_root = self._get_runtime_memes_dir_for_event(event)
                 pack_context = self._resolve_runtime_pack_context(event=event)
                 semantic_images = []
                 semantic_temp_files = []
                 for selected_id in self._limit_meme_selection(semantic_selected_ids):
-                    image_path = validate_selected_id(
-                        event, selected_id, pack_context.get("pack_dir")
-                    )
+                    image_path = validate_selected_id(event, selected_id, pack_context)
                     if image_path is None:
                         continue
                     try:
@@ -1508,7 +1560,6 @@ class EventHandlerMixin:
             # 第三步：旧模式添加表情图片（如果有找到的表情）
             found_emotions = event.get_extra("found_emotions") or []
             if scope_allows_attach and found_emotions and not semantic_selected_ids:
-                memes_root = self._get_runtime_memes_dir_for_event(event)
                 # 概率判定复用 _resp_impl 阶段的预检结果（避免二次掷骰）；
                 # extra 缺失（异常路径）时回退本地掷骰，保持旧行为。
                 legacy_probability_hit = event.get_extra(
@@ -1521,29 +1572,10 @@ class EventHandlerMixin:
                     emotion_images = []
                     temp_files = []  # 记录临时文件路径
                     for emotion in self._limit_meme_selection(found_emotions):
-                        if not emotion or emotion == REVIEW_CATEGORY:
-                            continue
-
-                        try:
-                            emotion_path = resolve_safe_category_directory(
-                                memes_root, emotion
-                            )
-                        except ValueError:
-                            continue
-                        if not emotion_path.is_dir():
-                            continue
-
-                        memes = [
-                            f
-                            for f in os.listdir(emotion_path)
-                            if f.lower().endswith(IMAGE_EXTENSIONS)
-                        ]
-
+                        memes = self._get_category_meme_files(event, emotion)
                         if not memes:
                             continue
-
-                        meme = random.choice(memes)
-                        meme_file = str(emotion_path / meme)
+                        meme_file = str(random.choice(memes))
 
                         try:
                             # 转换静态图为 GIF（如果配置开启）
@@ -1666,7 +1698,7 @@ class EventHandlerMixin:
                     background = PILImage.new("RGB", img.size, (255, 255, 255))
                     if img.mode == "P":
                         img = img.convert("RGBA")
-                    background.paste(img, mask=img.split()[3])  # 第 3 个索引是透明通道
+                    background.paste(img, mask=img.getchannel("A"))
                     img = background
                 else:
                     img = img.convert("RGB")
@@ -1693,9 +1725,7 @@ class EventHandlerMixin:
             pack_context = self._resolve_runtime_pack_context(event=event)
             try:
                 for selected_id in self._limit_meme_selection(semantic_selected_ids):
-                    image_path = validate_selected_id(
-                        event, selected_id, pack_context.get("pack_dir")
-                    )
+                    image_path = validate_selected_id(event, selected_id, pack_context)
                     if image_path is None:
                         continue
                     final_path = await asyncio.to_thread(
@@ -1717,8 +1747,6 @@ class EventHandlerMixin:
         if not found_emotions:
             return
 
-        memes_root = self._get_runtime_memes_dir_for_event(event)
-
         try:
             # 概率判定复用 _resp_impl 阶段的预检结果；extra 缺失时回退本地掷骰。
             legacy_probability_hit = event.get_extra(
@@ -1730,26 +1758,10 @@ class EventHandlerMixin:
                 return
 
             for emotion in self._limit_meme_selection(found_emotions):
-                if not emotion or emotion == REVIEW_CATEGORY:
-                    continue
-
-                try:
-                    emotion_path = resolve_safe_category_directory(memes_root, emotion)
-                except ValueError:
-                    continue
-                if not emotion_path.is_dir():
-                    continue
-
-                memes = [
-                    f
-                    for f in os.listdir(emotion_path)
-                    if f.lower().endswith(IMAGE_EXTENSIONS)
-                ]
+                memes = self._get_category_meme_files(event, emotion)
                 if not memes:
                     continue
-
-                meme = random.choice(memes)
-                meme_file = str(emotion_path / meme)
+                meme_file = str(random.choice(memes))
                 final_meme_file = await asyncio.to_thread(
                     self._convert_to_gif, meme_file
                 )
@@ -1774,9 +1786,26 @@ class EventHandlerMixin:
 
     async def _send_meme_image(self, event: AstrMessageEvent, image: Image) -> None:
         image = await self._ensure_image_send_format(image)
-        if event.get_platform_name() in {"gewechat", "webchat"}:
+        platform_name = event.get_platform_name()
+        if platform_name in {"gewechat", "webchat"}:
             await event.send(MessageChain([image]))
             return
+        if (
+            platform_name == "qq_official"
+            and event.get_message_type() == MessageType.GROUP_MESSAGE
+        ):
+            raw_message = getattr(
+                getattr(event, "message_obj", None), "raw_message", None
+            )
+            try:
+                from botpy.message import GroupMessage
+            except ImportError:
+                pass
+            else:
+                # QQ group image replies must reuse the triggering message context.
+                if isinstance(raw_message, GroupMessage):
+                    await event.send(MessageChain([image]))
+                    return
         await self.context.send_message(event.unified_msg_origin, MessageChain([image]))
 
     async def _ensure_image_send_format(self, image: Image) -> Image:

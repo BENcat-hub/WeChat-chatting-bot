@@ -103,6 +103,11 @@ class AutoCollectManager:
         self.plugin = plugin
         self.enabled = bool(config.get("enabled", False))
         self.manual_review = bool(config.get("manual_review", True))
+        self.auto_embedding = bool(config.get("auto_embedding", True))
+        self._embedding_tasks: dict[str, asyncio.Task] = {}
+        self._auto_accept_tasks: dict[str, asyncio.Task] = {}
+        self._pending_auto_accept: dict[str, set[str]] = {}
+        self._closing = False
         self.pending_limit = max(1, int(config.get("pending_limit", 200) or 200))
         self.counters: dict[str, int] = {}
         self._inflight: set[str] = set()
@@ -177,17 +182,32 @@ class AutoCollectManager:
             os.fsync(file_obj.fileno())
         os.replace(temporary, path)
 
-    async def start(self) -> None:
-        """校验已配置的视觉模型，并启动一个后台工作任务。"""
+    async def start(self, *, defer_missing_provider: bool = False) -> None:
+        """Validate the vision provider and start one background worker.
+
+        Args:
+            defer_missing_provider: Skip unregistered providers during plugin
+                initialization; the core-loaded hook will retry after loading.
+        """
         if not self.enabled or self._worker_task is not None:
             return
         if not self.vision_provider_id:
             logger.warning("[meme_manager] 已启用自动收集，但尚未选择视觉模型")
             return
+        if (
+            defer_missing_provider
+            and self.vision_provider_id
+            not in self.plugin.context.provider_manager.inst_map
+        ):
+            logger.info(
+                "[meme_manager] Waiting for AstrBot to load vision provider: %s",
+                self.vision_provider_id,
+            )
+            return
         provider = self.plugin.context.get_provider_by_id(self.vision_provider_id)
         if provider is None:
             logger.info(
-                "[meme_manager] 自动收集视觉模型尚未就绪，等待加载后重试：%s",
+                "[meme_manager] Auto collection is inactive; vision provider is unavailable: %s",
                 self.vision_provider_id,
             )
             return
@@ -207,6 +227,7 @@ class AutoCollectManager:
                 self.vision_provider_id,
             )
             return
+        self._closing = False
         self._ready = True
         self._worker_task = asyncio.create_task(
             self._worker(), name="meme_manager_auto_collect"
@@ -219,6 +240,7 @@ class AutoCollectManager:
     async def close(self) -> None:
         """停止后台任务，并等待取消清理完成。"""
         self._ready = False
+        self._closing = True
         snapshot_tasks = tuple(self._snapshot_tasks)
         for snapshot_task in snapshot_tasks:
             snapshot_task.cancel()
@@ -230,6 +252,17 @@ class AutoCollectManager:
         if task and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        background_tasks = (
+            *self._embedding_tasks.values(),
+            *self._auto_accept_tasks.values(),
+        )
+        for background_task in background_tasks:
+            background_task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        self._embedding_tasks.clear()
+        self._auto_accept_tasks.clear()
+        self._pending_auto_accept.clear()
         while True:
             try:
                 job = self.queue.get_nowait()
@@ -1230,6 +1263,15 @@ class AutoCollectManager:
             except RuntimeError:
                 self.counters["pack_busy"] = self.counters.get("pack_busy", 0) + 1
                 logger.info("[meme_manager] 表情包正在处理，已收集图片保留在待审箱")
+                self._pending_auto_accept.setdefault(job.target_pack_id, set()).add(
+                    f"{job.target_pack_id}:{digest}"
+                )
+                task = self._auto_accept_tasks.get(job.target_pack_id)
+                if task is None or task.done():
+                    self._auto_accept_tasks[job.target_pack_id] = asyncio.create_task(
+                        self._retry_auto_accept(job.target_pack_id),
+                        name=f"meme_manager_auto_accept_{job.target_pack_id}",
+                    )
 
     async def pending_status(self, pack_id: str) -> dict[str, Any]:
         """List every candidate belonging to a pack, with confident items first.
@@ -1444,7 +1486,132 @@ class AutoCollectManager:
                 self.plugin.semantic_task_manager.end_external_pack_operation(pack_id)
         if result["imported"]:
             await self.plugin.reload_emotions()
+            if (
+                not self._closing
+                and self.auto_embedding
+                and getattr(self.plugin, "semantic_enabled", False)
+            ):
+                task = self._embedding_tasks.get(pack_id)
+                if task is None or task.done():
+                    self._embedding_tasks[pack_id] = asyncio.create_task(
+                        self._generate_collected_vectors(pack_id),
+                        name=f"meme_manager_collected_vectors_{pack_id}",
+                    )
         return result
+
+    async def _generate_collected_vectors(self, pack_id: str) -> None:
+        """Coalesce accepted images and incrementally update their pack index.
+
+        Args:
+            pack_id: Pack containing newly accepted images.
+        """
+        try:
+            # Allow consecutive collection jobs to share one embedding batch.
+            await asyncio.sleep(1)
+            while self.auto_embedding and getattr(
+                self.plugin, "semantic_enabled", False
+            ):
+                try:
+                    self.plugin.semantic_task_manager.assert_pack_mutation_allowed(
+                        pack_id, "update collected image vectors"
+                    )
+                except RuntimeError:
+                    # Retain the trigger while another task or paused queue owns the pack.
+                    await asyncio.sleep(2)
+                    continue
+                try:
+                    await self.plugin.semantic_task_manager.rebuild_index(
+                        pack_id, force=False
+                    )
+                except RuntimeError:
+                    # Another semantic task may have acquired the lock after the check.
+                    try:
+                        self.plugin.semantic_task_manager.assert_pack_mutation_allowed(
+                            pack_id, "update collected image vectors"
+                        )
+                    except RuntimeError:
+                        await asyncio.sleep(2)
+                        continue
+                    raise
+                break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Automatic incremental embedding failed for pack %s; "
+                "pending images can be retried from the management page",
+                pack_id,
+                exc_info=True,
+            )
+        finally:
+            self._embedding_tasks.pop(pack_id, None)
+
+    async def _retry_auto_accept(self, pack_id: str) -> None:
+        """Retry only newly collected candidates deferred by a busy pack.
+
+        Args:
+            pack_id: Pack containing candidates collected with review disabled.
+        """
+        try:
+            while not self.manual_review and self._pending_auto_accept.get(pack_id):
+                try:
+                    self.plugin.semantic_task_manager.assert_pack_mutation_allowed(
+                        pack_id, "accept collected images"
+                    )
+                except RuntimeError:
+                    await asyncio.sleep(2)
+                    continue
+                async with self._inbox_lock:
+                    metadata = self._load_json(
+                        AUTO_COLLECT_INBOX_METADATA_PATH, {"items": {}}
+                    )
+                    items = metadata.get("items", {})
+                    pending = self._pending_auto_accept[pack_id]
+                    pending.intersection_update(
+                        record_id
+                        for record_id, item in items.items()
+                        if isinstance(item, dict)
+                        and item.get("target_pack_id") == pack_id
+                    )
+                    selections = sorted(pending)[:2000]
+                if not selections:
+                    break
+                acceptance = asyncio.create_task(
+                    self.accept_pending(
+                        pack_id,
+                        [{"id": record_id} for record_id in selections],
+                        manual_confirmed=False,
+                    )
+                )
+                try:
+                    await asyncio.shield(acceptance)
+                except asyncio.CancelledError:
+                    # Finish an in-progress disk mutation before releasing the task.
+                    await asyncio.gather(acceptance, return_exceptions=True)
+                    raise
+                except RuntimeError:
+                    # The pack may have become busy while waiting for the inbox lock.
+                    try:
+                        self.plugin.semantic_task_manager.assert_pack_mutation_allowed(
+                            pack_id, "accept collected images"
+                        )
+                    except RuntimeError:
+                        await asyncio.sleep(2)
+                        continue
+                    raise
+                self._pending_auto_accept[pack_id].difference_update(selections)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Deferred automatic acceptance failed for pack %s; "
+                "candidates remain available for manual retry",
+                pack_id,
+                exc_info=True,
+            )
+        finally:
+            self._auto_accept_tasks.pop(pack_id, None)
+            self._pending_auto_accept.pop(pack_id, None)
 
     async def discard_pending(
         self, pack_id: str, ids: list[str], remember_rejection: bool = False

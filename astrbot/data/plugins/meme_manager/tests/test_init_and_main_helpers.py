@@ -176,8 +176,8 @@ def test_main_semantic_mode_requires_matching_verified_pack():
         Event(
             {
                 "meme_manager_semantic_active": True,
-                "meme_manager_semantic_verified_pack_id": "pack-a",
-                "meme_manager_runtime_pack_id": "pack-a",
+                "meme_manager_semantic_verified_pack_ids": "pack-a",
+                "meme_manager_runtime_pack_ids": ["pack-a"],
             }
         )
     )
@@ -185,8 +185,8 @@ def test_main_semantic_mode_requires_matching_verified_pack():
         Event(
             {
                 "meme_manager_semantic_active": True,
-                "meme_manager_semantic_verified_pack_id": "pack-a",
-                "meme_manager_runtime_pack_id": "pack-b",
+                "meme_manager_semantic_verified_pack_ids": "pack-a",
+                "meme_manager_runtime_pack_ids": ["pack-b"],
             }
         )
     )

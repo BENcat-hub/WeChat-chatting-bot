@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 
 STACK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOKEN = "<FILL_ME_WEFLOW_TOKEN>"
+TOKEN = "<FILL_ME>"
 BASE = "http://127.0.0.1:5031/api/v1"
 
 WXID = {

@@ -987,7 +987,7 @@ class HistoricalChatStoreTests(unittest.IsolatedAsyncioTestCase):
         source = json.dumps(
             {
                 "metadata": {"name": "QQChatExporter", "version": "0.1.0"},
-                "chatInfo": {"name": "测试群", "type": "group", "selfUin": "10001", "selfName": "Bot"},
+                "chatInfo": {"name": "示例群聊D", "type": "group", "selfUin": "10001", "selfName": "Bot"},
                 "messages": [
                     {
                         "id": "g-1", "seq": "1", "timestamp": 1783852174000,

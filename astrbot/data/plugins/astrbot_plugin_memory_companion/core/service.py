@@ -195,6 +195,33 @@ _RECONSTRUCTION_ACTIONS = frozenset(
 )
 
 
+def _append_turn_tail_instruction(req: Any, text: str) -> bool:
+    """把工具契约/指令追加到本轮用户消息尾部（KV Cache 友好），成功返回 True。
+
+    写进 ``system_prompt`` 会让整段 system 每一轮都漂移：DeepSeek 的前缀缓存
+    以 system 开头，一旦首段字节变化，后面几十 K 的上下文全部重算（实测命中率
+    从 ~90% 掉到 ~10%）。``extra_user_content_parts`` 是 AstrBot 4.29 官方的
+    尾部通道，最终拼在本轮 user 消息末尾，不进入 system 前缀。
+    """
+
+    if not text:
+        return False
+    parts = getattr(req, "extra_user_content_parts", None)
+    if not isinstance(parts, list):
+        return False
+    try:
+        from astrbot.core.agent.message import TextPart
+
+        part = TextPart(text=text)
+        marker = getattr(part, "mark_as_temp", None)
+        if callable(marker):
+            part = marker()
+        parts.append(part)
+        return True
+    except Exception:
+        return False
+
+
 @dataclass(slots=True)
 class MemoryRouteDecision:
     layer: str = "current_message"
@@ -5501,6 +5528,9 @@ class MemoryCompanionService:
             _REMEMBER_TOOL_CONTRACT_HEADER,
             _REMEMBER_TOOL_CONTRACT_FOOTER,
         )
+        req.system_prompt = current
+        if _append_turn_tail_instruction(req, _REMEMBER_TOOL_CONTRACT):
+            return
         req.system_prompt = f"{current}\n\n{_REMEMBER_TOOL_CONTRACT}" if current else _REMEMBER_TOOL_CONTRACT
 
     def _apply_core_memory_tool_contract(self, req: Any) -> None:
@@ -5512,8 +5542,10 @@ class MemoryCompanionService:
             _CORE_MEMORY_TOOL_CONTRACT_HEADER,
             _CORE_MEMORY_TOOL_CONTRACT_FOOTER,
         )
+        req.system_prompt = current
         if not self.config.bool("core_memory.llm_management_enabled", True):
-            req.system_prompt = current
+            return
+        if _append_turn_tail_instruction(req, _CORE_MEMORY_TOOL_CONTRACT):
             return
         req.system_prompt = (
             f"{current}\n\n{_CORE_MEMORY_TOOL_CONTRACT}"
@@ -5553,6 +5585,9 @@ class MemoryCompanionService:
             _RECONSTRUCTION_CONTRACT_FOOTER,
             f"{dynamic_line}\n{_RECONSTRUCTION_CONTRACT_FOOTER}",
         )
+        req.system_prompt = current
+        if _append_turn_tail_instruction(req, contract):
+            return
         req.system_prompt = f"{current}\n\n{contract}" if current else contract
 
     def _should_offer_memory_reconstruction(self, ctx: SessionContext) -> bool:

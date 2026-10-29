@@ -132,7 +132,7 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         return MemoryRecord(
             memory_type="conversation_summary",
             subject=EntityRef(kind="user", id="group-user", name="群成员"),
-            object=EntityRef(kind="group", id="g1", name="测试群"),
+            object=EntityRef(kind="group", id="g1", name="示例群聊D"),
             scope="group",
             session_id="qq:GroupMessage:g1",
             platform="qq",

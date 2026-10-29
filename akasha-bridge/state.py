@@ -15,7 +15,9 @@ AI 服务：AstrBot 通过 aiocqhttp (OneBot v11) 接入
 import hashlib
 import json
 import os
+import re
 import threading
+import time
 from typing import Optional
 
 # ============ 状态控制 ============
@@ -135,3 +137,4 @@ wxui_group_gather_seconds = 1.2
 wxui_warm_worker = True
 ollama_base_url = "http://127.0.0.1:61000"
 ollama_timeout = 60
+
