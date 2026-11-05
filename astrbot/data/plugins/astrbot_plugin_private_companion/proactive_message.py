@@ -8127,6 +8127,12 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         if reason == "morning_greeting":
             reviewed = self._strip_morning_meal_questions(reviewed)
         finalized = self._normalize_proactive_sentence_flow(reviewed)
+        if finalized and getattr(self, "_recent_proactive_text_duplicated", None):
+            try:
+                if self._recent_proactive_text_duplicated(user, finalized):
+                    return "", "与近期主动消息语义重复"
+            except Exception as exc:  # 去重失败不应阻断发送链路
+                logger.warning("主动消息近似去重检查失败: %s", exc)
         return (finalized, "") if finalized else ("", "最终句式整理后为空")
 
     @staticmethod

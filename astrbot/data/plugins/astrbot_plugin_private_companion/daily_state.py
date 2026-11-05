@@ -2842,23 +2842,119 @@ class DailyStateMixin(DailyStateTickMixin):
             or (len(common) >= 6 and overlap >= overlap_floor)
         )
 
+    @staticmethod
+    def _person_identity_keys(user: dict[str, Any]) -> set[str]:
+        """同一真人的判定键：昵称 / 显示名 / 备注。空值不参与。"""
+        keys: set[str] = set()
+        if not isinstance(user, dict):
+            return keys
+        for key in ("nickname", "last_display_name", "remark", "display_name"):
+            value = _single_line(user.get(key), 60)
+            if value:
+                keys.add(value)
+        return keys
+
+    def _same_person_user_objects(self, user: dict[str, Any]) -> list[dict[str, Any]]:
+        """找出当前对象背后同一个真人的其它 users 对象（用于跨对象去重）。"""
+        data = getattr(getattr(self, "store", None), "data", None)
+        users = data.get("users") if isinstance(data, dict) else None
+        if not isinstance(users, dict) or not users:
+            return []
+        mine = str(user.get("user_id") or user.get("id") or "")
+        keys = self._person_identity_keys(user)
+        if not keys:
+            return []
+        siblings: list[dict[str, Any]] = []
+        for uid, other in users.items():
+            if not isinstance(other, dict):
+                continue
+            other_id = str(other.get("user_id") or other.get("id") or uid or "")
+            if mine and other_id == mine:
+                continue
+            if self._person_identity_keys(other) & keys:
+                siblings.append(other)
+        return siblings
+
+    @staticmethod
+    def _proactive_text_bigrams(text: str) -> set[str]:
+        cleaned = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", str(text or ""))
+        if len(cleaned) < 2:
+            return set()
+        return {cleaned[i : i + 2] for i in range(len(cleaned) - 1)}
+
+    def _recent_proactive_text_duplicated(
+        self,
+        user: dict[str, Any],
+        text: str,
+        *,
+        now: float | None = None,
+        threshold: float = 0.55,
+    ) -> bool:
+        """同一真人（含同昵称的其它用户对象）近期是否发过高度近似的主动消息。"""
+        target = self._proactive_text_bigrams(text)
+        if len(target) < 4:
+            return False
+        check_now = now or _now_ts()
+        owners: list[dict[str, Any]] = [user]
+        owners.extend(self._same_person_user_objects(user))
+        for owner in owners:
+            for item in self._cleanup_recent_proactive_topics(owner, now=check_now):
+                previous = _single_line(item.get("text"), 240)
+                if not previous:
+                    continue
+                is_weather = (
+                    str(item.get("signature") or "") == "ordinary_weather_topic"
+                    or "雨" in previous
+                    or "雪" in previous
+                )
+                window_minutes = self._proactive_dedup_window_minutes(
+                    "weather" if is_weather else "sent",
+                    1080 if is_weather else 240,
+                )
+                if not self._proactive_dedup_age_allowed(check_now - _safe_float(item.get("ts"), 0), window_minutes):
+                    continue
+                other = self._proactive_text_bigrams(previous)
+                if not other:
+                    continue
+                containment = len(target & other) / min(len(target), len(other))
+                if containment >= threshold:
+                    logger.info(
+                        "主动消息文本近似重复已拦截: user=%s previous=%s containment=%.2f",
+                        _single_line(user.get("user_id") or user.get("id"), 40),
+                        _single_line(previous, 60),
+                        containment,
+                    )
+                    return True
+        return False
+
     def _recent_proactive_topic_repeated(self, user: dict[str, Any], signature: str, *, now: float | None = None) -> bool:
         if not signature:
             return False
         check_now = now or _now_ts()
-        for item in self._cleanup_recent_proactive_topics(user, now=check_now):
-            item_signature = str(item.get("signature") or "")
-            is_weather = signature == "ordinary_weather_topic" or item_signature == "ordinary_weather_topic"
-            window_minutes = self._proactive_dedup_window_minutes(
-                "weather" if is_weather else "sent",
-                1080 if is_weather else 240,
-            )
-            if not self._proactive_dedup_age_allowed(check_now - _safe_float(item.get("ts"), 0), window_minutes):
-                continue
-            if self._topic_signature_similar(signature, item_signature, use_proactive_dedup_config=True):
-                return True
+        scopes: list[tuple[str, dict[str, Any]]] = [(str(user.get("user_id") or user.get("id") or ""), user)]
+        for sibling in self._same_person_user_objects(user):
+            scopes.append((str(sibling.get("user_id") or sibling.get("id") or ""), sibling))
+        for owner_id, owner in scopes:
+            for item in self._cleanup_recent_proactive_topics(owner, now=check_now):
+                item_signature = str(item.get("signature") or "")
+                is_weather = signature == "ordinary_weather_topic" or item_signature == "ordinary_weather_topic"
+                window_minutes = self._proactive_dedup_window_minutes(
+                    "weather" if is_weather else "sent",
+                    1080 if is_weather else 240,
+                )
+                if not self._proactive_dedup_age_allowed(check_now - _safe_float(item.get("ts"), 0), window_minutes):
+                    continue
+                if self._topic_signature_similar(signature, item_signature, use_proactive_dedup_config=True):
+                    if owner_id and owner_id != str(user.get("user_id") or user.get("id") or ""):
+                        logger.info(
+                            "跨对象重复主动已拦截: user=%s sibling=%s signature=%s previous=%s",
+                            _single_line(user.get("user_id") or user.get("id"), 40),
+                            _single_line(owner_id, 40),
+                            _single_line(signature, 60),
+                            _single_line(item.get("text"), 60),
+                        )
+                    return True
         return False
-
     def _remember_proactive_topic(self, user: dict[str, Any], *, text: str = "", topic: str = "", motive: str = "") -> None:
         meta_leak_checker = getattr(self, "_framework_agent_meta_summary_leak", None)
         if callable(meta_leak_checker) and (
