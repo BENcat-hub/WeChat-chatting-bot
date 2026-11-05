@@ -16,7 +16,7 @@
 | OCR 找不到「用户F」 | Windows OCR（winsdk）对 12px 的「用户F」在侧栏和聊天头部**任何缩放都读不出**（`丕忄尸` 或整行漏掉）；「示例群聊D」读成「测讠羊」 | 新增 RapidOCR（PP-OCRv4）常驻服务 `.venv-ocr`，1x 原图即读对（用户F score 0.91）。`ocr_engine=rapid` |
 | 用户F的消息全被拦下 | `_identity_recheck` 把头部碎字「丕忄尸」当成「另一个像人名的会话」→ 判 `chat switched mid-send` 并清空输入 | 碎字（`_header_unreadable`）一律按「读不出」放行；RapidOCR 上线后头部直接读对「用户F」 |
 | 搜索点进视频号 | 旧搜索路径按**固定坐标盲点**第一条，面板没开/没渲染时点进聊天区或网络结果 | 搜索只在整张侧栏 OCR 失败后才用；必须 OCR 读到「整串等于目标名」的联系人/群聊行才点；**禁止盲点**（`search_blind_click=false`） |
-| 半冻结无法恢复 | minimize/restore、hide/show、InvalidateRect 都无效（实测） | 只有重启微信有效。新增「悬停是否重绘」探活 + 自愈重启（冷却/次数上限/用户在用键鼠时让路） |
+| 半冻结无法恢复 | minimize/restore、hide/show、InvalidateRect 都无效（实测） | **双击窗口顶部条就能解冻**（2026-10-29 用户实测 + 本机复现，不用退出重开）：`ui_titlebar_refresh()` 走原生 NC 双击，解冻后再双击一次还原尺寸。探活判死后阶梯 = 收覆盖层 → 双击标题栏 → 最后才重启微信 |
 
 验证：`文件传输助手` 真发 3 条全部 WeFlow 回读确认（localId 346/347/348）；`用户F` 搜索
 路径 + 头部复核通过、搜索后 UI 仍然重绘（hover ratio 0.42）；`用户C`/`示例群聊D` 侧栏
@@ -53,8 +53,9 @@ OCR 定位 0.5~0.8 s。
 > 也就是自动化实际发出的那一种；**物理键盘按 Esc 是否同样触发未单独验证**。但对本系统而言
 > 结论不变：自动化路径从此不再发送 Esc。
 
-> 补充实测：minimize→restore、hide→show、`InvalidateRect+UpdateWindow` 三招都无法解除，
-> 只有 `taskkill Weixin.exe` + 重启（约 6 s，自动登录点点一下）能恢复。
+> 补充实测：minimize→restore、hide→show、`InvalidateRect+UpdateWindow` 三招都无法解除。
+> **2026-10-29 21:4x 修正**：不必重启微信 —— 见 §4.1，**双击窗口顶部条**即可解冻（这是用户
+> 手动发现的，本机已复现且已接进自动恢复阶梯）。`taskkill` 重启降为最后手段。
 
 ### 1.3 修复
 
@@ -130,12 +131,47 @@ OCR 定位 0.5~0.8 s。
 | --- | --- |
 | `_render_repaint_once` :2528 | 光标离开窗口抓基线 → 移到会话行 → 再抓，返回灰度变化比例 |
 | `ui_render_alive` :2573 | 先 `ensure_wechat_ready()`（可见/未最小化/前台/WindowFromPoint 未遮挡），再测两行取最大值；测不出返回 None（绝不当冻结） |
-| `ensure_ui_live` :2717 | 25s→**60s** TTL 缓存（`logs/wxui-liveness.json` 跨进程）；判死后先 `dismiss_overlay()` 收面板复测；仍死→冷却闸门→重启微信；用户在用键鼠（`human_busy`）时让路 |
-| `restart_wechat` :2644 | taskkill + 启动 + 等窗 + 登录页点「进入微信」（0.5w/0.79h）；记录 `logs/wxui-wechat-restarts.json` |
+| `ensure_ui_live` :2717 | 25s→**60s** TTL 缓存（`logs/wxui-liveness.json` 跨进程）；判死后阶梯：`dismiss_overlay()` 收面板 → `ui_titlebar_refresh()` 双击标题栏 → 仍死才走冷却闸门重启微信；用户在用键鼠（`human_busy`）时让路 |
+| `ui_titlebar_refresh` :2677 | **§4.1**：真鼠标双击窗口顶部条（`left+0.62w, top+20`），解冻后再双击一次还原尺寸；节流 20 s / 10 分钟 3 次（`logs/wxui-titlebar-refresh.json`） |
+| `restart_wechat` :2644 | taskkill + 启动 + 等窗 + 登录页点「进入微信」（0.5w/0.79h）；记录 `logs/wxui-wechat-restarts.json`。现在只在双击标题栏也失败时调用 |
 | `_recover_budget` :2608 | 10 分钟冷却、每小时最多 3 次 |
 
 `open_chat()` 在拿到可用窗口矩形后调用 `ensure_ui_live()`；失败返回可重试错误，消息留在
 bridge 重发队列里，20s 后自动再来。
+
+### 4.1 解冻新手段：双击窗口顶部条（2026-10-29 用户实测 + 本机复现）
+
+用户原话：**「我发现冻结后双击窗口顶部就可以解冻，不需要退出重开」**。
+
+本机复现（`scripts/_exp_titlebar_unfreeze_1029.py`，证据 `logs/ocrdiag/titlebar-exp.json`，
+判据仍然是「悬停会话行是否整行重绘」）：
+
+| 步骤 | hover ratio | 说明 |
+| --- | --- | --- |
+| baseline | **0.4248** | 正常 |
+| `winio.chord(VK_ESCAPE)` 后 | **0.0000** | 冻结（与 §1 的决定性实验一致） |
+| `WM_SYSCOMMAND SC_MAXIMIZE` | 0.0000 | 窗口确实最大化了，但**没救活** |
+| `WM_SYSCOMMAND SC_RESTORE` | 0.0000 | 仍然死 |
+| 真鼠标双击 `(left+0.62w, top+20)` | **0.4248** | **复活** |
+| 再双击一次还原尺寸 | **0.4248** | 不复发，窗口几何回到原值 |
+
+结论：解冻必须走**原生 NC 双击**（`WM_NCLBUTTONDBLCLK`），由窗口管理器重建渲染面；
+`PostMessage(WM_SYSCOMMAND)` 走内核消息路径，重建不了 MMUI 的渲染目标。这也解释了为什么
+早先「minimize→restore / hide→show」全部无效——那些都是程序化路径。
+
+实现要点（`wxui.ui_titlebar_refresh`）：
+
+* 取当前矩形算点 `(left + 0.62*w, top + 20)`；`top` 兜负值（最大化时原点可能是 -12）。
+* 双击前过 `_point_belongs_to(hwnd, point)`：那一点此刻必须属于微信进程，否则拒绝。
+* 双击后若窗口变成最大化，**再双击一次还原**；还原不到原矩形就 `SetWindowPos` 摆回去。
+* 节流：`ui_refresh_min_interval_s=20`、`ui_refresh_max_per_10min=3`；`human_busy` 时让路。
+* `winio.double_click()` 专门为此新增：**故意绕过** `click()` 里的双击抑制（那里防的是
+  「双击会话行 = 在独立窗口打开」；这里要的就是合成一次真双击），两次 down/up 间隔 12 ms。
+
+自动阶梯实测（`scripts/_check_titlebar_ladder_1029.py`，证据
+`logs/ocrdiag/titlebar-ladder-check.json`）：冻结 → `ensure_ui_live(ttl_s=0)` 返回
+`ok=True, titlebar_refresh=True`，耗时 **11.1 s**，Weixin.exe 的 5 个 PID **前后完全一致**
+（没重启），窗口 `maximized=false`、矩形回到 `[1658,326,3338,1523]`，hover ratio 回到 0.4248。
 
 另外：wxui 现在**同时写 `logs/wxui-YYYYMMDD.log`**（按天追加）。原因：bridge 用
 `subprocess.run(capture_output=True, timeout=45)` 调 wxui，超时被杀时 stdout/stderr 全丢，
@@ -156,7 +192,8 @@ bridge 重发队列里，20s 后自动再来。
 | 面板没开时 `_search_result_pick` | 返回 None + `panel_visible=false`（拒绝盲点） |
 | 真发 `文件传输助手`（commit） | 3 次全部 WeFlow 回读确认：localId **346 / 347 / 348** |
 | 单次发送耗时 | 5.5~12.4 s（含 ~1.9 s windows-mcp 启动 + 首次 ~3.6 s 探活），远低于 bridge 45 s 超时 |
-| 冻结恢复 | `restart_wechat` 6.2 s 恢复，hover ratio 0.0 → 0.4259 |
+| 冻结恢复（旧） | `restart_wechat` 6.2 s 恢复，hover ratio 0.0 → 0.4259 |
+| 冻结恢复（新，2026-10-29 21:52） | `ensure_ui_live` 自动阶梯 11.1 s 恢复：double-click → double-click back，ratio 0.0 → 0.4248，**微信进程未重启**（5 个 PID 不变），窗口未最大化、矩形不变 |
 
 ---
 
@@ -179,6 +216,11 @@ bridge 重发队列里，20s 后自动再来。
 "overlay_dismiss_y_ratio": 0.084,
 "ui_alive_diff_ratio": 0.01,
 "ui_live_ttl_s": 60,
+"ui_refresh_enabled": true,
+"ui_refresh_dbl_x_ratio": 0.62,
+"ui_refresh_dbl_y_offset_px": 20,
+"ui_refresh_min_interval_s": 20,
+"ui_refresh_max_per_10min": 3,
 "wxui_auto_recover": true,
 "wxui_recover_cooldown_s": 600,
 "wxui_recover_max_per_hour": 3,
@@ -207,15 +249,19 @@ bridge 重发队列里，20s 后自动再来。
 1. **不要再用 Esc 清场**。代码里已无 `ui_escape()` 调用；以后新增微信自动化时也要遵守。
 2. `windows` OCR 引擎下「用户F」仍然读不出，所以 `ocr_engine=windows` 只是排障退路。
 3. `.venv-ocr` 是新增的 274 MB 环境；如果删掉，`ocr_engine=rapid` 会退回 winsdk（功能降级）。
-4. 自愈重启会**杀掉用户正在看的微信**：已加冷却/每小时上限/`human_busy` 让路，但仍是
-   最后手段；日志 `logs/wxui-wechat-restarts.json` 可查。
+4. 自愈重启会**杀掉用户正在看的微信**：现在它排在新阶梯最后（先收覆盖层 → 再双击标题栏
+   解冻 → 两者都失败才重启），并有冷却/每小时上限/`human_busy` 让路；日志
+   `logs/wxui-wechat-restarts.json` 可查，双击解冻记在 `logs/wxui-titlebar-refresh.json`。
+   注意双击解冻会让窗口**闪一下最大化再还原**（约 2 s），这是解冻本身的副作用，正常。
 5. 本轮实验期间为定位根因主动重启过微信约 5 次（08:38 误判 1 次 + 实验 4 次），属一次性
    诊断开销；生产路径有闸门不会再这样。
 6. 复现/诊断脚本（都在 `scripts/`，前缀 `_`）：
    `_exp_search_freeze_1029.py`（根因实验）、`_probe_search_panel_1029.py`（面板 OCR + 活性）、
    `_test_ocr_server.py`（OCR 服务往返）、`_bench_rapidocr.py`（OCR 耗时）、
    `_probe_hover_detail_1029.py`（悬停判据细节）、`_diag_steps_1029.py`（提交路径分段计时）、
-   `_diag_bridge_invoke_1029.py`（按 bridge 的方式跑一次 send 并计时）。
+   `_diag_bridge_invoke_1029.py`（按 bridge 的方式跑一次 send 并计时）、
+   `_exp_titlebar_unfreeze_1029.py`（双击标题栏解冻实验）、`_check_titlebar_ladder_1029.py`
+   （自动恢复阶梯端到端验证）。
 7. **调试期间不要在 bot 在线时跑 GUI 实验**：bridge 的 `_ui_lock` 只串行化它自己的发送，
    外部脚本（我这次的面板实验）会与它抢同一个微信窗口——09:10–09:16 那批 45s 超时就是
    实验脚本和 bridge 发送叠在一起造成的，停止实验后立刻恢复（同一套 bridge 调用

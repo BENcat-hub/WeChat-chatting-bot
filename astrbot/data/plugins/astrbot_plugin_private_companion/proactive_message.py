@@ -2193,7 +2193,8 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         state = self.data.get("daily_state", {})
         energy = _safe_int(state.get("energy"), 70, 0, 100) if isinstance(state, dict) else 70
         lines = [
-            "主动消息通常比正式回复更碎、更口语；大多数控制在 20 个汉字左右，能停在半句就不要补成完整段落。",
+            "主动消息要短、口语，但必须自成一句读得懂的话：至少要有明确的主谓（谁在做什么、在哪、在想什么），"
+            "不要用「那份/那个/一半」这类没有指代的说法起头，也不要停在半个句子上。多数控制在 20~45 字。",
             "除非语义确实需要，不要每句都用完整句号收尾；不要为了显得自然而堆叠解释、背景和客套。",
         ]
         if energy <= 42:
@@ -2203,7 +2204,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         else:
             lines.append("当前能量平稳：优先一到两句短消息，保留一点停顿和留白，避免客服式完整陈述。")
         if reason in {"check_in", "quiet_care", "state_share"} and "photo" not in action:
-            lines.append("如果本轮只是想起对方或顺手分享一点感受，低信息量的短句也可以成立；不要为了增加信息而硬塞新事实。")
+            lines.append("如果本轮只是想起对方或顺手分享一点感受，可以只说一句；但这句要读得通、看得懂——不要只剩一个没有前因的片段，也不要为了凑信息硬塞新事实。")
         busy_context_getter = getattr(self, "_busy_proactive_voice_context", None)
         try:
             busy_context = busy_context_getter() if callable(busy_context_getter) else {}
@@ -2417,7 +2418,22 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                 + self._format_plan_item_for_prompt(previous)
                 + "。如果离当前时间较久,只当作余味。"
             )
-        return "\n".join(line for line in lines if line)
+        return "\n".join(line for line in lines if line and not self._plan_prompt_text_is_vague(line))
+
+    _VAGUE_PLAN_MARKERS = ("临近时段可能有安排",)
+
+    def _plan_prompt_text_is_vague(self, text: str) -> bool:
+        """「17:40｜临近时段可能有安排」这类空壳只说明「也许有安排」，没有任何可说的内容。
+
+        把它当线索喂给模型，模型只能拿「那份 / 一半 / 一会儿」这类没有指代的短语填空，
+        正文就会没头没尾。宁可不给线索，也不给空壳。
+        """
+
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return True
+        return any(marker in cleaned for marker in self._VAGUE_PLAN_MARKERS)
+
 
     def _sanitize_schedule_context_for_private_user(self, text: str, user: dict[str, Any] | None = None) -> str:
         cleaned = str(text or "").strip()
@@ -2737,6 +2753,13 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                 lines.append(f"- 这些固定称呼不属于当前对象：{'、'.join(forbidden)}。需要称呼时使用上面的当前昵称，也可以自然省略称呼。")
         else:
             lines.append("- 如果人格明确规定了对主要用户的专属称呼，优先遵循该称呼；不要把当前显示名自行拼接后缀来发明新称呼。")
+            if allowed:
+                lines.append(
+                    "- 聊天里不要加称呼：直接开口说话。历史聊天里以「主人」开头的旧称呼、"
+                    "以及把对方昵称（显示名）当称呼的说法都已经过期，一律不要用；"
+                    "万一确实需要叫一声，只用「宝宝」，不要用昵称、显示名或自己发明别的称呼，"
+                    "也不要把称呼当成每句话的固定开头。"
+                )
         boundary_section_getter = getattr(
             self,
             "_format_private_user_boundary_prompt_section",
@@ -2849,6 +2872,81 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         )
         repaired, count = re.subn(pattern, lambda match: f"{match.group(1)}{replacement}", cleaned, count=1)
         return (repaired, wrong) if count else (cleaned, "")
+
+    def _normalize_chat_address(
+        self,
+        text: str,
+        user: dict[str, Any] | None,
+        name: str = "",
+    ) -> str:
+        """聊天里统一不加称呼；万一模型还是叫了名字，只留「宝宝」。
+
+        用户明确要求：不要用昵称/显示名/「主人」这类称呼，真要叫就叫宝宝。
+        """
+        cleaned = str(text or "")
+        if not cleaned:
+            return cleaned
+        tokens: list[str] = []
+        for item in self._proactive_recipient_allowed_names(user, name):
+            tokens.append(_single_line(item, 40))
+        if isinstance(user, dict):
+            for key in ("nickname", "last_display_name", "nickname_prev", "display_name"):
+                tokens.append(_single_line(user.get(key), 40))
+        tokens.append("主人")
+        for token in sorted({t for t in tokens if t and len(t) >= 2 and t != "宝宝"}, key=len, reverse=True):
+            if token in cleaned:
+                cleaned = cleaned.replace(token, "宝宝")
+        cleaned = re.sub(r"(?:宝宝[\s、，,：:]*){2,}", "宝宝 ", cleaned)
+        cleaned = re.sub(r"^宝宝[\s、，,：:]+", "", cleaned).strip()
+        return cleaned
+
+    def _has_dangling_reference_opener(self, text: str) -> bool:
+        """判断开头是不是「那份 / 那个 / 一半」这种没有指代的说法。
+
+        模型偶尔会从上一句没说完的话往下接，读者看不到上文，就变成没头没尾。
+        命中后由调用方换成落地的表述。
+        """
+        cleaned = _single_line(text, 120)
+        if not cleaned:
+            return False
+        return bool(re.match(r"^(?:那|这)(?:份|个|些|点|回|阵)|^一半", cleaned))
+
+    def _strip_leading_address_prefix(
+        self,
+        text: str,
+        user: dict[str, Any] | None,
+        name: str = "",
+    ) -> str:
+        """去掉句首那种「昵称 + 空格」的机械称呼开场。
+
+        主动消息一开口就点对方的名（「桃桃真可爱 天黑得早…」）读起来像点名，
+        不像人说话。只在句首候选称呼后面紧跟空白/顿号、且剥掉后还剩足够内容时才剥。
+        """
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return cleaned
+        candidates: list[str] = []
+        for item in self._proactive_recipient_allowed_names(user, name):
+            label = _single_line(item, 40)
+            if label:
+                candidates.append(label)
+        if isinstance(user, dict):
+            for key in ("nickname", "last_display_name", "nickname_prev", "remark", "display_name"):
+                label = _single_line(user.get(key), 40)
+                if label:
+                    candidates.append(label)
+        # 长的优先，避免「桃桃」先吃掉「桃桃真可爱」的一部分
+        for candidate in sorted(set(candidates), key=len, reverse=True):
+            if len(candidate) < 2 or not cleaned.startswith(candidate):
+                continue
+            rest = cleaned[len(candidate):]
+            if not rest or rest[0] not in " \t、，,：:~～\n":
+                continue
+            stripped = rest.lstrip(" \t、，,：:~～")
+            if len(stripped) < 6:
+                continue
+            return stripped
+        return cleaned
 
     def _default_proactive_prompt_document(
         self,
@@ -3478,6 +3576,8 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         relationship_fact = self._format_proactive_relationship_fact(user)
         current_item = self._proactive_current_plan_item(self.data.get("daily_plan", {}))
         current_schedule = self._format_schedule_context_for_prompt() or self._format_plan_item_for_prompt(current_item)
+        if self._plan_prompt_text_is_vague(current_schedule):
+            current_schedule = "（本轮没有可用的具体生活片段；不要虚构日程细节，只能从真实对话、当下念头或明确记忆里开口）"
         troubleshooting_section = self._proactive_troubleshooting_request_prompt_section(user)
         source_focused_reasons = {
             "bili_video_share",
@@ -3631,13 +3731,21 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         current_schedule = self._sanitize_schedule_context_for_private_user(current_schedule, user)
         current_schedule = sanitize_relationship_source(current_schedule, "proactive.current_schedule")
         compact_motive = _single_line(
-            sanitize_relationship_source(motive, "proactive.planned_motive"),
+            self._compact_proactive_motive_text(
+                sanitize_relationship_source(motive, "proactive.planned_motive"),
+                reason,
+                name,
+            ),
             36,
         ) or "有一点想靠近对方"
         topic_hint = _single_line(
-            sanitize_relationship_source(
-                user.get("planned_proactive_topic"),
-                "proactive.planned_topic",
+            self._compact_proactive_motive_text(
+                sanitize_relationship_source(
+                    user.get("planned_proactive_topic"),
+                    "proactive.planned_topic",
+                ),
+                reason,
+                name,
             ),
             40,
         )
@@ -7948,6 +8056,23 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         cleaned = self._apply_proactive_style_variation(cleaned, user)
         cleaned = self._collapse_multi_candidate_proactive_text(cleaned, user=user, name=name)
         cleaned = self._repair_proactive_subject_drift(cleaned, reason=reason, action=action, action_context=action_context)
+        cleaned = self._strip_leading_address_prefix(cleaned, user, name)
+        cleaned = self._normalize_chat_address(cleaned, user, name)
+        if self._has_dangling_reference_opener(cleaned):
+            grounded_text = self._ground_proactive_text(
+                cleaned,
+                reason=reason,
+                action=action,
+                action_context=action_context,
+            )
+            if grounded_text and grounded_text != cleaned:
+                logger.info(
+                    "主动消息开头指代悬空, 已换成落地表述: reason=%s before=%s after=%s",
+                    reason,
+                    _single_line(cleaned, 60),
+                    _single_line(grounded_text, 60),
+                )
+                cleaned = grounded_text
         if reason == "morning_greeting":
             cleaned = self._strip_morning_meal_questions(cleaned)
         cleaned = self._visible_text_without_tts_reading(cleaned, limit=1000)
@@ -8724,10 +8849,44 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             cleaned = re.sub(r"(呀|啦|嘛|哦|呢)(?=.*\1)", "", cleaned)
         return cleaned or str(text or "").strip()
 
+    def _compact_proactive_motive_text(self, value: Any, reason: str, name: str = "") -> str:
+        """动机/话题只该是一句「想做什么」，不该是一段已经发生的日程叙事。
+
+        旧实现把日程 activity 原文截到 36 字当「开口动机」，模型照抄就变成念稿
+        （「我刚刚把薄外套挂回椅背…显示器下沿，左右」）；截断还会把半句切断，
+        于是正文天然没头没尾。叙事型内容交给生活片段做背景，动机退回意图本身。
+        """
+
+        raw = _single_line(value, 140)
+        if not raw:
+            return ""
+        clauses = [part for part in re.split(r"[，,。；;：:！？!?]", raw) if part.strip()]
+        looks_narrative = len(clauses) >= 3 or len(raw) > 28
+        # 「发完就扣下手机继续吃」这类是动作指令，不是「想做什么」；
+        # 照抄进动机，模型就会写成状态汇报。
+        if not looks_narrative and re.match(r"^(?:发|去|回|把|拿|做|吃|睡|看|写|收|关|扣|挂|放|走|坐|躺|站|跑|洗|买|拆|喝|听)", raw) and len(raw) >= 6:
+            looks_narrative = True
+        # 没有「想/关心/分享…」这类意图词、却带「了/刚/已经/又/才」的，是已经发生过的事，
+        # 属于生活片段而不是开口动机（模型照抄就会写成「我刚刚…」的流水账）。
+        intent_markers = ("想", "关心", "惦记", "念着", "分享", "陪", "聊", "问问", "问一下", "担心", "好奇", "打个招呼", "说说", "看看", "听听")
+        past_markers = ("了", "刚", "已经", "又", "才", "完")
+        if (
+            not looks_narrative
+            and not any(marker in raw for marker in intent_markers)
+            and any(marker in raw for marker in past_markers)
+        ):
+            looks_narrative = True
+        if not looks_narrative:
+            return raw
+        reason_text = str(_REASON_TEXT.get(reason, "") or "").replace("{name}", name or "对方")
+        return _single_line(reason_text, 24)
+
     def _format_action_prompt_context(self, action: str, action_context: str) -> str:
         context = str(action_context or "").strip()
-        if not context:
-            return "普通文字"
+        if not context or context.startswith("message："):
+            # 「message：只发送私聊文本」是内部动作说明，不是发生过的事件。
+            # 把它当事实喂给模型，模型只能靠含糊短语填补空白，从而写出没头没尾的半句。
+            return "（本轮没有真实发生的额外事件；只能从当下念头、真实对话或明确日程里开口，不要虚构见闻）"
         return _single_line(self._sanitize_action_context_text(action, context), 420)
 
     def _sanitize_action_boundaries(
@@ -8976,7 +9135,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                 }
         return {
             "success": True,
-            "context": "\n".join(item for item in contexts if item) or "message：只发送私聊文本",
+            "context": "\n".join(item for item in contexts if item),
             "extra_components": extra_components,
             "summary": " + ".join(summary_parts) or normalized,
             "effective_action": "+".join(effective_parts) or normalized,
@@ -9054,7 +9213,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             return payload
         if action.startswith("external:"):
             return await self._execute_external_proactive_ability(action.split(":", 1)[1], user, name, reason)
-        return {"success": True, "context": "message：只发送私聊文本", "extra_components": [], "summary": "文字", "effective_action": "message"}
+        return {"success": True, "context": "", "extra_components": [], "summary": "文字", "effective_action": "message"}
 
     async def _execute_external_proactive_ability(
         self,
@@ -10896,14 +11055,14 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                 source = str(normalizer(source) or source).strip()
             except Exception:
                 pass
-        if re.search(r"<tts\b[^>]*>.*?</tts>", source, flags=re.IGNORECASE | re.DOTALL):
-            outside = re.sub(r"<tts\b[^>]*>.*?</tts>", "", source, flags=re.IGNORECASE | re.DOTALL)
-            outside = re.sub(r"</?t{2,}s\b[^>]*>", "", outside, flags=re.IGNORECASE).strip()
+        if re.search(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", source, flags=re.IGNORECASE | re.DOTALL):
+            outside = re.sub(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", "", source, flags=re.IGNORECASE | re.DOTALL)
+            outside = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", outside, flags=re.IGNORECASE).strip()
             if re.search(r"[\u4e00-\u9fff]", outside):
                 return _single_line(_strip_internal_message_blocks(
                     outside, tts_enabled=bool(runtime_persona_setting(self, "enable_tts_enhancement", False))
                 ), limit)
-            source = re.sub(r"</?t{2,}s\b[^>]*>", "", source, flags=re.IGNORECASE).strip()
+            source = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", source, flags=re.IGNORECASE).strip()
         has_kana = bool(re.search(r"[\u3040-\u30ff]", source))
         has_cjk = bool(re.search(r"[\u4e00-\u9fff]", source))
         if (
@@ -17344,7 +17503,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
     def _clean_forward_segment_texts(self, segments: list[str]) -> list[str]:
         cleaned: list[str] = []
         for segment in segments:
-            text = re.sub(r"</?t{2,}s\b[^>]*>", "", str(segment or ""), flags=re.IGNORECASE).strip()
+            text = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", str(segment or ""), flags=re.IGNORECASE).strip()
             text = self._strip_leading_sentence_boundary_artifacts(text)
             if text:
                 cleaned.append(text)

@@ -34,6 +34,7 @@ import time
 from typing import List, Optional
 
 import requests
+from text_sanitize import sanitize_outbound_text
 
 try:  # 复用同一个 BaseSender 定义，保证接口一致
     from uia_sender import BaseSender, UiaSender
@@ -92,6 +93,7 @@ class WeMessengerSender(BaseSender):  # type: ignore[misc]
     # ==================== 对外接口 ====================
 
     def send_text(self, contact: str, text: str) -> bool:
+        text = sanitize_outbound_text(text)
         if not text:
             return False
         text = text[: self.max_text_length]

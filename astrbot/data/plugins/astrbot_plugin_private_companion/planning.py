@@ -501,7 +501,9 @@ def normalize_story_plan(plugin, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item.get("chain"), list):
             item["chain"] = []
         normalized_proactive.append(item)
-    normalized_proactive = plugin._balance_proactive_events_for_day(normalized_proactive, limit=10)
+    # 2026-11-03：日常事件改为「一人独占一条」后，10 条/天不够分（4~6 个活跃对象各要
+    # 2~4 条），把单段上限提到 20，配合 daily_state 的分段桶上限一起放大事件池。
+    normalized_proactive = plugin._balance_proactive_events_for_day(normalized_proactive, limit=20)
     summary = _single_line(payload.get("summary"), 160) or "这一段按原日程慢慢推进。"
     if callable(social_fact_sanitizer):
         summary = social_fact_sanitizer(summary, field="detail.summary")

@@ -1,0 +1,761 @@
+"""用量查询 Mixin。
+
+封装对原生 ``ProviderStat`` 表的四维（会话 / 用户 / 模型 / 全局）聚合查询，
+供预算检查、报表、命令复用。
+
+可测性设计：聚合逻辑抽成模块级纯函数 ``aggregate_rows``（不依赖 astrbot /
+sqlmodel，可单测）；DB 查询在 ``UsageQueryMixin`` 方法内延迟 import astrbot，
+使本模块顶层零第三方依赖，本地可直接 import 测试。
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+# 时序分桶支持的列白名单（由 ``query_usage_timeseries`` 校验后传入 ``bucketize_rows``）。
+TIMESERIES_BUCKETS = ("day", "hour")
+
+
+def aggregate_rows(rows: list[Any]) -> dict[str, Any]:
+    """聚合 ``ProviderStat`` 行（或类似对象）的 token 三类与条数。
+
+    纯函数，仅依赖每个行的 ``token_input_other`` / ``token_input_cached`` /
+    ``token_output`` 属性，可脱离 DB 单测。
+
+    Args:
+        rows: ``ProviderStat`` 对象列表（或任何含上述属性的 duck-typed 对象）。
+
+    Returns:
+        含 ``token_input_other`` / ``token_input_cached`` / ``token_output`` /
+        ``count`` 的聚合 dict。
+    """
+    s_other = 0
+    s_cached = 0
+    s_output = 0
+    for row in rows:
+        s_other += int(getattr(row, "token_input_other", 0) or 0)
+        s_cached += int(getattr(row, "token_input_cached", 0) or 0)
+        s_output += int(getattr(row, "token_output", 0) or 0)
+    return {
+        "token_input_other": s_other,
+        "token_input_cached": s_cached,
+        "token_output": s_output,
+        "count": len(rows),
+    }
+
+
+def _bucket_key(created: Any, bucket: str) -> str | None:
+    """从行的 ``created_at`` 派生桶 key（纯函数）。
+
+    - ``day``：``"YYYY-MM-DD"``。
+    - ``hour``：``"YYYY-MM-DD HH:00"``。
+
+    输入为 None 或解析失败返回 None（该行被丢弃）。
+    """
+    if created is None:
+        return None
+    try:
+        dt = created if isinstance(created, datetime) else datetime.fromisoformat(str(created))
+        # 与 SQL strftime 一致：带偏移时间转 UTC，SQLite 无时区值按 UTC 解释。
+        dt = dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+        day = dt.strftime("%Y-%m-%d")
+        if bucket == "hour":
+            return f"{day} {dt:%H}:00"
+        return day
+    except Exception:
+        return None
+
+
+def bucketize_rows(
+    rows: list[Any],
+    bucket: str = "day",
+) -> list[dict[str, Any]]:
+    """应用层分桶聚合（纯函数，便于脱离 DB 单测）。
+
+    Args:
+        rows: ``ProviderStat`` 对象列表（duck-typed，含 ``created_at`` 与 token 三类）。
+        bucket: ``"day"`` 或 ``"hour"``。
+
+    Returns:
+        ``[{bucket, token_input_other, token_input_cached, token_output, count}, ...]``，
+        按 bucket 升序。``created_at`` 缺失的行被跳过。
+    """
+    buckets: dict[str, dict[str, int]] = {}
+    for row in rows:
+        key = _bucket_key(getattr(row, "created_at", None), bucket)
+        if key is None:
+            continue
+        b = buckets.setdefault(
+            key,
+            {"token_input_other": 0, "token_input_cached": 0, "token_output": 0, "count": 0},
+        )
+        b["token_input_other"] += int(getattr(row, "token_input_other", 0) or 0)
+        b["token_input_cached"] += int(getattr(row, "token_input_cached", 0) or 0)
+        b["token_output"] += int(getattr(row, "token_output", 0) or 0)
+        b["count"] += 1
+    return [{"bucket": k, **v} for k, v in sorted(buckets.items())]
+
+
+class UsageQueryMixin:
+    """查询 ``ProviderStat`` 聚合用量的 Mixin。"""
+
+    # 由 ``Main`` 宿主提供（Mixin 不定义 ``__init__``）。
+    context: Any
+
+    async def query_usage(
+        self,
+        *,
+        umo: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> dict[str, Any]:
+        """按条件聚合查询 token 用量（SQL SUM/COUNT，失败返回零值）。
+
+        时间窗口基于 ``ProviderStat.created_at``（UTC datetime）；注意
+        ``start_time`` / ``end_time`` 是 float（耗时/时间戳），不适合做窗口筛选。
+
+        Args:
+            umo: 会话标识（unified message origin），None 表示不限。
+            provider: Provider ID，None 表示不限。
+            model: 模型名，None 表示不限。
+            start: 窗口起始时间（含）。
+            end: 窗口结束时间（含）。
+
+        Returns:
+            包含 ``token_input_other`` / ``token_input_cached`` / ``token_output``
+            / ``count`` 的聚合 dict。
+        """
+        from astrbot.core.db.po import ProviderStat
+        from sqlmodel import func, select
+
+        zero: dict[str, Any] = {
+            "token_input_other": 0,
+            "token_input_cached": 0,
+            "token_output": 0,
+            "count": 0,
+        }
+        try:
+            db = self.context.get_db()
+            stmt = select(
+                func.sum(ProviderStat.token_input_other),
+                func.sum(ProviderStat.token_input_cached),
+                func.sum(ProviderStat.token_output),
+                func.count(),
+            )
+            if umo:
+                stmt = stmt.where(ProviderStat.umo == umo)
+            if provider:
+                stmt = stmt.where(ProviderStat.provider_id == provider)
+            if model:
+                stmt = stmt.where(ProviderStat.provider_model == model)
+            if start:
+                stmt = stmt.where(ProviderStat.created_at >= start)
+            if end:
+                stmt = stmt.where(ProviderStat.created_at <= end)
+            async with db.get_db() as session:
+                result = await session.execute(stmt)
+                row = result.one()
+            return {
+                "token_input_other": int(row[0] or 0),
+                "token_input_cached": int(row[1] or 0),
+                "token_output": int(row[2] or 0),
+                "count": int(row[3] or 0),
+            }
+        except Exception:
+            return zero
+
+    async def delete_usage_by_provider(self, provider_id: str) -> int:
+        """按精确 Provider ID 删除 AstrBot 原生用量记录。
+
+        该操作仅供已从 AstrBot 配置中删除的 Provider 残留清理使用。调用方必须先
+        校验 Provider 已不在当前配置中；这里坚持精确匹配，避免名称前缀相近时误删。
+        数据库异常直接向上抛出，由 Web API 返回明确失败，不能把失败伪装成删除 0 条。
+        """
+        pid = str(provider_id or "").strip()
+        if not pid:
+            return 0
+
+        from astrbot.core.db.po import ProviderStat
+        from sqlalchemy import delete
+
+        db = self.context.get_db()
+        async with db.get_db() as session:
+            result = await session.execute(
+                delete(ProviderStat).where(ProviderStat.provider_id == pid)
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
+
+    async def query_records(
+        self,
+        *,
+        umo: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Any]:
+        """按条件查询 ``ProviderStat`` 明细行（最新优先，失败返回空列表）。"""
+        from astrbot.core.db.po import ProviderStat
+        from sqlmodel import select
+
+        try:
+            db = self.context.get_db()
+            stmt = select(ProviderStat)
+            if umo:
+                stmt = stmt.where(ProviderStat.umo == umo)
+            if provider:
+                stmt = stmt.where(ProviderStat.provider_id == provider)
+            if model:
+                stmt = stmt.where(ProviderStat.provider_model == model)
+            if start:
+                stmt = stmt.where(ProviderStat.created_at >= start)
+            if end:
+                stmt = stmt.where(ProviderStat.created_at <= end)
+            stmt = stmt.order_by(ProviderStat.created_at.desc()).limit(limit)
+            async with db.get_db() as session:
+                result = await session.execute(stmt)
+                return list(result.scalars().all())
+        except Exception:
+            return []
+
+    async def query_usage_grouped(
+        self,
+        *,
+        by: str = "model",
+        umo: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """按 ``by`` 分组聚合 token 用量（供成本核算按模型 / provider / 会话拆分）。
+
+        Args:
+            by: ``"model"``（按 ``provider_model``）、``"provider"``（按
+            ``provider_id``）或 ``"umo"``（按会话 ``umo``）。
+            umo: 会话标识，None 表示不限。
+            provider: Provider ID，None 表示不限。
+            model: 模型名（``provider_model``），None 表示不限。
+            start: 窗口起始（含）。
+            end: 窗口结束（含）。
+
+        Returns:
+            ``[{"key": str, "token_input_other": int, "token_input_cached": int,
+            "token_output": int, "count": int}, ...]``，``key`` 为分组值
+            （模型名 / provider id / umo）。失败返回空列表。
+        """
+        from astrbot.core.db.po import ProviderStat
+        from sqlmodel import func, select
+
+        try:
+            db = self.context.get_db()
+            composite = by == "provider_model"
+            if by == "provider":
+                group_col = ProviderStat.provider_id
+            elif by == "umo":
+                group_col = ProviderStat.umo
+            else:
+                group_col = ProviderStat.provider_model
+            if composite:
+                stmt = select(  # type: ignore[call-overload]
+                    ProviderStat.provider_id,
+                    ProviderStat.provider_model,
+                    func.sum(ProviderStat.token_input_other),
+                    func.sum(ProviderStat.token_input_cached),
+                    func.sum(ProviderStat.token_output),
+                    func.count(),
+                ).group_by(ProviderStat.provider_id, ProviderStat.provider_model)
+            else:
+                stmt = select(  # type: ignore[call-overload]
+                    group_col,
+                    func.sum(ProviderStat.token_input_other),
+                    func.sum(ProviderStat.token_input_cached),
+                    func.sum(ProviderStat.token_output),
+                    func.count(),
+                ).group_by(group_col)
+            if umo:
+                stmt = stmt.where(ProviderStat.umo == umo)
+            if provider:
+                stmt = stmt.where(ProviderStat.provider_id == provider)
+            if model:
+                stmt = stmt.where(ProviderStat.provider_model == model)
+            if start:
+                stmt = stmt.where(ProviderStat.created_at >= start)
+            if end:
+                stmt = stmt.where(ProviderStat.created_at <= end)
+            async with db.get_db() as session:
+                result = await session.execute(stmt)
+                rows = result.all()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                if composite:
+                    out.append(
+                        {
+                            "provider_id": str(r[0] or ""),
+                            "provider_model": str(r[1] or ""),
+                            "key": str(r[1] or ""),
+                            "token_input_other": int(r[2] or 0),
+                            "token_input_cached": int(r[3] or 0),
+                            "token_output": int(r[4] or 0),
+                            "count": int(r[5] or 0),
+                        }
+                    )
+                else:
+                    out.append(
+                        {
+                            "key": str(r[0] or ""),
+                            "token_input_other": int(r[1] or 0),
+                            "token_input_cached": int(r[2] or 0),
+                            "token_output": int(r[3] or 0),
+                            "count": int(r[4] or 0),
+                        }
+                    )
+            return out
+        except Exception:
+            return []
+
+    async def query_usage_cost_rows(
+        self,
+        pricing: dict[str, Any],
+        *,
+        umo: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """返回适合成本计算的 Provider/模型聚合行。
+
+        无分时策略时复用原有快速查询。存在分时策略时，仅为相关 Provider 增加 UTC
+        分钟分组并附 ``created_at``；未配置策略的 Provider 仍只产生一条聚合行。
+        """
+        from .pricing_schedule import scheduled_provider_ids
+
+        schedules = pricing.get("schedules") if isinstance(pricing, dict) else None
+        scheduled = scheduled_provider_ids(schedules)
+        if not scheduled:
+            rows = await self.query_usage_grouped(
+                by="provider_model",
+                umo=umo,
+                provider=provider,
+                model=model,
+                start=start,
+                end=end,
+            )
+            return await self._expand_nonlinear_cost_rows(
+                pricing, rows, umo=umo, provider=provider, model=model, start=start, end=end
+            )
+
+        from astrbot.core.db.po import ProviderStat
+        from sqlalchemy import case
+        from sqlmodel import func, select
+
+        try:
+            db = self.context.get_db()
+            pricing_bucket = case(
+                (
+                    ProviderStat.provider_id.in_(sorted(scheduled)),
+                    func.strftime("%Y-%m-%d %H:%M", ProviderStat.created_at),
+                ),
+                else_="",
+            )
+            stmt = select(  # type: ignore[call-overload]
+                pricing_bucket,
+                ProviderStat.provider_id,
+                ProviderStat.provider_model,
+                func.sum(ProviderStat.token_input_other),
+                func.sum(ProviderStat.token_input_cached),
+                func.sum(ProviderStat.token_output),
+                func.count(),
+            ).group_by(pricing_bucket, ProviderStat.provider_id, ProviderStat.provider_model)
+            if umo:
+                stmt = stmt.where(ProviderStat.umo == umo)
+            if provider:
+                stmt = stmt.where(ProviderStat.provider_id == provider)
+            if model:
+                stmt = stmt.where(ProviderStat.provider_model == model)
+            if start:
+                stmt = stmt.where(ProviderStat.created_at >= start)
+            if end:
+                stmt = stmt.where(ProviderStat.created_at <= end)
+            async with db.get_db() as session:
+                rows = (await session.execute(stmt)).all()
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                bucket = str(row[0] or "")
+                created_at = None
+                if bucket:
+                    try:
+                        created_at = datetime.strptime(bucket, "%Y-%m-%d %H:%M").replace(tzinfo=UTC)
+                    except ValueError:
+                        created_at = None
+                out.append(
+                    {
+                        "provider_id": str(row[1] or ""),
+                        "provider_model": str(row[2] or ""),
+                        "key": str(row[2] or ""),
+                        "token_input_other": int(row[3] or 0),
+                        "token_input_cached": int(row[4] or 0),
+                        "token_output": int(row[5] or 0),
+                        "count": int(row[6] or 0),
+                        "created_at": created_at,
+                    }
+                )
+            return await self._expand_nonlinear_cost_rows(
+                pricing, out, umo=umo, provider=provider, model=model, start=start, end=end
+            )
+        except Exception:
+            return []
+
+    async def query_usage_timeseries(
+        self,
+        *,
+        start: datetime,
+        end: datetime | None = None,
+        bucket: str = "day",
+        umo: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按天 / 小时分桶聚合 token 用量与条数（基于 ``ProviderStat``，全量历史）。
+
+        用 SQLite ``func.strftime`` 在 SQL 层按 **UTC** 分桶（避免应用层拉全量行；
+        前端用 ``toLocaleDateString`` 渲染本地日标签，UTC vs 本地最多 ±1 天偏差，
+        趋势看形状可接受）。``created_at`` 是 aware UTC datetime，文本序与 ISO 序一致，
+        可直接用 ``>=`` / ``<=`` 做区间筛选。
+
+        Args:
+            start: 窗口起始（含）。
+            end: 窗口结束（含），None 表示至今。
+            bucket: ``"day"``（默认）或 ``"hour"``，其余按 day。
+
+        Returns:
+            ``[{bucket, token_input_other, token_input_cached, token_output, count}, ...]``，
+            按 bucket 升序。失败返回空列表（不抛异常）。
+        """
+        from astrbot.core.db.po import ProviderStat
+        from sqlmodel import func, select
+
+        try:
+            db = self.context.get_db()
+            bucket_col = (
+                func.strftime("%Y-%m-%d %H:00", ProviderStat.created_at)
+                if bucket == "hour"
+                else func.strftime("%Y-%m-%d", ProviderStat.created_at)
+            )
+            stmt = select(  # type: ignore[call-overload]
+                bucket_col,
+                func.sum(ProviderStat.token_input_other),
+                func.sum(ProviderStat.token_input_cached),
+                func.sum(ProviderStat.token_output),
+                func.count(),
+            ).group_by(bucket_col)
+            if umo:
+                stmt = stmt.where(ProviderStat.umo == umo)
+            if provider:
+                stmt = stmt.where(ProviderStat.provider_id == provider)
+            if model:
+                stmt = stmt.where(ProviderStat.provider_model == model)
+            if start:
+                stmt = stmt.where(ProviderStat.created_at >= start)
+            if end:
+                stmt = stmt.where(ProviderStat.created_at <= end)
+            async with db.get_db() as session:
+                result = await session.execute(stmt)
+                rows = result.all()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                bkey = r[0]
+                if not bkey:
+                    continue
+                out.append(
+                    {
+                        "bucket": str(bkey),
+                        "token_input_other": int(r[1] or 0),
+                        "token_input_cached": int(r[2] or 0),
+                        "token_output": int(r[3] or 0),
+                        "count": int(r[4] or 0),
+                    }
+                )
+            out.sort(key=lambda x: x["bucket"])
+            return out
+        except Exception:
+            return []
+
+    async def query_usage_timeseries_by_model(
+        self,
+        *,
+        start: datetime,
+        end: datetime | None = None,
+        bucket: str = "day",
+        umo: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按 (bucket, provider_id, provider_model) 三元组聚合用量（用于按桶计成本）。
+
+        与 :meth:`query_usage_timeseries` 类似，但额外按模型分组，使调用方可以
+        逐桶按模型定价计算成本。返回扁平行列表（每行含 bucket + model 维度）。
+
+        Returns:
+            ``[{bucket, provider_id, provider_model, token_input_other,
+            token_input_cached, token_output, count}, ...]``。失败返回空列表。
+        """
+        from astrbot.core.db.po import ProviderStat
+        from sqlmodel import func, select
+
+        try:
+            db = self.context.get_db()
+            bucket_col = (
+                func.strftime("%Y-%m-%d %H:00", ProviderStat.created_at)
+                if bucket == "hour"
+                else func.strftime("%Y-%m-%d", ProviderStat.created_at)
+            )
+            stmt = select(  # type: ignore[call-overload]
+                bucket_col,
+                ProviderStat.provider_id,
+                ProviderStat.provider_model,
+                func.sum(ProviderStat.token_input_other),
+                func.sum(ProviderStat.token_input_cached),
+                func.sum(ProviderStat.token_output),
+                func.count(),
+            ).group_by(
+                bucket_col,
+                ProviderStat.provider_id,
+                ProviderStat.provider_model,
+            )
+            if umo:
+                stmt = stmt.where(ProviderStat.umo == umo)
+            if provider:
+                stmt = stmt.where(ProviderStat.provider_id == provider)
+            if model:
+                stmt = stmt.where(ProviderStat.provider_model == model)
+            if start:
+                stmt = stmt.where(ProviderStat.created_at >= start)
+            if end:
+                stmt = stmt.where(ProviderStat.created_at <= end)
+            async with db.get_db() as session:
+                result = await session.execute(stmt)
+                rows = result.all()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                bkey = r[0]
+                if not bkey:
+                    continue
+                out.append(
+                    {
+                        "bucket": str(bkey),
+                        "provider_id": str(r[1] or ""),
+                        "provider_model": str(r[2] or ""),
+                        "token_input_other": int(r[3] or 0),
+                        "token_input_cached": int(r[4] or 0),
+                        "token_output": int(r[5] or 0),
+                        "count": int(r[6] or 0),
+                    }
+                )
+            out.sort(key=lambda x: (x["bucket"], x["provider_model"]))
+            return out
+        except Exception:
+            return []
+
+    async def query_usage_cost_timeseries(
+        self,
+        pricing: dict[str, Any],
+        *,
+        start: datetime,
+        end: datetime | None = None,
+        bucket: str = "day",
+        umo: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按展示桶返回时间感知的成本计算行。"""
+        from .pricing_schedule import scheduled_provider_ids
+
+        schedules = pricing.get("schedules") if isinstance(pricing, dict) else None
+        scheduled = scheduled_provider_ids(schedules)
+        if not scheduled:
+            rows = await self.query_usage_timeseries_by_model(
+                start=start,
+                end=end,
+                bucket=bucket,
+                umo=umo,
+                provider=provider,
+                model=model,
+            )
+            return await self._expand_nonlinear_cost_rows(
+                pricing,
+                rows,
+                umo=umo,
+                provider=provider,
+                model=model,
+                start=start,
+                end=end,
+                bucket=bucket,
+            )
+
+        from astrbot.core.db.po import ProviderStat
+        from sqlalchemy import case
+        from sqlmodel import func, select
+
+        try:
+            db = self.context.get_db()
+            display_bucket = (
+                func.strftime("%Y-%m-%d %H:00", ProviderStat.created_at)
+                if bucket == "hour"
+                else func.strftime("%Y-%m-%d", ProviderStat.created_at)
+            )
+            pricing_bucket = case(
+                (
+                    ProviderStat.provider_id.in_(sorted(scheduled)),
+                    func.strftime("%Y-%m-%d %H:%M", ProviderStat.created_at),
+                ),
+                else_=display_bucket,
+            )
+            stmt = select(  # type: ignore[call-overload]
+                display_bucket,
+                pricing_bucket,
+                ProviderStat.provider_id,
+                ProviderStat.provider_model,
+                func.sum(ProviderStat.token_input_other),
+                func.sum(ProviderStat.token_input_cached),
+                func.sum(ProviderStat.token_output),
+                func.count(),
+            ).group_by(
+                display_bucket,
+                pricing_bucket,
+                ProviderStat.provider_id,
+                ProviderStat.provider_model,
+            )
+            if umo:
+                stmt = stmt.where(ProviderStat.umo == umo)
+            if provider:
+                stmt = stmt.where(ProviderStat.provider_id == provider)
+            if model:
+                stmt = stmt.where(ProviderStat.provider_model == model)
+            if start:
+                stmt = stmt.where(ProviderStat.created_at >= start)
+            if end:
+                stmt = stmt.where(ProviderStat.created_at <= end)
+            async with db.get_db() as session:
+                rows = (await session.execute(stmt)).all()
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                pricing_key = str(row[1] or "")
+                created_at = None
+                try:
+                    fmt = "%Y-%m-%d %H:%M" if len(pricing_key) > 10 else "%Y-%m-%d"
+                    created_at = datetime.strptime(pricing_key, fmt).replace(tzinfo=UTC)
+                except ValueError:
+                    pass
+                out.append(
+                    {
+                        "bucket": str(row[0] or ""),
+                        "provider_id": str(row[2] or ""),
+                        "provider_model": str(row[3] or ""),
+                        "token_input_other": int(row[4] or 0),
+                        "token_input_cached": int(row[5] or 0),
+                        "token_output": int(row[6] or 0),
+                        "count": int(row[7] or 0),
+                        "created_at": created_at,
+                    }
+                )
+            out.sort(key=lambda item: (item["bucket"], item["provider_model"]))
+            return await self._expand_nonlinear_cost_rows(
+                pricing,
+                out,
+                umo=umo,
+                provider=provider,
+                model=model,
+                start=start,
+                end=end,
+                bucket=bucket,
+            )
+        except Exception:
+            return []
+
+    async def _expand_nonlinear_cost_rows(
+        self,
+        pricing: dict[str, Any],
+        rows: list[dict[str, Any]],
+        *,
+        umo: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        bucket: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """阶梯与表达式必须逐条计费，先 SUM 会错误改变每次调用命中的档位。"""
+        from .cost import resolve_effective_pricing
+
+        nonlinear = {
+            (str(row.get("provider_id") or ""), str(row.get("provider_model") or ""))
+            for row in rows
+            if (
+                resolve_effective_pricing(
+                    row.get("provider_id"),
+                    row.get("provider_model"),
+                    pricing,
+                    row.get("created_at"),
+                )
+                or {}
+            ).get("mode")
+            in ("per_tier", "tiered_expr")
+        }
+        if not nonlinear:
+            return rows
+
+        from astrbot.core.db.po import ProviderStat
+        from sqlalchemy import tuple_
+        from sqlmodel import func, select
+
+        stmt = select(ProviderStat).where(
+            tuple_(
+                func.coalesce(ProviderStat.provider_id, ""),
+                func.coalesce(ProviderStat.provider_model, ""),
+            ).in_(sorted(nonlinear))
+        )
+        if umo:
+            stmt = stmt.where(ProviderStat.umo == umo)
+        if provider:
+            stmt = stmt.where(ProviderStat.provider_id == provider)
+        if model:
+            stmt = stmt.where(ProviderStat.provider_model == model)
+        if start:
+            stmt = stmt.where(ProviderStat.created_at >= start)
+        if end:
+            stmt = stmt.where(ProviderStat.created_at <= end)
+        async with self.context.get_db().get_db() as session:
+            details = (await session.execute(stmt)).scalars().all()
+        out = [
+            row
+            for row in rows
+            if (str(row.get("provider_id") or ""), str(row.get("provider_model") or ""))
+            not in nonlinear
+        ]
+        for detail in details:
+            created = detail.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            row = {
+                "provider_id": str(detail.provider_id or ""),
+                "provider_model": str(detail.provider_model or ""),
+                "key": str(detail.provider_model or ""),
+                "count": 1,
+                "token_input_other": int(detail.token_input_other or 0),
+                "token_input_cached": int(detail.token_input_cached or 0),
+                "token_output": int(detail.token_output or 0),
+                "created_at": created,
+            }
+            if bucket is not None:
+                row["bucket"] = _bucket_key(created, bucket)
+            out.append(row)
+        if bucket is not None:
+            out.sort(key=lambda row: (row["bucket"], row["provider_model"]))
+        return out

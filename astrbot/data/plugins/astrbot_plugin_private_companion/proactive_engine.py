@@ -3667,6 +3667,17 @@ class ProactiveEngineMixin:
                 ),
             )
             review_at = _safe_float(selected.get("window_start_at"), check_now)
+        # 2026-11-02 修复：窗口还没到的念头，只允许预物化一次。
+        # 旧行为是「没有 ready 的念头时，每轮 tick 都把最早的未来念头物化一遍」，
+        # 于是同一个念头每 ~3 分钟被物化一次，3 次撞上 15 分钟窗口的熔断，
+        # 状态被打成 blocked —— 那条排到早间的消息就永远发不出去了（20:19–21:05 连炸 7 次）。
+        _window_start = _safe_float(selected.get("window_start_at"), 0)
+        if _window_start > check_now + 1 and _safe_int(selected.get("materialized_count"), 0, 0) >= 1:
+            user["next_proactive_at"] = _window_start
+            selected["last_status"] = "deferred"
+            selected["last_note"] = "窗口未到，等待窗口（不重复物化）"
+            selected["updated_ts"] = check_now
+            return False
         last_materialized_at = _safe_float(selected.get("last_materialized_at"), 0)
         materialized_count = _safe_int(selected.get("materialized_count"), 0, 0)
         if materialized_count >= 3 and check_now - last_materialized_at <= 15 * 60:
@@ -8713,6 +8724,10 @@ class ProactiveEngineMixin:
                     break
         if not weighted:
             return None
+        # 2026-11-04 修：原实现引用了本函数内未定义的 current_uid / exclusive_reasons，
+        # 只要 daily_story_plan 里有候选事件就抛 NameError，导致整个 private_companion 加载失败
+        # （main.py:8614 _initialize_before_publication → proactive.py:2267 → 这里）。
+        # 恢复 10-29 快照的语义：不做抢占标记。
         return self._weighted_choice(weighted)
 
     def _today_proactive_daypart_counts(self, user: dict[str, Any]) -> dict[str, int]:

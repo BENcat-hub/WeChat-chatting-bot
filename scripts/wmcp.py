@@ -21,7 +21,22 @@ import subprocess
 import sys
 import time
 
-EXE = r"C:\Users\<YOU>\.local\bin\windows-mcp.exe"
+def _find_exe():
+    """定位 windows-mcp.exe。
+
+    分享包把用户名抹成了占位符（原来是 `C:\\Users\\<YOU>\\.local\\bin\\windows-mcp.exe`），
+    恢复后必须自己找：env 覆盖 → 当前用户 ~/.local/bin → PATH。
+    """
+    env = os.environ.get("WINDOWS_MCP_EXE")
+    if env and os.path.exists(env):
+        return env
+    local = os.path.join(os.path.expanduser("~"), ".local", "bin", "windows-mcp.exe")
+    if os.path.exists(local):
+        return local
+    return shutil.which("windows-mcp.exe") or shutil.which("windows-mcp") or local
+
+
+EXE = _find_exe()
 PROTOCOL = "2025-06-18"
 # 2026-10-29：wxui.py 现在由 bridge 用 CREATE_NO_WINDOW 启动（没有控制台），它再拉起
 # windows-mcp.exe 时如果不带这个标志，Windows 会为这个 console 子系统进程新建控制台窗口

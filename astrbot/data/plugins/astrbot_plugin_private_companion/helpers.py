@@ -1014,6 +1014,8 @@ def _apply_wechat_chat_style(text: Any) -> str:
     # 逗号换成空格；数字千分位（如 3,000）不动
     normalized = re.sub(r"，", " ", normalized)
     normalized = re.sub(r"(?<![0-9]),(?![0-9])", " ", normalized)
+    # 分号与顿号同样换成空格：微信口语不这么断句，留着会拼出「；。」「力气；。」这类怪组合
+    normalized = normalized.replace("；", " ").replace(";", " ").replace("、", " ")
     # 收敛空白：不留连续空格，也不让空格贴到标点或行首行尾
     normalized = re.sub(r"[ \t]{2,}", " ", normalized)
     normalized = re.sub(r"[ \t]+([，,。！？!?~～…])", r"\1", normalized)

@@ -1,0 +1,16 @@
+name: astrbot_plugin_memewiki
+display_name: 梗百科
+version: 1.6.0
+author: local
+repo: https://cnmeme.wiki
+astrbot_version: ">=4.13,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
+  - telegram
+  - discord
+  - slack
+  - webchat
+desc: 查梗：先查本地全量字典（毫秒级），未命中回落 cnmeme.wiki 公开 API；/梗 指令可出图片卡片，支持每天自动同步。
+short_desc: 本地 6000+ 词条优先，未命中回落在线词库

@@ -1,0 +1,134 @@
+{
+  "reply_mode": {
+    "description": "/梗 指令的回复形式",
+    "type": "string",
+    "options": [
+      "image",
+      "text"
+    ],
+    "labels": [
+      "图片卡片（推荐）",
+      "纯文字"
+    ],
+    "hint": "图片卡片 = 渲染成一张带用法/出处的梗卡；纯文字 = 直接刷一段文字。默认图片卡片。",
+    "default": "image"
+  },
+  "auto_sync_enable": {
+    "description": "每天自动同步词库",
+    "type": "bool",
+    "hint": "开启后，每天指定时间运行 scripts/sync_memes.py 抓取新词条并重建词库。只补新增，通常几分钟；数据写到 data/plugin_data/astrbot_plugin_memewiki/。",
+    "default": false
+  },
+  "auto_sync_hour": {
+    "description": "同步时刻（0-23 点）",
+    "type": "int",
+    "hint": "默认 4，即每天凌晨 4 点开始。",
+    "default": 4
+  },
+  "sync_detail_limit": {
+    "description": "每次同步最多抓多少条详情",
+    "type": "int",
+    "hint": "默认 1000。同步是增量的：列表只翻到「整页没有新词条」为止，详情只抓新增和更新过的词条，已缓存的直接复用。这个上限只用来控制单次运行时长（约 1 秒/条），排队没抓完的第二天继续。填 0 = 不限制。",
+    "default": 1000
+  },
+  "inject_guidance": {
+    "description": "自动注入「用法说明」",
+    "type": "bool",
+    "hint": "开启后，每次请求会附带一小段规则（先查梗、先接梗别科普、查不到别编、别用客服腔），用户不需要改人设。默认开启。",
+    "default": true
+  },
+  "guidance_text": {
+    "description": "自定义用法说明",
+    "type": "text",
+    "hint": "留空使用内置文案；填了就用你的内容替换整段（会额外占用 prompt）。",
+    "default": ""
+  },
+  "search_mode": {
+    "description": "词库没收录时怎么联网",
+    "type": "string",
+    "options": [
+      "auto",
+      "plugin",
+      "model",
+      "off"
+    ],
+    "labels": [
+      "自动：插件先搜，搜不到再提示模型（推荐）",
+      "只插件代搜",
+      "只提示模型自己搜",
+      "完全关闭"
+    ],
+    "hint": "插件不存 API Key：代搜用的是你在 AstrBot「配置 → 网页搜索」里配好的服务商，没配就跳过。auto 最省心；聊天里用 /网搜 设置过的话，以 /网搜 为准。",
+    "default": "auto"
+  },
+  "search_max_chars": {
+    "description": "触发联网的最大字数",
+    "type": "int",
+    "hint": "不是明确在问梗时，只有不超过这个字数的短词才会联网；整句闲聊不搜。默认 10。",
+    "default": 10
+  },
+  "gate_mode": {
+    "description": "联网前的闸门",
+    "type": "string",
+    "options": [
+      "llm",
+      "rules",
+      "off"
+    ],
+    "labels": [
+      "规则 + 模型判定（推荐）",
+      "只用规则（零延迟、零成本）",
+      "关闭闸门（旧行为）"
+    ],
+    "hint": "线上 48 小时实测：真正联网的查询里约七成不该联网（整句闲聊、现实人物、游戏数值、让人做事）。推荐模式先用规则砍掉结构上不是词的消息，剩下的短词再让模型判一次；判定和联网是并发跑的，该查时延迟不变。「只用规则」只在本地过滤、零成本，但短口头禅会漏网（约留住三成噪声）。",
+    "default": "llm"
+  },
+  "gate_provider_id": {
+    "description": "闸门判定用哪个模型",
+    "type": "string",
+    "hint": "留空 = 用当前对话的模型；也可以填 provider id（例如 deepseek/deepseek-chat）换一个更便宜的模型来判定。",
+    "default": ""
+  },
+  "gate_timeout": {
+    "description": "闸门判定超时（秒）",
+    "type": "float",
+    "hint": "超过这个时间就按「查」放行，不拖慢回复。默认 1.2 秒；实测判定约 0.7 秒。",
+    "default": 1.2
+  },
+  "gate_cache_ttl": {
+    "description": "闸门判定结果缓存（秒）",
+    "type": "int",
+    "hint": "同一个词在群里的判定结果复用多久，默认 600 秒。",
+    "default": 600
+  },
+  "search_timeout": {
+    "description": "搜索超时（秒）",
+    "type": "float",
+    "hint": "超过这个时间就放弃搜索，直接按“没查到”处理，避免拖慢回复。默认 6 秒。",
+    "default": 6.0
+  },
+  "archive_enable": {
+    "description": "检索存档：联网结果留一份",
+    "type": "bool",
+    "hint": "词库没收录、联网搜到过的梗会按词存进 search_archive.db，下次再遇到同一个词直接复用，不联网、不过闸门。群里反复聊同一个梗时省得每次重搜。",
+    "default": true
+  },
+  "archive_ttl_days": {
+    "description": "存档复用有效期（天）",
+    "type": "int",
+    "hint": "存档多久内直接拿来用，默认 90 天。过期的不会被删，只在这次搜不到时兜底用。填 0 = 存档永不过期。",
+    "default": 90
+  },
+  "archive_miss_ttl_days": {
+    "description": "「搜过没结果」记住几天",
+    "type": "int",
+    "hint": "查过硬是没搜到结果的词，这么多天内不再重复联网（默认 3 天）。设 0 = 不记这种空结果，避免新梗被旧结论挡住。",
+    "default": 3
+  },
+  "inject_deadline": {
+    "description": "预查超过多久就丢弃",
+    "type": "float",
+    "hint": "预查（本地 + 联网）超过这么多秒才拿到结果，就不再注入上下文了——那时候回复已经发出去了，塞进去只占提示词。默认 6 秒；0 = 不限制。",
+    "default": 6.0
+  }
+}

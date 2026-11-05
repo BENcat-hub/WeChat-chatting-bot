@@ -1,0 +1,203 @@
+{
+  "enabled": {
+    "description": "启用 WebUI 美化",
+    "type": "bool",
+    "default": true,
+    "hint": "默认启用；首次使用建议搭配 AstrBot 深色模式。"
+  },
+  "dynamic_background_enabled": {
+    "description": "动态背景",
+    "type": "bool",
+    "default": true,
+    "hint": "允许视频、动图和 SVG 动画；关闭或系统减少动态效果时显示静态封面。视频静音循环，播放取决于浏览器支持的编码。"
+  },
+  "background_image": {
+    "description": "背景素材路径",
+    "type": "string",
+    "default": "",
+    "hint": "当前选中的背景素材文件名，通过插件设置页切换后自动填入。"
+  },
+  "background_images": {
+    "description": "背景图库",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "由插件设置页维护的背景素材文件名列表。"
+  },
+  "landscape_background_image": {
+    "description": "横屏背景素材路径",
+    "type": "string",
+    "default": "",
+    "hint": "横屏设备或横屏视口优先使用的背景素材文件名。"
+  },
+  "landscape_background_images": {
+    "description": "横屏背景图库",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "上传到横屏分区的背景素材文件名列表。"
+  },
+  "portrait_background_image": {
+    "description": "竖屏背景素材路径",
+    "type": "string",
+    "default": "",
+    "hint": "竖屏设备或竖屏视口优先使用的背景素材文件名。"
+  },
+  "portrait_background_images": {
+    "description": "竖屏背景图库",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "上传到竖屏分区的背景素材文件名列表。"
+  },
+  "background_fit": {
+    "description": "背景填充方式",
+    "type": "string",
+    "default": "cover",
+    "options": ["cover", "contain", "stretch", "auto"],
+    "hint": "控制背景素材如何填充 WebUI 可视区域。"
+  },
+  "background_position": {
+    "description": "背景位置",
+    "type": "string",
+    "default": "center center",
+    "hint": "例如 center center、top center、left top。"
+  },
+  "background_blur": {
+    "description": "背景模糊强度",
+    "type": "int",
+    "default": 0,
+    "hint": "单位为 px；0 表示不模糊背景。"
+  },
+  "background_dim": {
+    "description": "背景遮罩强度",
+    "type": "float",
+    "default": 0.5,
+    "hint": "取值 0 到 0.95，数值越高背景越暗。"
+  },
+  "surface_opacity": {
+    "description": "界面底色强度",
+    "type": "float",
+    "default": 0.0,
+    "hint": "取值 0 到 1；0 表示常驻面板透明，1 表示接近原主题底色。"
+  },
+  "stats_card_blur": {
+    "description": "界面毛玻璃强度",
+    "type": "int",
+    "default": 14,
+    "hint": "范围为 0 到 40 px，控制主要信息框、组件管理页面和侧栏当前选中项的毛玻璃强度；0 表示关闭新增的模糊与玻璃装饰，让信息框和组件管理表面恢复透明，同时保留侧栏原有选中底色。"
+  },
+  "mobile_sidebar_glass": {
+    "description": "移动端侧栏毛玻璃强度",
+    "type": "int",
+    "default": 18,
+    "minimum": 0,
+    "maximum": 40,
+    "slider": {
+      "min": 0,
+      "max": 40,
+      "step": 1
+    },
+    "hint": "范围为 0 到 40 px，仅作用于窄屏浮层侧栏；0 表示关闭移动端侧栏的底色、模糊和阴影，且独立于界面毛玻璃设置。"
+  },
+  "text_enhancement_mode": {
+    "description": "文字增强模式",
+    "type": "string",
+    "default": "soft_shadow",
+    "options": ["off", "soft_shadow", "stroke"],
+    "hint": "soft_shadow 为柔和阴影，stroke 为强力描边。"
+  },
+  "text_enhancement_strength": {
+    "description": "文字增强强度",
+    "type": "float",
+    "default": 1.0,
+    "hint": "取值 0 到 1；数值越高文字和图标的阴影或描边越明显。"
+  },
+  "background_grayscale": {
+    "description": "背景灰度",
+    "type": "float",
+    "default": 0.0,
+    "hint": "取值 0 到 1；只影响背景图层。"
+  },
+  "background_brightness": {
+    "description": "背景亮度",
+    "type": "float",
+    "default": 1.0,
+    "hint": "取值 0.5 到 1.5；1 表示保持原亮度。"
+  },
+  "background_contrast": {
+    "description": "背景对比度",
+    "type": "float",
+    "default": 1.0,
+    "hint": "取值 0.5 到 1.5；1 表示保持原对比度。"
+  },
+  "background_saturation": {
+    "description": "背景饱和度",
+    "type": "float",
+    "default": 1.0,
+    "hint": "取值 0 到 2；1 表示保持原饱和度。"
+  },
+  "random_background_on_load": {
+    "description": "打开或刷新时随机背景",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后每次打开或刷新 AstrBot WebUI 会从图库随机选一张背景，并写回当前背景。"
+  },
+  "background_rotation_enabled": {
+    "description": "定时轮换背景",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后按设定间隔从当前视口方向的图库随机切换背景（不连续重复当前图）；页面隐藏时暂停。"
+  },
+  "background_rotation_interval_minutes": {
+    "description": "定时轮换间隔（分钟）",
+    "type": "int",
+    "default": 30,
+    "minimum": 1,
+    "maximum": 1440,
+    "slider": {
+      "min": 1,
+      "max": 1440,
+      "step": 1
+    },
+    "hint": "取值 1 到 1440 分钟；同一浏览器的多个 WebUI 标签页只会有一个负责轮换。"
+  },
+  "auto_theme_enabled": {
+    "description": "自动同步壁纸主题色",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会读取当前壁纸主题色，并写入 AstrBot 的主色和辅色。"
+  },
+  "detailed_token_stats_enabled": {
+    "description": "系统统计模型 Token 明细",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会在 AstrBot 系统统计页追加每个模型的输入、输出、缓存命中与命中率。"
+  },
+  "theme_primary": {
+    "description": "自动生成的主色",
+    "type": "string",
+    "default": "",
+    "hint": "格式为 #RRGGBB；上传壁纸或手动重新读取后自动生成。"
+  },
+  "theme_secondary": {
+    "description": "自动生成的辅色",
+    "type": "string",
+    "default": "",
+    "hint": "格式为 #RRGGBB；上传壁纸或手动重新读取后自动生成。"
+  },
+  "advanced_css": {
+    "description": "高级自定义 CSS",
+    "type": "text",
+    "default": "",
+    "editor_mode": true,
+    "editor_language": "css",
+    "hint": "会追加到调色盘生成的主题 CSS 中；外链资源会被拦截。"
+  }
+}

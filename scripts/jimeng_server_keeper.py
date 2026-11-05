@@ -96,6 +96,7 @@ def restart() -> int | None:
         cwd=str(ROOT),
         stdout=log.open("ab"),
         stderr=err.open("ab"),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
     )
     emit(event="restart", pid=proc.pid, log=str(log.relative_to(ROOT)).replace("\\", "/"))
     time.sleep(8)

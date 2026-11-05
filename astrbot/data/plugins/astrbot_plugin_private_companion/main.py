@@ -10491,7 +10491,7 @@ class PrivateCompanionPlugin(
                 allowed_private_tts_tokens=set(protected_tts_tokens.keys()) if isinstance(protected_tts_tokens, dict) else None,
             )
             if not bool(runtime_persona_setting(self, 'enable_tts_enhancement', False)):
-                cleaned = re.sub(r"</?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE).strip()
+                cleaned = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE).strip()
             cleaned = sanitize_llm_segment_control_tokens(cleaned)
             if cleaned != original:
                 changed = True
@@ -10543,7 +10543,7 @@ class PrivateCompanionPlugin(
                 ),
             )
             if not bool(runtime_persona_setting(self, 'enable_tts_enhancement', False)):
-                cleaned = re.sub(r"</?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE).strip()
+                cleaned = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE).strip()
             cleaned = sanitize_llm_segment_control_tokens(cleaned)
             if cleaned:
                 cleaned_chain.append(Plain(cleaned) if cleaned != original else component)
@@ -11328,15 +11328,6 @@ class PrivateCompanionPlugin(
         chunks, changed, text = self._segment_llm_reply_chain(event, chain)
         if not chunks or not text:
             return
-        chunks, dropped_recitals = self._drop_schedule_recital_chunks(event, chunks)
-        if dropped_recitals:
-            changed = True
-            try:
-                filtered_texts = self._plain_text_segments_from_chunks(chunks)
-            except Exception:
-                filtered_texts = []
-            if filtered_texts and len(filtered_texts) == len(chunks):
-                text = "\n".join(str(item or "") for item in filtered_texts) or text
         chunks = self._limit_private_routine_check_segments(
             str(getattr(event, "message_str", "") or ""),
             chunks,
@@ -11443,88 +11434,6 @@ class PrivateCompanionPlugin(
         if not body or any(not isinstance(comp, Plain) for comp in body):
             return ""
         return "".join(str(getattr(comp, "text", "") or "") for comp in body).strip()
-
-    # 后置过滤：把「当前计划时段」当成刚发生的事复述出来的分段直接丢弃。
-    # 阈值与长度上限都是经验值：正常回复几乎不会命中日程里的二字词组合，
-    # 逐句复述行程的分段则会出现大面积重合。
-    _SCHEDULE_RECITAL_OVERLAP_THRESHOLD = 0.30
-    _SCHEDULE_RECITAL_MAX_CHARS = 60
-    _SCHEDULE_RECITAL_QUESTION_PATTERN = re.compile(
-        r"(干嘛|干什么|做什么|在忙|忙啥|忙什么|干吗|干啥|去哪|哪儿|哪里|怎么样|过得|"
-        r"干了啥|做了什么|什么安排|计划|日程|安排|行程)"
-    )
-
-    @staticmethod
-    def _cjk_bigram_set(text: str) -> set[str]:
-        cleaned = re.sub(r"[^\u4e00-\u9fff]", "", str(text or ""))
-        if len(cleaned) < 2:
-            return set()
-        return {cleaned[index : index + 2] for index in range(len(cleaned) - 1)}
-
-    def _drop_schedule_recital_chunks(
-        self,
-        event: AstrMessageEvent,
-        chunks: list[Any],
-    ) -> tuple[list[Any], int]:
-        """丢弃与「当前计划时段」文本高度重合的分段。
-
-        用户没有在问 Bot 近况时，日程只允许作为语气背景；某一段与计划文本的
-        汉字二元组重合度超过阈值，说明模型把行程写成了回复正文，直接丢弃。
-        用户主动问行程/近况时不过滤。
-        """
-        if not bool(getattr(self, "enable_schedule_recital_filter", True)):
-            # 2026-10-23 用户要求关闭：编号清单会被判成「复述日程」而丢掉大半段。
-            return chunks, 0
-        if len(chunks) < 2:
-            return chunks, 0
-        inbound = str(getattr(event, "message_str", "") or "")
-        if self._SCHEDULE_RECITAL_QUESTION_PATTERN.search(inbound):
-            return chunks, 0
-        try:
-            verified_schedule, planned_schedule = self._private_passive_schedule_material(None)
-        except Exception:
-            return chunks, 0
-        plan_text = planned_schedule or verified_schedule or ""
-        plan_bigrams = self._cjk_bigram_set(plan_text)
-        if not plan_bigrams:
-            return chunks, 0
-        plain_texts = self._plain_text_segments_from_chunks(chunks)
-        if len(plain_texts) != len(chunks):
-            plain_texts = [self._segmented_chunk_log_text(chunk) for chunk in chunks]
-        scored: list[tuple[int, Any, float, str]] = []
-        for index, chunk in enumerate(chunks):
-            seg_text = str(plain_texts[index] or "").strip()
-            seg_bigrams = self._cjk_bigram_set(seg_text)
-            if not seg_bigrams:
-                scored.append((index, chunk, 0.0, seg_text))
-                continue
-            ratio = len(plan_bigrams & seg_bigrams) / len(seg_bigrams)
-            scored.append((index, chunk, ratio, seg_text))
-        dropped = [
-            item
-            for item in scored
-            if item[2] >= self._SCHEDULE_RECITAL_OVERLAP_THRESHOLD
-            and len(item[3]) <= self._SCHEDULE_RECITAL_MAX_CHARS
-        ]
-        if not dropped:
-            return chunks, 0
-        dropped_indexes = {item[0] for item in dropped}
-        keep = [item[1] for item in scored if item[0] not in dropped_indexes]
-        if not keep:
-            # 整条回复都在复述日程时保留重合度最低的一段，避免完全不回应。
-            survivor = min(scored, key=lambda item: item[2])
-            keep = [survivor[1]]
-            dropped_indexes.discard(survivor[0])
-            dropped = [item for item in scored if item[0] in dropped_indexes]
-        for index, _chunk, ratio, seg_text in dropped:
-            logger.info(
-                "已丢弃与当前计划时段高度重合的分段: session=%s seg_index=%s overlap=%.2f text=%s",
-                _single_line(getattr(event, "unified_msg_origin", ""), 120) or "unknown",
-                index,
-                ratio,
-                _single_line(seg_text, 120),
-            )
-        return keep, len(dropped)
 
     def _segmented_result_from_chain(
         self,
@@ -11722,7 +11631,7 @@ class PrivateCompanionPlugin(
             if isinstance(protected_tts_tokens, dict) else None,
         )
         if not bool(runtime_persona_setting(self, 'enable_tts_enhancement', False)):
-            cleaned = re.sub(r"</?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE).strip()
+            cleaned = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE).strip()
         cleaned = sanitize_llm_segment_control_tokens(cleaned)
         return cleaned
 
@@ -12409,7 +12318,7 @@ class PrivateCompanionPlugin(
                                 pass
                         if (
                             bool(runtime_persona_setting(self, 'enable_tts_enhancement', False))
-                            and re.search(r"<tts\b[^>]*>.*?</tts>", normalized_segment, flags=re.IGNORECASE | re.DOTALL)
+                            and re.search(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", normalized_segment, flags=re.IGNORECASE | re.DOTALL)
                         ):
                             processor = getattr(self, "_process_tts_tags", None)
                             if callable(processor):
@@ -12622,7 +12531,7 @@ class PrivateCompanionPlugin(
                         pass
                 if (
                     bool(runtime_persona_setting(self, 'enable_tts_enhancement', False))
-                    and re.search(r"<tts\b[^>]*>.*?</tts>", normalized_segment, flags=re.IGNORECASE | re.DOTALL)
+                    and re.search(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", normalized_segment, flags=re.IGNORECASE | re.DOTALL)
                 ):
                         processor = getattr(self, "_process_tts_tags", None)
                         if callable(processor):

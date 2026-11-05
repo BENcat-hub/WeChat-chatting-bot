@@ -93,6 +93,11 @@ VOICE_BUBBLE_PYTHON = config.get("voice_bubble_python") or os.path.join(
     STACK_ROOT, "rvc-backend", ".venv", "Scripts", "python.exe")
 VOICE_BUBBLE_SCRIPT = os.path.join(STACK_ROOT, "scripts", "voice_send.py")
 VOICE_BUBBLE_TIMEOUT = float(config.get("voice_bubble_timeout", 200))
+# 气泡失败后要不要把 wav 当文件卡片发出去。默认 False：用户明确说过「语音又变成文件发了」
+# 是故障，不是降级 —— wav 卡片对方点开要在播放器里听，不如不发。失败会记到
+# logs/voice-bubble-failures.jsonl，由下一轮/人工补。
+VOICE_FALLBACK_TO_FILE = bool(config.get("voice_fallback_to_file", False))
+VOICE_FAILURE_LOG = os.path.join(STACK_ROOT, "logs", "voice-bubble-failures.jsonl")
 # 出站按联系人成组：同时有多个会话要回复时，先把一个人的消息发完，再换下一个人；
 # 同一联系人本次连发的第 2 条起走「只校验聊天头部」的快路径，省掉一次侧边栏全量 OCR。
 # 这个值是换人前的聚集窗口（秒）：上一段发完后最多等这么久，等到同一个人的后续分段

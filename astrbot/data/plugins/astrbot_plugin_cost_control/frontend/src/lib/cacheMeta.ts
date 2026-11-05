@@ -1,0 +1,187 @@
+import type { CacheEvent, CacheEventState, DiffLine } from "./types";
+
+// 折叠阈值：连续未变更的 context 行数大于此值时折叠为一段
+const CONTEXT_COLLAPSE_THRESHOLD = 3;
+
+export interface CollapsedSegment {
+  kind: "lines";
+  lines: DiffLine[];
+}
+
+export interface CollapsedPlaceholder {
+  kind: "placeholder";
+  count: number;
+  segments: CollapsedSegment[]; // 折叠时被隐藏的原始段，点击展开后渲染
+}
+
+export type CollapsedLine = DiffLine | CollapsedPlaceholder;
+
+// 缓存破坏事件类型元数据：标题 + 处置建议
+export const CACHE_EVENT_META: Record<string, { title: string; tip: string }> = {
+  context_reset: {
+    title: "上下文重置",
+    tip: "检查上下文是否被截断 / 会话被重置 / 历史被清空",
+  },
+  system_prompt_change: {
+    title: "system 变更",
+    tip: "稳定 system prompt，避免每轮改动前缀导致缓存失效",
+  },
+  tools_change: {
+    title: "工具定义变更",
+    tip: "保持 func_tool 集合稳定，避免增删工具破坏缓存键",
+  },
+  order_drift: {
+    title: "顺序漂移",
+    tip: "避免重排或改写历史消息，保持追加式增长",
+  },
+};
+
+export function cacheEvtMeta(t?: string): { title: string; tip: string } {
+  return CACHE_EVENT_META[t || ""] || { title: t || "?", tip: "" };
+}
+
+function nz(v: unknown): string {
+  return v != null ? String(v) : "-";
+}
+
+export function cacheDiffText(
+  type: string,
+  b?: CacheEventState,
+  a?: CacheEventState,
+): string {
+  if (type === "context_reset") return `历史 ${nz(b?.history_len)} → ${nz(a?.history_len)}`;
+  if (type === "system_prompt_change")
+    return `system ${b?.system_hash || "-"} → ${a?.system_hash || "-"}`;
+  if (type === "tools_change")
+    return `tools ${b?.tools_hash || "-"} → ${a?.tools_hash || "-"}`;
+  if (type === "order_drift") return `首个分歧 #${nz(a?.first_diverge_at)}`;
+  return "";
+}
+
+export interface DiffRow {
+  label: string;
+  before: string;
+  after: string;
+  changed: boolean;
+}
+
+export interface DiffPayload {
+  label: string;
+  segments: CollapsedSegment[];
+  // 初始折叠状态：true 表示所有长 context 段默认收起
+  initiallyCollapsed: boolean;
+}
+
+export interface CacheDetail {
+  rows: DiffRow[];
+  firstDiv?: number;
+  tip: string;
+  detail: string;
+  diff?: DiffPayload;
+  toolsCompare?: { before: string; after: string };
+}
+
+// 将连续的 context 行合并为一个段，便于折叠
+function collapseContext(
+  lines: DiffLine[],
+  threshold: number,
+): CollapsedSegment[] {
+  const segments: CollapsedSegment[] = [];
+  let buf: DiffLine[] = [];
+  const flush = () => {
+    if (buf.length === 0) return;
+    segments.push({ kind: "lines", lines: buf });
+    buf = [];
+  };
+  for (const l of lines) {
+    if (l.op === " ") {
+      buf.push(l);
+    } else {
+      flush();
+      segments.push({ kind: "lines", lines: [l] });
+    }
+  }
+  flush();
+  // 仅折叠长度超过阈值的纯 context 段；首尾 context 段保留原样以提供上下文
+  return segments.map((s) => {
+    if (s.lines.every((l) => l.op === " ") && s.lines.length > threshold) {
+      return s; // 由 buildCollapsedView 决定是否折叠
+    }
+    return s;
+  });
+}
+
+// 把 segments 中过长的 context 段折叠为 placeholder，返回 CollapsedLine[]
+export function buildCollapsedView(
+  segments: CollapsedSegment[],
+  collapsed: boolean,
+): CollapsedLine[] {
+  // 折叠态：每个过长的 context 段只保留首尾各 KEEP 行，中间收起为 placeholder
+  // （含首段 / 尾段——长前导上下文同样折叠，避免一展开就刷满屏）。
+  const KEEP = 3;
+  const out: CollapsedLine[] = [];
+  segments.forEach((s) => {
+    const isLongContext =
+      s.lines.every((l) => l.op === " ") && s.lines.length > CONTEXT_COLLAPSE_THRESHOLD;
+    if (collapsed && isLongContext && s.lines.length > KEEP * 2) {
+      const head = s.lines.slice(0, KEEP);
+      const tail = s.lines.slice(s.lines.length - KEEP);
+      const hidden = s.lines.length - KEEP * 2;
+      out.push(...head);
+      out.push({ kind: "placeholder", count: hidden, segments: [s] });
+      out.push(...tail);
+    } else {
+      out.push(...s.lines);
+    }
+  });
+  return out;
+}
+
+export function cacheDetailRows(ev: CacheEvent): CacheDetail {
+  const b = ev.before || {};
+  const a = ev.after || {};
+  const row = (label: string, bv: unknown, av: unknown): DiffRow => ({
+    label,
+    before: nz(bv),
+    after: nz(av),
+    changed: String(bv) !== String(av),
+  });
+  const rows: DiffRow[] = [
+    row("历史长度", b.history_len, a.history_len),
+    row("system hash", b.system_hash, a.system_hash),
+    row("tools hash", b.tools_hash, a.tools_hash),
+  ];
+  const firstDiv =
+    ev.type === "order_drift" && a.first_diverge_at != null
+      ? a.first_diverge_at
+      : undefined;
+  // 工具定义变更：使用 before/after tools_text 做结构化对比（不再走 gitdiff）
+  if (ev.type === "tools_change") {
+    const beforeText = b.tools_text || "";
+    const afterText = a.tools_text || "";
+    if (beforeText || afterText) {
+      return {
+        rows,
+        firstDiv,
+        tip: cacheEvtMeta(ev.type).tip,
+        detail: ev.detail || "",
+        toolsCompare: { before: beforeText, after: afterText },
+      };
+    }
+  }
+
+  // system prompt 变更：仍使用 git 风格 diff
+  const sysLines = (a.system_diff || []).filter((l) => l && l.op);
+  if (sysLines.length === 0) {
+    return { rows, firstDiv, tip: cacheEvtMeta(ev.type).tip, detail: ev.detail || "" };
+  }
+  const label = "system prompt 变更";
+  const segments = collapseContext(sysLines, CONTEXT_COLLAPSE_THRESHOLD);
+  return {
+    rows,
+    firstDiv,
+    tip: cacheEvtMeta(ev.type).tip,
+    detail: ev.detail || "",
+    diff: { label, segments, initiallyCollapsed: true },
+  };
+}

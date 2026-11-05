@@ -23,6 +23,7 @@ import random
 import subprocess
 import threading
 import time
+from text_sanitize import sanitize_outbound_text
 
 log = logging.getLogger("weflow-bridge")
 
@@ -30,6 +31,7 @@ log = logging.getLogger("weflow-bridge")
 class BaseSender:
     """消息发送器基类"""
     def send_text(self, contact: str, text: str) -> bool:
+        text = sanitize_outbound_text(text)
         raise NotImplementedError
 
     def send_image(self, contact: str, image_path: str) -> bool:
@@ -202,6 +204,7 @@ class UiaSender(BaseSender):
     # ================================================================
 
     def send_text(self, contact: str, text: str) -> bool:
+        text = sanitize_outbound_text(text)
         """
         发送文本消息。
 

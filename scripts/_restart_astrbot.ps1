@@ -1,23 +1,8 @@
-﻿# 重启 AstrBot（停掉旧进程树 -> 用 scripts\astrbot-start.ps1 重新拉起，脚本内已带 ASTRBOT_RELOAD=1）
+# 重启 AstrBot（停掉旧进程树 → 用 WMI 以独立进程树重新拉起 astrbot-start.ps1）。
+# 2026-11-01 修：本机 Get-NetTCPConnection 经常不可用（NetTCPIP 模块没加载），按端口找 pid 的
+# 老写法会静默失效；停进程改成 taskkill /T 按 astrbot.exe 进程树来。逻辑只保留在
+# _restart_astrbot_only.ps1 一处，这里只做委托（保留文件名，兼容旧文档里的调用）。
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
-Set-Location $root
-
-$pids = @()
-$pids += (Get-NetTCPConnection -LocalPort 11229 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess)
-$pids += (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -match 'astrbot-start\.ps1|astrbot\.exe run' } | Select-Object -ExpandProperty ProcessId)
-foreach ($p in ($pids | Sort-Object -Unique)) {
-    try { Stop-Process -Id $p -Force -ErrorAction Stop; "stopped pid $p" } catch { "skip pid $p" }
-}
-Start-Sleep -Seconds 4
-"11229 free: $(-not [bool](Get-NetTCPConnection -LocalPort 11229 -State Listen -ErrorAction SilentlyContinue))"
-
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$log = "$root\logs\astrbot-$stamp.log"
-$proc = Start-Process pwsh -ArgumentList '-NoProfile', '-File', "$root\scripts\astrbot-start.ps1", '-LogFile', $log -WindowStyle Hidden -PassThru
-"astrbot runner pid $($proc.Id)"
-"log $log"
-Start-Sleep -Seconds 22
-Get-NetTCPConnection -LocalPort 11229, 6185, 8766, 5031 -State Listen -ErrorAction SilentlyContinue |
-    Sort-Object LocalPort | Select-Object LocalPort, OwningProcess | Format-Table -AutoSize | Out-String
-$log
+$inner = Join-Path $PSScriptRoot '_restart_astrbot_only.ps1'
+if (-not (Test-Path $inner)) { throw "缺少 $inner" }
+& $inner

@@ -1,0 +1,698 @@
+"""AI 智能诊断 Mixin。
+
+一键 AI 诊断功能：收集成本控制各维度数据（成本/用量/缓存/归因/预算/定价），
+调用 AstrBot 默认 LLM Provider 进行综合分析，输出结构化的诊断结论与优化建议。
+
+方案选择：数据注入上文（非 Agent+Tools）
+- Pages 场景无真实 event，tool_loop_agent 不可用
+- 一次性 llm_generate 调用，快速可靠
+- LLM 扮演"成本分析师"角色，逐一分析各维度数据
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+import traceback
+from typing import Any
+
+
+class AiDiagMixin:
+    """AI 智能诊断功能。"""
+
+    # 由 ``Main`` 宿主提供（Mixin 不定义 ``__init__``）。
+    context: Any
+    cfg: Any
+    # 兄弟 Mixin 提供。
+    build_report: Any
+    get_budgets: Any
+    get_budgets_cost: Any
+    get_pricing: Any
+    query_supplements: Any
+    query_cache_events: Any
+    query_usage: Any
+    query_usage_grouped: Any
+    query_usage_cost_rows: Any
+    query_user_token_totals: Any
+    query_user_cost_total: Any
+    get_data_dir: Any
+
+    # ===== 缓存读写 =====
+
+    _DIAG_CACHE_FILE = "ai_diag_cache.json"
+    _DIAG_CACHE_TTL = 2 * 3600  # 2小时（秒）
+
+    def _diag_cache_path(self) -> str:
+        """返回诊断缓存文件路径。"""
+        import os
+
+        data_dir = getattr(self, "_data_dir", None) or str(self.get_data_dir())
+        return os.path.join(data_dir, self._DIAG_CACHE_FILE)
+
+    def _save_diag_cache(self, result: dict[str, Any]) -> None:
+        """将诊断结果保存到缓存文件（原子写）。"""
+        try:
+            import os
+
+            path = self._diag_cache_path()
+            data_dir = os.path.dirname(path)
+            os.makedirs(data_dir, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, default=str)
+            os.replace(tmp, path)
+        except Exception:
+            pass  # 缓存写入失败不影响主流程
+
+    def _load_diag_cache(self) -> dict[str, Any] | None:
+        """读取上次诊断缓存。不存在或损坏返回 None。"""
+        try:
+            import os
+
+            path = self._diag_cache_path()
+            if not os.path.exists(path):
+                return None
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def get_cached_diag(self) -> dict[str, Any]:
+        """返回上次诊断缓存 + 时效信息。
+
+        返回结构::
+
+            {
+                "result": {...},       # 上次诊断结果（含 conclusion）
+                "timestamp": 1234567890,
+                "age_seconds": 7200,
+                "stale": False,         # 是否超过2小时
+            }
+
+        无缓存时返回 ``{"result": None}``。
+        """
+        cached = self._load_diag_cache()
+        if not cached:
+            return {"result": None}
+        now = int(time.time())
+        try:
+            ts = int(cached.get("timestamp", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return {"result": None}
+        if ts <= 0 or ts > now:
+            return {"result": None}
+        if self._parse_conclusion(json.dumps(cached.get("conclusion"))) is None:
+            return {"result": None}
+        age = max(0, now - ts)
+        return {
+            "result": cached,
+            "timestamp": ts,
+            "age_seconds": age,
+            "stale": age > self._DIAG_CACHE_TTL,
+        }
+
+    # ===== Provider 获取 =====
+
+    def _get_default_provider_id(self) -> str | None:
+        """获取 AstrBot 默认聊天 Provider ID。"""
+        # ProviderType 从 entities 导入（manager 模块在非运行态导入会循环依赖）。
+        try:
+            from astrbot.core.provider.entities import ProviderType
+
+            prov = self.context.provider_manager.get_using_provider(
+                provider_type=ProviderType.CHAT_COMPLETION,
+                umo=None,
+            )
+            if prov:
+                return prov.meta().id
+        except Exception:
+            pass
+        # 回退：取第一个可用的 chat provider。meta.type 是 adapter 名
+        # （openai_chat_completion / openai_responses 等）而非能力类型，
+        # 须按 provider_type 枚举判断，不能与 "chat_completion" 字符串比较。
+        try:
+            from astrbot.core.provider.entities import ProviderType
+
+            for p in self.context.provider_manager.provider_insts:
+                meta = p.meta()
+                if meta.provider_type == ProviderType.CHAT_COMPLETION:
+                    return meta.id
+        except Exception:
+            pass
+        return None
+
+    def _get_provider_display_name(self, provider_id: str | None) -> str:
+        """获取 Provider 的显示名称（模型名 + ID）。"""
+        if not provider_id:
+            return "未配置"
+        try:
+            for p in self.context.provider_manager.provider_insts:
+                meta = p.meta()
+                if meta.id == provider_id:
+                    model = (
+                        getattr(meta, "model", None)
+                        or getattr(meta, "model_name", None)
+                        or provider_id
+                    )
+                    return f"{model} ({provider_id})"
+        except Exception:
+            pass
+        return provider_id or ""
+
+    # ===== 数据收集 =====
+
+    async def _collect_diag_data(self) -> dict[str, Any]:
+        """收集所有维度的诊断数据快照。"""
+        data: dict[str, Any] = {}
+
+        # 1. 成本与用量概览（周窗口）
+        try:
+            report = await self.build_report(window="weekly")
+            usage = report.get("usage", {}) or {}
+            data["overview"] = {
+                "window": "近7天",
+                "cost": round(float(report.get("cost", 0) or 0), 4),
+                "call_count": int(usage.get("count", 0) or 0),
+                "token_input_other": int(usage.get("token_input_other", 0) or 0),
+                "token_input_cached": int(usage.get("token_input_cached", 0) or 0),
+                "token_output": int(usage.get("token_output", 0) or 0),
+                "cache_hit_rate": round(float(report.get("cache_hit_rate", 0) or 0), 1),
+                "cache_samples": int(report.get("cache_samples", 0) or 0),
+                "avg_injection": int(report.get("avg_injection", 0) or 0),
+                "injection_samples": int(report.get("injection_samples", 0) or 0),
+                "cost_by_model": [
+                    {
+                        "model": m.get("model", ""),
+                        "cost": round(float(m.get("cost", 0) or 0), 4),
+                        "tokens": int(m.get("tokens", 0) or 0),
+                        "count": int(m.get("count", 0) or 0),
+                    }
+                    for m in (report.get("cost_by_model") or [])[:8]
+                ],
+                "top_sessions_by_cost": [
+                    {
+                        "umo": s.get("umo", "")[:20],
+                        "cost": round(float(s.get("cost", 0) or 0), 4),
+                        "tokens": int(s.get("tokens", 0) or 0),
+                    }
+                    for s in (report.get("top_sessions_by_cost") or [])[:5]
+                ],
+            }
+        except Exception as e:
+            data["overview"] = {"error": str(e)}
+
+        # 2. 缓存破坏事件
+        try:
+            events = await self.query_cache_events(limit=20)
+            data["cache_events"] = {
+                "total": len(events),
+                "items": [
+                    {
+                        "umo": getattr(e, "umo", "")[:20] if getattr(e, "umo", None) else "",
+                        "type": getattr(e, "type", "") or "",
+                        "severity": getattr(e, "severity", "") or "",
+                        "detail": (getattr(e, "detail", "") or "")[:120],
+                    }
+                    for e in events[:10]
+                ],
+            }
+        except Exception as e:
+            data["cache_events"] = {"error": str(e)}
+
+        # 3. 上下文注入归因（最近样本）
+        try:
+            from datetime import UTC, datetime
+
+            from .analytics import report_window_start
+            from .budget import resolve_tz
+            from .config import get_config
+
+            now = datetime.now(UTC)
+            tz = resolve_tz(self.context)
+            refresh = str(get_config(getattr(self, "cfg", None), "refresh_time", "00:00"))
+            start = report_window_start("weekly", now, tz, refresh)
+            sups = await self.query_supplements(start=start, limit=500)
+            # 提取归因数据（query_supplements 为最新优先，取前 20 条即最近 20 条）
+            attributions: list[dict[str, Any]] = []
+            for s in sups[:20]:
+                attr = getattr(s, "attribution", None)
+                if attr and isinstance(attr, dict):
+                    attributions.append(
+                        {
+                            "umo": str(getattr(s, "umo", "") or "")[:20],
+                            "injection_total": getattr(s, "injection_total", None),
+                            "system": attr.get("system"),
+                            "tools": attr.get("tools"),
+                            "history": attr.get("history"),
+                            "user": attr.get("user"),
+                            "extra": attr.get("extra"),
+                        }
+                    )
+            data["attribution"] = {
+                "samples": len(attributions),
+                "items": attributions[:10],
+            }
+        except Exception as e:
+            data["attribution"] = {"error": str(e)}
+
+        # 4. 预算状态
+        try:
+            from datetime import UTC, datetime
+
+            from .budget import (
+                _DIM_ORDER,
+                day_window_start,
+                month_window_start,
+                resolve_tz,
+                total_tokens,
+            )
+            from .config import (
+                get_budgets_cost_currency,
+                get_config,
+                get_currency_symbol,
+                get_rates,
+            )
+            from .cost import compute_cost_grouped_in_main
+            from .exchange_rates import convert
+
+            now = datetime.now(UTC)
+            tz = resolve_tz(self.context)
+            refresh = str(get_config(getattr(self, "cfg", None), "refresh_time", "00:00"))
+            d_start = day_window_start(refresh, now, tz)
+            m_start = month_window_start(now, tz)
+            day_total = total_tokens(await self.query_usage(start=d_start))
+            month_total = total_tokens(await self.query_usage(start=m_start))
+
+            limits = self.get_budgets()
+            limits_cost = self.get_budgets_cost()
+
+            # 主货币口径的全局花费（诊断报告没有具体请求上下文，per_* 维度
+            # 的 token 用量取当日最大会话/用户/模型，代表最接近限额的主体）。
+            main_cur = get_currency_symbol(getattr(self, "cfg", None))
+            rates = get_rates(getattr(self, "cfg", None))
+            pricing = self.get_pricing()
+            limit_currencies = get_budgets_cost_currency(getattr(self, "cfg", None))
+
+            async def _cost_total(start, **filters) -> float | None:
+                try:
+                    return compute_cost_grouped_in_main(
+                        await self.query_usage_cost_rows(pricing, start=start, **filters),
+                        pricing,
+                        main_cur,
+                        rates,
+                    )
+                except Exception:
+                    return None  # 无法计算时保留未知，不能向诊断模型提供假零成本。
+
+            day_cost = await _cost_total(d_start)
+            month_cost = await _cost_total(m_start)
+            sessions = await self.query_usage_grouped(by="umo", start=d_start)
+            models = await self.query_usage_grouped(by="model", start=d_start)
+            top_session = max((total_tokens(g) for g in sessions), default=0)
+            top_model = max((total_tokens(g) for g in models), default=0)
+            user_totals = []
+            users_available = True
+            try:
+                user_totals = await self.query_user_token_totals(d_start, limit=500)
+            except Exception:
+                users_available = False
+            top_user = max((int(tokens) for _, tokens in user_totals), default=0)
+
+            async def _maximum_cost(subjects, query) -> float | None:
+                import asyncio
+
+                sem = asyncio.Semaphore(8)
+
+                async def one(subject):
+                    async with sem:
+                        try:
+                            return await query(subject)
+                        except Exception:
+                            return None
+
+                amounts = await asyncio.gather(*(one(subject) for subject in subjects))
+                if any(amount is None for amount in amounts):
+                    return None
+                return max(amounts, default=0.0)
+
+            dim_cost = {"global_daily": day_cost, "global_monthly": month_cost}
+            if float(limits_cost.get("per_session_daily", 0) or 0) > 0:
+                dim_cost["per_session_daily"] = await _maximum_cost(
+                    {str(g["key"]) for g in sessions if g.get("key")},
+                    lambda key: _cost_total(d_start, umo=key),
+                )
+            if float(limits_cost.get("per_model_daily", 0) or 0) > 0:
+                dim_cost["per_model_daily"] = await _maximum_cost(
+                    {str(g["key"]) for g in models if g.get("key")},
+                    lambda key: _cost_total(d_start, model=key),
+                )
+            if float(limits_cost.get("per_user_daily", 0) or 0) > 0:
+                dim_cost["per_user_daily"] = (
+                    await _maximum_cost(
+                        {str(uid) for uid, _ in user_totals},
+                        lambda uid: self.query_user_cost_total(
+                            uid, d_start, pricing, main_cur, rates
+                        ),
+                    )
+                    if users_available
+                    else None
+                )
+
+            dims: list[dict[str, Any]] = []
+            dim_labels = {
+                "global_daily": "每日全局",
+                "global_monthly": "每月全局",
+                "per_session_daily": "每会话·每日",
+                "per_user_daily": "每用户·每日",
+                "per_model_daily": "每模型·每日",
+            }
+            dim_used = {
+                "global_daily": day_total,
+                "global_monthly": month_total,
+                "per_session_daily": top_session,
+                "per_user_daily": top_user,
+                "per_model_daily": top_model,
+            }
+            for d in _DIM_ORDER:
+                lt = int(limits.get(d, 0) or 0)
+                lc = convert(
+                    float(limits_cost.get(d, 0) or 0),
+                    limit_currencies.get(d) or main_cur,
+                    main_cur,
+                    rates,
+                )
+                used = dim_used.get(d, 0)
+                raw_cost = dim_cost.get(d)
+                cost_used = round(raw_cost, 6) if raw_cost is not None else None
+                if lt > 0 or lc > 0:
+                    ratio = round(used * 100.0 / lt, 1) if lt > 0 else 0
+                    cost_ratio = (
+                        round(cost_used * 100.0 / lc, 1)
+                        if lc > 0 and cost_used is not None
+                        else None
+                    )
+                    exceeded_t = used >= lt if lt > 0 else False
+                    exceeded_c = cost_used >= lc if lc > 0 and cost_used is not None else False
+                    entry: dict[str, Any] = {
+                        "dimension": dim_labels.get(d, d),
+                        "token_limit": lt,
+                        "token_used": used,
+                        "token_ratio": ratio,
+                        "exceeded": exceeded_t or exceeded_c,
+                    }
+                    if lc > 0:
+                        entry["cost_limit"] = lc
+                        entry["cost_used"] = cost_used
+                        entry["cost_ratio"] = cost_ratio
+                        entry["currency"] = main_cur
+                        if cost_used is None:
+                            entry["cost_error"] = "成本计算失败，花费超限状态未知"
+                            if not exceeded_t:
+                                entry["exceeded"] = None
+                    if d.startswith("per_"):
+                        entry["note"] = "token 与花费分别取当日最大主体，可能来自不同主体"
+                    if d == "per_user_daily":
+                        entry["note"] += "；用户范围为当日 token 最多的至多 500 名用户"
+                    dims.append(entry)
+            data["budgets"] = {"dimensions": dims, "currency": main_cur}
+        except Exception as e:
+            data["budgets"] = {"error": str(e)}
+
+        # 5. 定价覆盖
+        try:
+            from .cost import resolve_pricing
+
+            pricing = self.get_pricing()
+            rows = await self.query_usage_grouped(by="provider_model")
+            unpriced: list[dict[str, Any]] = []
+            for r in rows:
+                provider_id = r.get("provider_id") or ""
+                model = r.get("provider_model") or ""
+                if model and resolve_pricing(provider_id or None, model, pricing) is None:
+                    unpriced.append(
+                        {
+                            "model": model,
+                            "provider_id": provider_id,
+                            "tokens": (
+                                int(r.get("token_input_other", 0) or 0)
+                                + int(r.get("token_input_cached", 0) or 0)
+                                + int(r.get("token_output", 0) or 0)
+                            ),
+                            "count": int(r.get("count", 0) or 0),
+                        }
+                    )
+            data["pricing"] = {
+                "total_models": len(rows),
+                "unpriced_count": len(unpriced),
+                "unpriced": unpriced[:5],
+            }
+        except Exception as e:
+            data["pricing"] = {"error": str(e)}
+
+        return data
+
+    # ===== Prompt 构建 =====
+
+    def _build_diag_prompt(self, data: dict[str, Any]) -> tuple[str, str]:
+        """构造 system prompt 和 user prompt。
+
+        返回 (system_prompt, user_prompt)。
+        """
+        system_prompt = (
+            "你是一位专业的 LLM 成本分析师，负责对 AstrBot 成本控制插件的运行数据进行全面诊断。\n"
+            "你将收到5个维度的成本数据，请逐一分析并给出专业结论。\n\n"
+            "输出要求（严格 JSON 格式，不要包裹在 markdown 代码块中）：\n"
+            "{\n"
+            '  "overall": "整体评价（1-2句话概括成本健康状况）",\n'
+            '  "overall_score": 85,\n'
+            '  "highlights": ["做得好的方面1", "做得好的方面2"],\n'
+            '  "risks": [\n'
+            '    {"module": "模块名", "level": "high/medium/low/info", '
+            '"issue": "问题描述", "advice": "改进建议"}\n'
+            "  ],\n"
+            '  "summary": "总结性建议（1-2句话）"\n'
+            "}\n\n"
+            "评分标准（基于成本效率）：\n"
+            "90+优秀（成本控制极佳），75-89良好，60-74需关注，<60需修复。\n"
+            "等级说明：high=高危（成本浪费严重，需立即处理）、medium=中危（建议处理）、"
+            "low=低危（可优化）、info=提示（仅提示，无需处理）。\n"
+            "重点关注：缓存命中率低导致成本浪费、未定价模型导致成本统计缺失、"
+            "预算接近超限、上下文注入过多导致 token 浪费。\n"
+            "请基于实际数据分析，不要凭空臆测。如果数据不足，如实说明。"
+        )
+
+        sections: list[str] = []
+
+        # 1. 成本与用量概览
+        ov = data.get("overview", {})
+        if "error" not in ov:
+            hit_rate = ov.get("cache_hit_rate", 0)
+            cache_samples = ov.get("cache_samples", 0)
+            avg_inj = ov.get("avg_injection", 0)
+            inj_samples = ov.get("injection_samples", 0)
+            cost_models = json.dumps(ov.get("cost_by_model", []), ensure_ascii=False)[:600]
+            top_sessions = json.dumps(ov.get("top_sessions_by_cost", []), ensure_ascii=False)[:400]
+            sections.append(
+                f"## 成本与用量（{ov.get('window', '近7天')}）\n"
+                f"总成本：{ov.get('cost', 0)}，"
+                f"调用次数：{ov.get('call_count', 0)}\n"
+                f"Token 分布：输入(非缓存) {ov.get('token_input_other', 0)} / "
+                f"缓存命中 {ov.get('token_input_cached', 0)} / "
+                f"输出 {ov.get('token_output', 0)}\n"
+                f"平均缓存命中率：{hit_rate}%（{cache_samples} 样本）\n"
+                f"平均上下文注入：{avg_inj} token"
+                f"（{inj_samples} 样本）\n"
+                f"按模型成本：{cost_models}\n"
+                f"高成本会话：{top_sessions}"
+            )
+        else:
+            sections.append(f"## 成本与用量\n状态：数据获取失败（{ov.get('error')}）")
+
+        # 2. 缓存破坏事件
+        ce = data.get("cache_events", {})
+        if "error" not in ce:
+            sections.append(
+                f"## 缓存破坏诊断\n"
+                f"最近缓存事件数：{ce.get('total', 0)}\n"
+                f"事件样例：{json.dumps(ce.get('items', []), ensure_ascii=False)[:500]}"
+            )
+        else:
+            sections.append(f"## 缓存破坏诊断\n状态：数据获取失败（{ce.get('error')}）")
+
+        # 3. 上下文注入归因
+        at = data.get("attribution", {})
+        if "error" not in at:
+            sections.append(
+                f"## 上下文注入归因\n"
+                f"归因样本数：{at.get('samples', 0)}\n"
+                f"归因详情（system/tools/history/user/extra 各维度 token）：\n"
+                f"{json.dumps(at.get('items', []), ensure_ascii=False)[:600]}"
+            )
+        else:
+            sections.append(f"## 上下文注入归因\n状态：数据获取失败（{at.get('error')}）")
+
+        # 4. 预算状态
+        bd = data.get("budgets", {})
+        if "error" not in bd:
+            bd_dims = json.dumps(bd.get("dimensions", []), ensure_ascii=False)
+            sections.append(f"## 预算状态\n已配置的预算维度：{bd_dims}")
+        else:
+            sections.append(f"## 预算状态\n状态：数据获取失败（{bd.get('error')}）")
+
+        # 5. 定价覆盖
+        pr = data.get("pricing", {})
+        if "error" not in pr:
+            sections.append(
+                f"## 定价覆盖\n"
+                f"总模型数：{pr.get('total_models', 0)}，"
+                f"未定价模型数：{pr.get('unpriced_count', 0)}\n"
+                f"未定价模型：{json.dumps(pr.get('unpriced', []), ensure_ascii=False)[:400]}"
+            )
+        else:
+            sections.append(f"## 定价覆盖\n状态：数据获取失败（{pr.get('error')}）")
+
+        user_prompt = (
+            "请对以下 AstrBot 成本控制数据进行全面诊断分析，输出 JSON 结论：\n\n"
+            + "\n\n".join(sections)
+        )
+        return system_prompt, user_prompt
+
+    # ===== 结论解析 =====
+
+    @staticmethod
+    def _parse_conclusion(text: str) -> dict | None:
+        """从 LLM 返回文本中解析 JSON 结论。
+
+        兼容三种情况：纯 JSON、```json ...``` 代码块、混杂文本中提取。
+        """
+        text = text.strip()
+
+        def parse_object(value: str) -> dict | None:
+            decoded = json.loads(value)
+            if not isinstance(decoded, dict):
+                return None
+            for field in ("overall", "summary"):
+                if field in decoded and not isinstance(decoded[field], str):
+                    return None
+            if "highlights" in decoded:
+                highlights = decoded["highlights"]
+                if not isinstance(highlights, list) or not all(
+                    isinstance(item, str) for item in highlights
+                ):
+                    return None
+            if "risks" in decoded:
+                risks = decoded["risks"]
+                if not isinstance(risks, list) or not all(
+                    isinstance(item, dict)
+                    and all(
+                        isinstance(item.get(key, ""), str)
+                        for key in ("module", "level", "issue", "advice")
+                    )
+                    for item in risks
+                ):
+                    return None
+            if "overall_score" in decoded:
+                score = decoded["overall_score"]
+                if (
+                    isinstance(score, bool)
+                    or not isinstance(score, (int, float))
+                    or not 0 <= score <= 100
+                ):
+                    return None
+            return decoded
+
+        # 直接解析整段 JSON
+        try:
+            return parse_object(text)
+        except Exception:
+            pass
+        # 降级 1：提取 ```json ...``` 代码块
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if m:
+            try:
+                return parse_object(m.group(1).strip())
+            except Exception:
+                pass
+        # 降级 2：提取首个 {...} 花括号块
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            try:
+                return parse_object(m.group(0))
+            except Exception:
+                pass
+        return None
+
+    # ===== 主流程 =====
+
+    async def run_ai_diag(self) -> dict[str, Any]:
+        """执行 AI 智能诊断。
+
+        流程：
+        1. 获取默认 Provider
+        2. 收集所有维度数据
+        3. 构造 prompt，调用 LLM
+        4. 解析结论，返回结构化结果
+        """
+        from astrbot import logger
+
+        result: dict[str, Any] = {
+            "timestamp": int(time.time()),
+            "provider_id": None,
+            "provider_name": None,
+            "conclusion": None,
+            "raw_text": None,
+            "error": None,
+        }
+
+        # 1. 获取 Provider（优先配置，回退默认）
+        from .config import get_config
+
+        cfg = getattr(self, "cfg", None) or {}
+        configured_id = get_config(cfg, "ai_diag_provider_id", "") or ""
+        provider_id = configured_id or self._get_default_provider_id()
+        result["provider_id"] = provider_id
+        result["provider_name"] = self._get_provider_display_name(provider_id)
+        if not provider_id:
+            result["error"] = "未找到可用的聊天模型 Provider，请在 AstrBot 配置中添加 LLM 提供商。"
+            return result
+
+        # 2. 收集维度数据
+        logger.info("[cost_control] AI诊断：开始收集数据...")
+        try:
+            data = await self._collect_diag_data()
+        except Exception as e:
+            result["error"] = f"数据收集失败: {type(e).__name__}: {e}"
+            return result
+
+        # 3. 构造 prompt 并调用 LLM
+        system_prompt, user_prompt = self._build_diag_prompt(data)
+        logger.info("[cost_control] AI诊断：调用 LLM (%s)...", provider_id)
+        try:
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+            )
+            raw_text = llm_resp.completion_text or ""
+            result["raw_text"] = raw_text
+
+            # 4. 解析 JSON 结论
+            conclusion = self._parse_conclusion(raw_text)
+            result["conclusion"] = conclusion
+            if conclusion:
+                logger.info(
+                    "[cost_control] AI诊断完成：总分 %s",
+                    conclusion.get("overall_score", "?"),
+                )
+                # 5. 成功则缓存到文件
+                self._save_diag_cache(result)
+            else:
+                result["error"] = "LLM 返回内容不是有效的诊断 JSON 对象"
+                logger.warning("[cost_control] AI诊断：LLM 返回内容无法解析为 JSON")
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}"
+            result["error"] = err_msg
+            logger.error("[cost_control] AI诊断失败：%s\n%s", err_msg, traceback.format_exc())
+        return result

@@ -5351,7 +5351,7 @@ class PrivateImageMixin:
         if not cleaned:
             return ""
         stale_patterns = (
-            r"\s*<tts\b[^>]*>[^<]*(?:午後|付き合う)[^<]*</tts>\s*[^。！？!?]*?(?:下午|五点|放学|陪你)[^。！？!?\n]*[。！？!?]?",
+            r"\s*<(?:pc_)?tts\b[^>]*>[^<]*(?:午後|付き合う)[^<]*</tts>\s*[^。！？!?]*?(?:下午|五点|放学|陪你)[^。！？!?\n]*[。！？!?]?",
             r"\s*(?:另外|还有|それと|顺便)[，,、\s]*[^。！？!?\n]*(?:下午|五点|放学|到时候|陪你)[^。！？!?\n]*[。！？!?]?",
             r"\s*[^。！？!?\n]*(?:下午我会|下午陪你|五点放学|放学就行|到时候叫我|到时候喊我)[^。！？!?\n]*[。！？!?]?",
         )
@@ -5498,11 +5498,11 @@ class PrivateImageMixin:
                 normalized = str(normalizer(normalized) or normalized).strip()
             except Exception:
                 pass
-        has_tts_block = bool(re.search(r"<tts\b[^>]*>.*?</tts>", normalized, flags=re.IGNORECASE | re.DOTALL))
+        has_tts_block = bool(re.search(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", normalized, flags=re.IGNORECASE | re.DOTALL))
         if has_tts_block and bool(self._private_image_setting("enable_tts_enhancement", False)):
             processor = getattr(self, "_process_tts_tags", None)
             if callable(processor):
-                fallback_plain = re.sub(r"</?t{2,}s\b[^>]*>", "", normalized, flags=re.IGNORECASE).strip()
+                fallback_plain = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", normalized, flags=re.IGNORECASE).strip()
                 try:
                     chain = await processor(normalized, event, fallback_plain=fallback_plain)
                 except Exception as exc:
@@ -5513,7 +5513,7 @@ class PrivateImageMixin:
                     return cleaned_chain
                 if fallback_plain:
                     return [Plain(fallback_plain)]
-        visible_text = re.sub(r"</?t{2,}s\b[^>]*>", "", normalized, flags=re.IGNORECASE).strip() if has_tts_block else normalized
+        visible_text = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", normalized, flags=re.IGNORECASE).strip() if has_tts_block else normalized
         return [Plain(visible_text)] if visible_text else []
 
     @staticmethod

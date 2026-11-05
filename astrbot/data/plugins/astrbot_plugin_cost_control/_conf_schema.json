@@ -1,0 +1,8 @@
+{
+  "enabled": {
+    "description": "启用本插件",
+    "hint": "总开关。其他所有详细参数均在插件仪表盘的「设置」页中调整，保存后热生效，无需重载",
+    "type": "bool",
+    "default": true
+  }
+}

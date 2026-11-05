@@ -1,30 +1,47 @@
 @echo off
 rem ============================================================
-rem  WeFlow 5.0.0 (patched) launcher  --  bypasses the WCDB expiry
-rem  gate that makes 6.3.2 return -101.
-rem  - wcdb_api.dll patched: InitProtection deadline -> 2037-09-30;
-rem    wcdb_init tm deadline -> year 2037 (was 2026).
-rem  - ELECTRON_RUN_AS_NODE must be cleared or electron runs as node.
-rem  - cwd MUST be the tree root: unpackaged imageDownloadService
-rem    resolves img_helper.dll via process.cwd()\resources\image\...
-rem    With a wrong cwd the hook silently fails, WeChat never caches
-rem    incoming photos, the API has no mediaUrl and the bot is blind.
-rem  - ffmpeg-static shipped WITHOUT ffmpeg.exe (the npm postinstall
-rem    download never ran). Without it WeFlow cannot decode the
-rem    HEVC/wxgf photos people send, so every incoming image fails to
-rem    export. We restore it from the installed WeFlow 6.3.2 tree.
+rem  Start WeFlow 5.0.0 from its source tree (port 5031).
+rem
+rem  Why this way:
+rem   * The 5.0 tree lives at wechat-ai-stack\weflow (recovered from the
+rem     2026-10-29 share package). node_modules is installed locally.
+rem   * Do NOT start "C:\Program Files\WeFlow\WeFlow.exe" (6.3.2): it
+rem     shares %APPDATA%\weflow with 5.0 and its components are expired.
+rem   * --no-sandbox is required on this machine, otherwise the Electron
+rem     sandbox helpers fail and the app exits with code 3.
+rem   * ELECTRON_RUN_AS_NODE must be UNSET, otherwise electron runs as
+rem     plain node and crashes on the v8 snapshot assert.
+rem
+rem  ASCII ONLY: cmd.exe breaks on BOM and on GBK Chinese.
 rem ============================================================
-set "ELECTRON_RUN_AS_NODE="
-set "WEFLOW50_ROOT=<WEFLOW_ROOT>"
-set "FFMPEG_DST=%WEFLOW50_ROOT%\node_modules\ffmpeg-static\ffmpeg.exe"
-set "FFMPEG_SRC=C:\Program Files\WeFlow\resources\app.asar.unpacked\node_modules\ffmpeg-static\ffmpeg.exe"
-if not exist "%FFMPEG_DST%" (
-  if exist "%FFMPEG_SRC%" (
-    echo [weflow50] restoring ffmpeg.exe ^(HEVC/wxgf image decode^)...
-    copy /y "%FFMPEG_SRC%" "%FFMPEG_DST%" >nul
-  ) else (
-    echo [weflow50] WARNING: ffmpeg.exe missing and no source found - incoming images will fail.
-  )
+setlocal
+rem Idempotency guard: exit quietly when the app is already listening on 5031,
+rem so logon autostart (wscript -> this script) never spawns a second instance.
+netstat -ano -p TCP | findstr /r /c:"LISTENING" | findstr /c:":5031 " >nul 2>&1
+if not errorlevel 1 (
+  echo [weflow50] already listening on 5031, nothing to do
+  exit /b 0
 )
-cd /d "%WEFLOW50_ROOT%"
-start "" "%WEFLOW50_ROOT%\node_modules\electron\dist\electron.exe" "%WEFLOW50_ROOT%"
+set "ROOT=C:\Users\Administrator.DESKTOP-LD9CS9H\Documents\deepseek-harness\default-workspace\wechat-ai-stack\weflow"
+set "ELECTRON=%ROOT%\node_modules\electron\dist\electron.exe"
+set "FFMPEG=%ROOT%\node_modules\ffmpeg-static\ffmpeg.exe"
+
+if not exist "%ELECTRON%" (
+  echo [weflow50] electron missing: %ELECTRON%
+  echo [weflow50] run: cd /d "%ROOT%" ^&^& npm ci --ignore-scripts
+  exit /b 1
+)
+if not exist "%FFMPEG%" (
+  echo [weflow50] ffmpeg-static binary missing, copying from the installed 6.3.2
+  copy /y "C:\Program Files\WeFlow\resources\app.asar.unpacked\node_modules\ffmpeg-static\ffmpeg.exe" "%FFMPEG%" >nul
+)
+
+rem Electron refuses to run as node when this is set (even to empty string).
+set ELECTRON_RUN_AS_NODE=
+set "TEMP=%ROOT%\..\.tmp-install"
+set "TMP=%TEMP%"
+
+cd /d "%ROOT%"
+start "" "%ELECTRON%" . --no-sandbox
+echo [weflow50] launched, HTTP API will listen on 127.0.0.1:5031
+exit /b 0

@@ -286,11 +286,9 @@ def initialize_plugin_config(self: Any, config: Any) -> None:
         "enable_p4_b_legacy_score_isolation",
         False,
     )
-    self.enable_schedule_recital_filter = self._cfg_bool(
-        c,
-        "enable_schedule_recital_filter",
-        True,
-    )
+    # 2026-10-30 用户要求：文字回复不再做「日程重合度」过滤（会把正常分句当成
+    # 复述行程整段丢弃）。enable_schedule_recital_filter 这个开关已连同实现一起删掉，
+    # 旧配置里留着也无害（_cfg_bool 只读已知键）。
 
 def _initialize_core_and_relationship_config(self: Any, c: Any) -> None:
     self.data_dir = StarTools.get_data_dir(PLUGIN_NAME)

@@ -4,6 +4,33 @@
 > 并据此给出一份按优先级排好的整理清单。
 > 关联文档：[HANDOVER-2026-10-28.md](HANDOVER-2026-10-28.md)（系统现状/坑/未完成项）。
 
+> **2026-10-31 更新（双语料 + 重建口径，必看）**
+>
+> 1. **本机有两套语料，不能同时挂 9200**：
+>
+> | 语料 | data-dir | 前缀 | 现状 |
+> | --- | --- | --- | --- |
+> | wechat-ai-stack | `C:\Users\Administrator.DESKTOP-LD9CS9H\.xerj-code\data` | `ax-*`（17 个） | **占着 9200**（pid 60508） |
+> | bili-fav-sort | `default-workspace\data` | `bili-fav-sort-*`（11 个） | 让出 9200，要用时再切 |
+>
+>    拉起/切换用新脚本 `scripts/_restart_xerj_ax_node.ps1`
+>    （`-DataDir <语料目录> -Port 9200 -Exe <xerj 路径>`；停占端口进程 → 删 `node.lock` →
+>    `Invoke-CimMethod Win32_Process Create` 拉起 → 自检 `GET /` 与 `/_cat/indices` 数 `ax-*`/`bili-*`）。
+>    **该 .ps1 必须带 UTF-8 BOM**，否则 PS 5.1 按 ANSI 读中文注释直接 ParserError。
+> 2. **重建命令不变**，但口径变了：`xerj autoindex wechat-ai-stack --code-analyzer code --brain wechat-ai-stack
+>    --yes --url http://127.0.0.1:9200`。本轮 walk 到 **2,752 个文件 / 110 MB**（ignore 规则跳过 359 文件、
+>    剪掉 103 个目录），估算索引 236.4 MB。
+> 3. **坑（每次删文件后重建都会撞）**：resume plan 是冻结的，计划里某个文件在磁盘被删就直接
+>    `exit=1 aborted`（`removing files from an indexed folder is not reconciled yet`），`--fresh` 同样被拒。
+>    三条出路：恢复被删文件重跑 / 清残留文档 + 删状态目录（`~/.xerj/autoindex/<hash>`，本轮是
+>    `bc8437d0a127f713`）后重跑 / 删该 plan 的索引原地重建或换新 `--state-dir`+`--prefix`+`--brain` 隔离重建。
+> 4. 本轮重建（10-31 01:42→01:52，wall 567.6 s）后 `ax-docs` 由 **58,889 → 77,493**，
+>    `ax-*` 合计 **79,297** 条（17 个索引，9 个非空）；本次 run 自身记账
+>    `files=2583 records=77493 datasets=9 junk=30 code_files=2064/2063`。
+>    冒烟：`xerj search --prefix ax "_raise_above_cover"` → `scripts/wxui.py:1461 [function]` (score 247)。
+>    下面 §2 的规模表是 10-27 那次的口径，留作对比。
+
+
 ---
 
 ## 1. 语料怎么用（3 分钟上手）

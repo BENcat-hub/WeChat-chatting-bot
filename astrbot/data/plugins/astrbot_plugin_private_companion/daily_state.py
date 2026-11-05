@@ -1832,8 +1832,9 @@ class DailyStateMixin(DailyStateTickMixin):
         self, story_plan: dict[str, Any], detail: dict[str, Any]
     ) -> None:
         for key, limit in (
-            ("today_events", 16),
-            ("proactive_events", 12),
+            ("today_events", 24),
+            # 2026-11-03：日常事件改为一人独占一条，池子上限同步放大（12 → 24）。
+            ("proactive_events", 24),
             ("long_term_events", 6),
         ):
             existing = story_plan.setdefault(key, [])
@@ -2345,7 +2346,9 @@ class DailyStateMixin(DailyStateTickMixin):
             if by_bucket[bucket]:
                 add(by_bucket[bucket][0])
         for bucket in buckets:
-            cap = 1 if bucket == "late_night" else 2
+            # 2026-11-03：池子要供「一人独占一条」，每个时段不再只留 2 条（深夜 1 条太薄），
+            # 放到 4 条 / 深夜 2 条，让同一天里每个私聊对象都能分到不同的事件。
+            cap = 2 if bucket == "late_night" else 4
             count = sum(1 for item in selected if self._proactive_daypart_bucket_for_event(item) == bucket)
             for item in by_bucket[bucket][1:]:
                 if count >= cap:
@@ -3335,14 +3338,26 @@ class DailyStateMixin(DailyStateTickMixin):
             return ""
         lines: list[str] = []
         meta_leak_checker = getattr(self, "_framework_agent_meta_summary_leak", None)
+        # 「那份/那个/一半」这类没有指代的开头，再念给模型一次只会让下一条继续悬空
+        dangling = re.compile(r"^(?:那|这)(?:份|个|些|点|回|阵)|^一半")
+        dangling_noted = False
+        quoted = 0
         for item in recent[-4:]:
             text = _single_line(item.get("text"), 80)
             if not text:
                 continue
             if callable(meta_leak_checker) and meta_leak_checker(text):
                 continue
+            if dangling.match(text):
+                if not dangling_noted:
+                    lines.append("- 之前提过一件没说完的小事（对方没有接话）。不要再接着它往下说，也不要用「那份/那个/一半」这类没头没尾的说法去指它。")
+                    dangling_noted = True
+                continue
             when = self._format_timestamp_elapsed(item.get("ts"))
             lines.append(f"- {when}说过：{text}")
+            quoted += 1
+        if quoted or dangling_noted:
+            lines.append("- 上面这些都还没等到回复：这次不要承接它们、不要追问、不要催对方回；换一件此刻自己这边的事，新起一句。")
         if any(str(item.get("signature") or "") == "ordinary_weather_topic" for item in recent):
             lines.append("- 最近已经用天气开过话题；除非本轮原因是刚发生的环境突变或官方预警，否则这次不要再写天气、气温、下雨、天色，也不要追问对方那边的天气。")
         return "\n".join(lines)
@@ -16358,7 +16373,10 @@ class DailyStateMixin(DailyStateTickMixin):
         if not clause:
             return False
         target_patterns = (
-            r"给(?P<target>[^，。；;,.!?？！、\s]{1,14}?)(?:回了?(?:一?条)?(?:消息|微信|QQ|私信|短信|语音)?|回复了?|发了?(?:一?条)?(?:消息|微信|QQ|私信|短信|语音)?|发去(?:消息|微信|QQ|私信|短信|语音)?|私聊了?)",
+            # 2026-11-02：最后那组「消息/微信/…」曾经整体可选，于是「人给焐回来了」这种
+            # 描写会被拆成 target=「焐」+ 「回」 命中，误判成「给焐回了消息」。现在
+            # 「回…」分支必须带消息名词，「发…」分支也必须带名词，只留「回复了」「私聊了」裸词。
+            r"给(?P<target>[^，。；;,.!?？！、\s]{1,14}?)(?:回复了?(?:一?条)?(?:消息|微信|QQ|私信|短信|语音)?|回了?(?:一?条)?(?:消息|微信|QQ|私信|短信|语音)|发了?(?:一?条)?(?:消息|微信|QQ|私信|短信|语音)|发去(?:一?条)?(?:消息|微信|QQ|私信|短信|语音)|私聊了?)",
             r"(?:收到|看见|看到|点开|翻到)(?P<target>[^，。；;,.!?？！、\s]{1,14}?)(?:的)?(?:消息|微信|QQ|私信|短信|语音|提醒)",
             r"(?P<target>[^，。；;,.!?？！、\s]{1,14}?)(?:发来|发了|传来|弹来|回了?)(?:一?条)?(?:消息|微信|QQ|私信|短信|语音|提醒)",
             r"(?:和|跟)(?P<target>[^，。；;,.!?？！、\s]{1,14}?)(?:聊了?|聊天|私聊|互相吐槽|互相安慰|发消息|回消息)",

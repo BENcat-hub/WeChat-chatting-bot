@@ -117,6 +117,12 @@ class MemoryStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=3000")
+        # 2026-11-02 修复：这台机器上 SQLite 的默认 temp_store=file 会让 FTS5 的
+        # 删除路径（DELETE FROM memory_fts / 自动维护重建）去开临时文件，然后
+        # 以 "unable to open database file" 失败（同一份库用 temp_store=MEMORY
+        # 就一切正常，见 scripts\_probe_fts3.py）。FTS5 的临时结构本来就能放内存，
+        # 所以统一改成 MEMORY，避免整条记忆写入链路被临时文件拖死。
+        connection.execute("PRAGMA temp_store=MEMORY")
         if not self._read_only:
             connection.execute("PRAGMA wal_autocheckpoint=500")
         return connection
@@ -144,6 +150,8 @@ class MemoryStore:
                     )
                     conn.row_factory = sqlite3.Row
                     conn.execute("PRAGMA busy_timeout=3000")
+                    # 见 _open_connection() 的说明：FTS5 的临时结构要走内存。
+                    conn.execute("PRAGMA temp_store=MEMORY")
                     self._read_conn = conn
         return conn
 

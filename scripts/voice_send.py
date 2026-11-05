@@ -20,7 +20,7 @@ import wave
 
 import numpy as np
 
-ROOT = r"<REPO_ROOT>"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT + r"\scripts")
 
 try:
@@ -37,21 +37,48 @@ PY_BV2 = os.path.join(ROOT, "bertvits2", ".venv", "Scripts", "python.exe")
 BV2_V1_SAY = os.path.join(ROOT, "bertvits2", "bv2_v1_say.py")
 BV2_SAY = os.path.join(ROOT, "bertvits2", "bv2_say.py")
 SVC_EXE = os.path.join(ROOT, "rvc-backend", ".venv", "Scripts", "svc.exe")
-FFMPEG = os.path.join(ROOT, "tools", "ffmpeg", "ffmpeg.exe")
+FFMPEG = os.path.join(ROOT, "tools", "ffmpeg.exe")
+if not os.path.exists(FFMPEG):
+    FFMPEG = os.path.join(ROOT, "tools", "ffmpeg", "ffmpeg.exe")
+NAHIDA_TTS = "http://127.0.0.1:8795/v1/audio/speech"
 PLAY_DEV = 24  # CABLE In 16 Ch (render)
 DEFAULT_CAPTURE = '麦克风 (REDMI 电脑音箱 2 Pro)'
 
 
 def tts(text, out_wav):
-    cmd = [PY_AKA, "-X", "utf8", os.path.join(ROOT, "scripts", "_tts_mimo.py"), text, out_wav]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=180)
-    if r.returncode != 0:
-        raise RuntimeError("tts failed: " + (r.stderr or r.stdout)[-400:])
+    """取原始 TTS（44.1k wav）—— 走常驻的 nahida_tts_server（8795）。
+
+    2026-11-05：原来调的 scripts/_tts_mimo.py 在 11-03 误删里没了；改成打
+    8795 的 OpenAI 兼容接口并带 skip_svc=1（只要 TTS，音色转换在下面 svc_convert
+    里做，避免双次 svc 把人声磨平）。
+    """
+    import urllib.request
+    body = json.dumps({"input": text, "voice": "nahida", "skip_svc": True}).encode("utf-8")
+    req = urllib.request.Request(NAHIDA_TTS, data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = resp.read()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"tts failed ({NAHIDA_TTS}): {exc}") from exc
+    if len(data) < 2048:
+        raise RuntimeError(f"tts failed: 8795 只回了 {len(data)} 字节")
+    with open(out_wav, "wb") as f:
+        f.write(data)
     return out_wav
 
 
+def _model_dir(model):
+    """音色模型目录：models_voice（说话）优先，其次 models（唱歌）。"""
+    for sub in ("models_voice", "models"):
+        d = os.path.join(ROOT, "rvc-backend", sub, model)
+        if os.path.isdir(d):
+            return d
+    raise RuntimeError(f"找不到音色模型目录：{model}（models_voice/ 与 models/ 都没有）")
+
+
 def svc_convert(in_wav, model, out_wav, transpose=0):
-    mdir = os.path.join(ROOT, "rvc-backend", "models", model)
+    mdir = _model_dir(model)
     pth = os.path.join(mdir, "G_latest.pth")
     if not os.path.exists(pth):
         cands = sorted([f for f in os.listdir(mdir) if f.startswith("G_") and f.endswith(".pth")],
@@ -61,7 +88,7 @@ def svc_convert(in_wav, model, out_wav, transpose=0):
         pth = os.path.join(mdir, cands[-1])
     cfg = os.path.join(mdir, "config.json")
     cluster = os.path.join(mdir, "kmeans_10000.pt")
-    cmd = [SVC_EXE, "infer", in_wav, "-m", pth, "-c", cfg, "-fm", "crepe", "-t", str(transpose),
+    cmd = [SVC_EXE, "infer", in_wav, "-m", pth, "-c", cfg, "-fm", (os.environ.get("NAHIDA_F0") or "harvest"), "-t", str(transpose),
            "-o", out_wav]
     # NOTE: no cluster (-k/-r): torch 2.6+ refuses the numpy-pickled kmeans with weights_only=True.
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",

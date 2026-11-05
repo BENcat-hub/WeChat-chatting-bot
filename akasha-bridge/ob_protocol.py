@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -29,6 +30,26 @@ log = logging.getLogger("ob11-bridge")
 _FILE_DEDUPE_WINDOW = 20.0
 _recent_file_sends: dict[str, float] = {}
 _file_dedupe_lock = threading.Lock()
+
+
+def _note_voice_failure(contact: str, path: str, reason: str = "") -> None:
+    """气泡没发出去时记一条，供下一轮/人工补发（不发文件卡片，不重试）。"""
+    rec = {
+        "ts": int(time.time()),
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "contact": contact,
+        "file": os.path.basename(path),
+        "path": path,
+        "bytes": os.path.getsize(path) if os.path.exists(path) else None,
+        "reason": reason or "voice bubble not verified",
+    }
+    try:
+        os.makedirs(os.path.dirname(config.VOICE_FAILURE_LOG), exist_ok=True)
+        with open(config.VOICE_FAILURE_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[OB11] 语音失败记录写不进去: {exc}")
+    log.warning(f"[OB11] 语音没发出去（不落文件卡片）: {rec['file']} → {contact}")
 
 
 def _queue_note(contact: str) -> str:
@@ -293,7 +314,7 @@ async def _handle_ob_api(data: dict):
             seg_data = seg.get("data", {})
 
             if seg_type == "text":
-                text = seg_data.get("text", "")
+                text = _scrub_internal_markers(seg_data.get("text", ""))
                 if text:
                     async with _SEND_LOCK:
                         ok = await asyncio.to_thread(state.sender_instance.send_text, contact, text)
@@ -387,6 +408,13 @@ async def _handle_ob_api(data: dict):
                     bubble = await _send_voice_bubble(contact, fpath)
                     if bubble:
                         continue
+                    # 2026-10-30：气泡两次都没成（voice_send 失败 / 回读不到）时不再回落成
+                    # 文件卡片 ——「语音又变成文件发了」用户按故障算，wav 卡片对方点开还得
+                    # 找播放器。默认只记账（logs/voice-bubble-failures.jsonl），要旧的降级
+                    # 行为就把 config.json 的 voice_fallback_to_file 设成 true。
+                    if not config.VOICE_FALLBACK_TO_FILE:
+                        _note_voice_failure(contact, fpath)
+                        continue
                 try:
                     fingerprint = await asyncio.to_thread(_file_fingerprint, fpath)
                 except Exception:
@@ -461,6 +489,44 @@ async def _handle_ob_api(data: dict):
             log.warning(f"[OB11] 无法回响应（WS 未连接）: {action}")
 
 
+
+_INTERNAL_TAG_RE = re.compile(r"</?(?:pc_[a-z0-9_]+|tts|TTS)\b[^<>]*>", re.IGNORECASE)
+_PCTTS_SENTINEL_RE = re.compile(r"\[\[PCTTS:[^\]]*\]\]", re.IGNORECASE)
+_LITERAL_MARKER_RE = re.compile(
+    r"(?:[A-Za-z]{1,4}\s*[下_][划_]?线?\s*(?:TTS|tts))|(?:_?(?:pc|PC)_tts)|(?:tc_tts)|</?pc_tts>|</?tts>",
+    re.IGNORECASE,
+)
+_SPACE_RUN_RE = re.compile(r"[ \t]{2,}")
+_LEAD_NOISE_RE = re.compile(r"^[ \t,，、。；;:：\-]+")
+
+
+def _scrub_internal_markers(text: str) -> str:
+    """把内部协议标记从可见正文里剥掉。
+
+    - `<pc_tts>…</pc_tts>` / `<tts>` / 其它 `pc_*` 标签：只去标签，保留里面的话
+    - `[[PCTTS:…]]` 哨兵、以及模型把标签拼成的字面词（"PC下划线TTS"）：整段去掉
+    - 去完再收敛空白与行首标点，避免出现「，」开头的句子
+    """
+    source = str(text or "")
+    if not source:
+        return ""
+    if not (
+        _INTERNAL_TAG_RE.search(source)
+        or _PCTTS_SENTINEL_RE.search(source)
+        or _LITERAL_MARKER_RE.search(source)
+    ):
+        return source
+    cleaned = _PCTTS_SENTINEL_RE.sub("", source)
+    cleaned = _LITERAL_MARKER_RE.sub("", cleaned)
+    cleaned = _INTERNAL_TAG_RE.sub("", cleaned)
+    cleaned = _SPACE_RUN_RE.sub(" ", cleaned)
+    cleaned = _LEAD_NOISE_RE.sub("", cleaned)
+    cleaned = re.sub(r"\[\]|<>|【】", "", cleaned)
+    cleaned = re.sub(r"(?:\r?\n){3,}", "\n\n", cleaned)
+    log.info("[OB11] 已剥离内部标记: %r -> %r", source[:60], cleaned[:60])
+    return cleaned.strip()
+
+
 def _extract_text(message: list) -> str:
     """从 OneBot message 段中提取可发送的文本。"""
     text_parts = []
@@ -486,7 +552,7 @@ def _extract_text(message: list) -> str:
             else:
                 # 其他未知类型也尝试提取文本
                 text_parts.append(d.get("text", ""))
-    return "".join(text_parts).strip()
+    return _scrub_internal_markers("".join(text_parts).strip())
 
 
 # ============ OneBot 协议处理 ============

@@ -62,3 +62,20 @@ secrets/weflow-token.txt
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---- 第三方二进制 / 大体积模型：不进版本库 ----
+weflow/
+rvc-backend/models/
+
+# 纳西妲说话音色（542MB，不入库）
+rvc-backend/models_voice/
+_restore-20261103/
+rvc-backend/cache/
+rvc-backend/outputs/
+rvc-backend/temp/
+secrets/mimo_api_key.txt
+secrets/mimo_api_base.txt
+secrets/siliconflow_api_key.txt
+.weflow-userdata/
+.wf-appdata/
+.tmp-install/

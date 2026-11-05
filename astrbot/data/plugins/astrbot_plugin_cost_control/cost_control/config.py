@@ -1,0 +1,697 @@
+"""配置读取辅助。
+
+提供模块级的 ``get_config`` / ``get_pricing`` 函数与 ``CONFIG_DEFAULTS`` 字典，
+供各 Mixin 统一读取 ``self.cfg``（merged 配置）。内置默认单价表 ``DEFAULT_PRICING``
+定义在 :mod:`cost_control.default_pricing`（便于单独更新），此处 re-export 以保持
+``cost_control.config.DEFAULT_PRICING`` 访问路径不变。
+不做成 Mixin，避免污染 ``Main`` 的继承链。
+
+由于 AstrBot 重载时会裁剪 ``_conf_schema.json`` 之外的配置键（``check_config_integrity``），
+本插件的**详细配置**（budgets / pricing / budget_overrides / 各模块阈值等）存于
+插件自有的 ``config.json``（data 目录，:func:`load_plugin_config` / :func:`save_plugin_config`），
+运行时由 ``Main`` 合并为 ``self.cfg`` 供读取；``_conf_schema.json`` 仅保留总开关
+``enabled``，其余所有参数（含各功能开关与详细配置）均由仪表盘「设置」页编辑并写入
+``config.json``。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import tempfile
+from copy import deepcopy
+from typing import Any
+
+from .default_pricing import DEFAULT_PRICING
+from .exchange_rates import DEFAULT_RATES
+from .pricing_clusters import normalize_pricing_multipliers
+
+# 配置默认值。键名与 ``_conf_schema.json`` 的顶层项一一对应。
+# object 类型的配置项用嵌套 dict 表示默认值。
+CONFIG_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "platforms": [],
+    # 主货币代码（同时也是显示符号），默认美元。
+    "currency_symbol": "$",
+    # 各货币对 USD 汇率（1 USD = rate 单位货币X）。首次取内置静态表，
+    # 用户可在设置页「立即同步」刷新。空对象时回退 DEFAULT_RATES。
+    "exchange_rates": dict(DEFAULT_RATES),
+    # 汇率最近同步时间（ISO），空=未同步过（用静态表）。
+    "exchange_rates_updated_at": "",
+    # 5 维全局默认预算（int token 上限）。
+    "budgets": {
+        "per_session_daily": 0,
+        "per_user_daily": 0,
+        "per_model_daily": 0,
+        "global_daily": 0,
+        "global_monthly": 0,
+    },
+    # 5 维全局默认花费预算（float USD）。
+    "budgets_cost": {
+        "per_session_daily": 0.0,
+        "per_user_daily": 0.0,
+        "per_model_daily": 0.0,
+        "global_daily": 0.0,
+        "global_monthly": 0.0,
+    },
+    # 5 维全局默认花费预算的货币代码（dim -> 代码，空=主货币）。
+    "budgets_cost_currency": {},
+    "pricing": {},  # 用户自定义定价，key=provider_id，value 按 mode（见 get_pricing）
+    # 分时定价策略（独立叠加层），key=provider_id 或 provider_id|model。
+    # 未命中任何时间段时继续使用 pricing / 价格源 / 内置表解析出的基础定价。
+    "pricing_schedules": {},
+    # AstrBot Provider Source 供应商聚类倍率，key=provider_source_id；1 倍无需持久化。
+    "pricing_multipliers": {},
+    # 局部阈值（每条规则挂自己的 on_exceeded；优先级高于全局 5 维）。
+    # 规则对象形如：
+    #   {"enabled": bool, "target_type": "umo"|"provider"|"user",
+    #    "target_value": str, "token_limit": int (0=不限),
+    #    "cost_limit": float (0=不限),
+    #    "on_exceeded": "stop"|"fallback"|"warn",
+    #    "stop_message": str,
+    #    "fallback_provider_ids": [str, ...],
+    #    "fallback_token_limit": int}
+    "budget_overrides": [],
+    # 备用 Provider 库（Panel 3）：id 与 on_exceeded=fallback 的规则共享。
+    # 形如：[{"id": "prov_x", "enabled": bool, "note": str}]
+    "fallback_providers": [],
+    # 全局默认超限处理（当 override 未命中且全局 5 维超限时生效）。
+    # "stop" / "fallback" / "warn"。
+    "default_on_exceeded": "stop",
+    "refresh_time": "00:00",
+    # AI 诊断使用的 Provider ID（空 = 使用 AstrBot 默认 chat provider）。
+    "ai_diag_provider_id": "",
+    "match_unique_session": False,
+    "cache_diag": {
+        "detect_context_reset": True,
+        "detect_system_prompt_change": True,
+        "detect_tools_change": True,
+        "detect_order_drift": True,
+        "cache_hit_rate_alert_enabled": False,
+        "cache_hit_rate_alert_threshold": 0,
+    },
+    "alerts": {
+        "enabled": True,
+        "cooldown_seconds": 300,
+        "daily_report_time": "09:00",
+        "daily_report_to": [],
+    },
+    "attribution": {
+        "enabled": True,
+        "sample_rate": 100,
+    },
+    "schedule": {
+        "enable_daily_report": False,
+        "retain_days": 90,
+    },
+    # 多源价格目录（multi-source-pricing）。
+    # 公共源默认启用；New API 源按 "newapi:<provider_id>": {"enabled": bool} 动态加入。
+    "price_sources": {
+        "modelsdev": {"enabled": True},
+        "litellm": {"enabled": True},
+        "openrouter": {"enabled": True},
+    },
+    # 用户对 (provider_id, model) 选定的价格源：
+    # {"<provider_id>": {"<model>": {"price_key": "<source>:<source_model_id>", "confirmed": bool}}}
+    "price_selections": {},
+    # 价格同步设置：默认仅手动触发；auto_enabled=True 时按 cron 自动刷新。
+    "price_sync": {"auto_enabled": False, "cron": "0 4 * * *"},
+}
+
+
+# 合法 target_type 白名单。
+_VALID_TARGET_TYPES = ("umo", "provider", "user")
+# 合法 on_exceeded 白名单。
+_VALID_ON_EXCEEDED = ("stop", "fallback", "warn")
+# 合法 default_on_exceeded 同 on_exceeded（复用同一组值）。
+
+
+def normalize_budget_override(raw: Any) -> dict[str, Any] | None:
+    """规范化单条局部阈值规则（纯函数；非法值一律兜底；空规则返回 None）。
+
+    Returns:
+        规范化后的 dict；非法 / 缺字段不可恢复时返回 ``None``（调用方应丢弃该条）。
+    """
+    if not isinstance(raw, dict) or not raw:
+        return None
+    target_type = str(raw.get("target_type") or "").strip().lower()
+    if target_type not in _VALID_TARGET_TYPES:
+        return None
+    target_value = str(raw.get("target_value") or "").strip()
+    if not target_value:
+        return None
+    try:
+        token_limit = max(0, int(raw.get("token_limit", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        token_limit = 0
+    cost_limit = _to_float_or_zero(raw.get("cost_limit", 0))
+    on_exceeded = str(raw.get("on_exceeded") or "").strip().lower()
+    if on_exceeded not in _VALID_ON_EXCEEDED:
+        on_exceeded = "stop"
+    stop_message = str(raw.get("stop_message", "") or "")
+    pids_raw = raw.get("fallback_provider_ids") or []
+    pids: list[str] = []
+    if isinstance(pids_raw, str):
+        pids = [p.strip() for p in pids_raw.split(",") if p.strip()]
+    elif isinstance(pids_raw, (list, tuple)):
+        for p in pids_raw:
+            s = str(p).strip()
+            if s:
+                pids.append(s)
+    try:
+        fallback_token_limit = max(0, int(raw.get("fallback_token_limit", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        fallback_token_limit = 0
+    enabled = coerce_to_default_type(raw.get("enabled", True), True)
+    # 花费限额的货币代码（空=主货币）。
+    cost_currency = str(raw.get("cost_currency", "") or "").strip().upper()
+    return {
+        "enabled": enabled,
+        "target_type": target_type,
+        "target_value": target_value,
+        "token_limit": token_limit,
+        "cost_limit": cost_limit,
+        "cost_currency": cost_currency,
+        "on_exceeded": on_exceeded,
+        "stop_message": stop_message,
+        "fallback_provider_ids": pids,
+        "fallback_token_limit": fallback_token_limit,
+    }
+
+
+def normalize_fallback_provider(raw: Any) -> dict[str, Any] | None:
+    """规范化备用 Provider 库条目（纯函数；非法值返回 None 丢弃）。"""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    pid = str(raw.get("id") or "").strip()
+    if not pid:
+        return None
+    note = str(raw.get("note", "") or "")
+    enabled = coerce_to_default_type(raw.get("enabled", True), True)
+    return {"id": pid, "enabled": enabled, "note": note}
+
+
+def enabled_overrides(overrides: Any) -> list[dict[str, Any]]:
+    """返回已启用且字段合法的 override（保持原顺序，纯函数）。
+
+    每条过 :func:`normalize_budget_override`（字段齐全）；返回 ``None`` 者跳过。
+    """
+    if not isinstance(overrides, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for ov in overrides:
+        n = normalize_budget_override(ov)
+        if n is not None and n.get("enabled", True):
+            out.append(n)
+    return out
+
+
+def enabled_fallback_providers(items: Any) -> list[dict[str, Any]]:
+    """返回已启用的备用 Provider（纯函数）。"""
+    if not isinstance(items, (list, tuple)):
+        return []
+    out: list[dict[str, Any]] = []
+    for it in items:
+        n = normalize_fallback_provider(it)
+        if n is not None and n.get("enabled", True):
+            out.append(n)
+    return out
+
+
+def get_config(config: dict[str, Any] | None, key: str, default: Any = None) -> Any:
+    """从插件配置字典读取指定键的值。
+
+    若 ``config`` 为 None 或缺少该键，则回退到 ``CONFIG_DEFAULTS[key]``，
+    若默认值也不存在则返回传入的 ``default``。
+
+    Args:
+        config: 插件配置字典（通常是 ``Main.config``）。
+        key: 顶层配置项键名，与 ``_conf_schema.json`` 一致。
+        default: 当 config 与 CONFIG_DEFAULTS 都缺失时返回的兜底值。
+
+    Returns:
+        配置值。
+    """
+    if config and key in config:
+        return config[key]
+    return CONFIG_DEFAULTS.get(key, default)
+
+
+def get_pricing(config: dict[str, Any] | None) -> dict[str, Any]:
+    """返回生效定价：``{"defaults", "user", "schedules", "multipliers"}``。
+
+    两套 key 空间并存、互不合并：
+
+    - ``defaults``：内置出厂默认表 ``DEFAULT_PRICING``（key=模型名，隐含 per_token），
+      由 :func:`cost_control.cost.match_pricing` 按模型名模糊匹配。
+    - ``user``：用户在 ``pricing`` 项配置的覆盖（key=**provider_id**）。每条按
+      ``mode``（``per_token``/``per_turn``/``per_request``/``per_tier``/``tiered_expr``）
+      规范化；缺 ``mode`` 视为 ``per_token``（兼容旧结构）。优先级高于 defaults——见
+      :func:`cost_control.cost.resolve_pricing`。
+    - ``multipliers``：AstrBot Provider Source 聚类倍率。命中基础规则后统一相乘；
+      未配置即 1 倍。Provider 到 Source 的映射由 :class:`cost_control.cost.CostMixin`
+      在运行时附加，不改变默认模型价的匹配逻辑。
+
+    Args:
+        config: 插件配置字典。
+
+    Returns:
+        ``{"defaults": {model: {input,...}}, "user": {provider_id: {mode,...}},
+        "multipliers": {cluster_id: float}}``。
+        user entry 形如：
+        - ``{"mode":"per_token","input":f,"input_cached":f,"output":f,"cache_creation":f|None}``
+        - ``{"mode":"per_turn","price":f}`` / ``{"mode":"per_request","price":f}``
+    """
+    defaults: dict[str, dict[str, float]] = {
+        model: dict(prices) for model, prices in DEFAULT_PRICING.items()
+    }
+    user: dict[str, dict[str, Any]] = {}
+    user_pricing = get_config(config, "pricing", {}) or {}
+    if isinstance(user_pricing, dict):
+        for pid, entry in user_pricing.items():
+            norm = _normalize_user_entry(entry)
+            if norm is not None:
+                user[str(pid)] = norm
+    multipliers = normalize_pricing_multipliers(get_config(config, "pricing_multipliers", {}) or {})
+    schedules = get_pricing_schedules(config)
+    return {
+        "defaults": defaults,
+        "user": user,
+        "schedules": schedules,
+        "multipliers": multipliers,
+        "exchange_rates": get_rates(config),
+    }
+
+
+def get_currency_symbol(config: dict[str, Any] | None) -> str:
+    """返回主货币代码（默认 ``"USD"``）。
+
+    兼容历史 ``"$"`` 值——自动归一化为 ``"USD"``。
+    """
+    raw = get_config(config, "currency_symbol", "USD")
+    cur = str(raw or "USD").strip().upper()
+    # 兼容历史 "$" / "＄"
+    if cur in ("$", "＄", "USD"):
+        return "USD"
+    return cur
+
+
+def get_budgets_cost_currency(config: dict[str, Any] | None) -> dict[str, str]:
+    """返回 5 维花费限额的货币代码（dim -> 代码，空=主货币）。"""
+    raw = get_config(config, "budgets_cost_currency", {}) or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v or "").strip().upper() for k, v in raw.items()}
+
+
+def get_rates(config: dict[str, Any] | None) -> dict[str, float]:
+    """返回生效汇率表（合并 config 与 DEFAULT_RATES，config 优先）。"""
+    from .exchange_rates import get_rates as _get_rates
+
+    return _get_rates(config)
+
+
+def get_rate_updated_at(config: dict[str, Any] | None) -> str:
+    """返回汇率最近同步时间（ISO，空=未同步过）。"""
+    from .exchange_rates import get_rate_updated_at as _get_at
+
+    return _get_at(config)
+
+
+_PUBLIC_PRICE_SOURCE_IDS = frozenset({"modelsdev", "litellm", "openrouter"})
+
+
+def _is_price_source_id(source_id: str) -> bool:
+    """只接受内置公共源或绑定既有 provider 的 New API 动态源。"""
+    return source_id in _PUBLIC_PRICE_SOURCE_IDS or (
+        source_id.startswith("newapi:") and bool(source_id[7:].strip())
+    )
+
+
+def get_price_sources(config: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """返回完整价格源配置，始终补齐三个公共源默认项。"""
+    return normalize_price_sources(get_config(config, "price_sources", {}))
+
+
+def get_enabled_price_sources(config: dict[str, Any] | None) -> list[str]:
+    """返回所有 enabled=True 的价格源 ID（保持配置顺序）。"""
+    return [sid for sid, cfg in get_price_sources(config).items() if cfg.get("enabled")]
+
+
+def normalize_price_sources(raw: Any) -> dict[str, dict[str, Any]]:
+    """规范化 ``price_sources``（保留 ``newapi:<pid>`` 等动态键，纯函数）。
+
+    公共源固定保留（默认 enabled）；每个条目强转 ``enabled`` 为 bool，
+    其余字段（provider_id/base_url/use_provider_key）原样保留。非法源 ID 丢弃。
+    """
+    base = get_config(CONFIG_DEFAULTS, "price_sources", {}) or {}
+    out: dict[str, dict[str, Any]] = {
+        sid: {"enabled": bool(cfg.get("enabled", True))}
+        for sid, cfg in base.items()
+        if isinstance(cfg, dict) and sid in _PUBLIC_PRICE_SOURCE_IDS
+    }
+    if not isinstance(raw, dict):
+        return out
+    for sid, cfg in raw.items():
+        key = str(sid or "").strip()
+        if not _is_price_source_id(key) or not isinstance(cfg, dict):
+            continue
+        entry = dict(cfg)
+        entry["enabled"] = bool(entry.get("enabled", True))
+        out[key] = entry
+    return out
+
+
+def get_price_selections(config: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """返回用户价格选择（``price_selections``）。
+
+    形态：``{"<provider_id>": {"<model>": {"price_key", "confirmed"}}}``；
+    非法结构回退空 dict。
+    """
+    raw = get_config(config, "price_selections", {}) or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for pid, models in raw.items():
+        key = str(pid or "").strip()
+        if not key or not isinstance(models, dict):
+            continue
+        clean: dict[str, Any] = {}
+        for model, sel in models.items():
+            mkey = str(model or "").strip()
+            if mkey and isinstance(sel, dict):
+                clean[mkey] = dict(sel)
+        if clean:
+            out[key] = clean
+    return out
+
+
+def get_price_sync_config(config: dict[str, Any] | None) -> dict[str, Any]:
+    """返回价格同步设置（``price_sync``）。"""
+    raw = get_config(config, "price_sync", {}) or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "auto_enabled": bool(raw.get("auto_enabled", False)),
+        "cron": str(raw.get("cron") or "0 4 * * *").strip(),
+    }
+
+
+_PER_TOKEN_FIELDS: tuple[str, ...] = ("input", "input_cached", "output", "cache_creation")
+
+
+def _normalize_user_entry(entry: Any) -> dict[str, Any] | None:
+    """规范化一条用户定价 entry（key=provider_id 的 value）。非法返回 ``None``。
+
+    识别 ``mode``（缺省 per_token），按 mode 校验：
+    - per_token：四字段 float>=0 或 None（缺省 None 表示未配置，供 resolve 继承），
+      另输出 ``configured`` 标记各字段是否显式提供（区分「未填」与「显式 0」）。
+    - per_turn/per_request：price（float>=0）。
+    - per_tier：base + context_tiers/service_tiers 结构。
+    - tiered_expr：expr 经 :func:`expr_eval.validate_tiered_expr` 校验，非法丢弃。
+    mode 非法或 entry 非 dict 返回 None。
+    """
+    if not isinstance(entry, dict):
+        return None
+    mode = str(entry.get("mode") or "per_token").strip().lower()
+    currency = str(entry.get("currency", "USD") or "USD").strip().upper() or "USD"
+    if mode == "per_token":
+        return _normalize_per_token(entry, currency)
+    if mode in ("per_turn", "per_request"):
+        return {"mode": mode, "price": _to_float_or_zero(entry.get("price")), "currency": currency}
+    if mode == "per_tier":
+        return _normalize_per_tier(entry, currency)
+    if mode == "tiered_expr":
+        return _normalize_tiered_expr(entry, currency)
+    return None
+
+
+def _is_set(v: Any) -> bool:
+    """字段是否显式提供（键存在、非 None、非空白字符串）。"""
+    if v is None:
+        return False
+    if isinstance(v, str) and not v.strip():
+        return False
+    return True
+
+
+def _normalize_per_token(entry: dict[str, Any], currency: str) -> dict[str, Any]:
+    out: dict[str, Any] = {"mode": "per_token", "currency": currency, "configured": {}}
+    for f in _PER_TOKEN_FIELDS:
+        if _is_set(entry.get(f)):
+            out[f] = _to_float_or_zero(entry.get(f))
+            out["configured"][f] = True
+        else:
+            out[f] = None
+            out["configured"][f] = False
+    return out
+
+
+def _normalize_price_fields(raw: Any) -> tuple[dict[str, Any], dict[str, bool]]:
+    """规范化一组 per_token 字段，返回 (值 dict, configured dict)。"""
+    values: dict[str, Any] = {}
+    configured: dict[str, bool] = {}
+    src = raw if isinstance(raw, dict) else {}
+    for f in _PER_TOKEN_FIELDS:
+        if _is_set(src.get(f)):
+            values[f] = _to_float_or_zero(src.get(f))
+            configured[f] = True
+        else:
+            values[f] = None
+            configured[f] = False
+    return values, configured
+
+
+def _normalize_per_tier(entry: dict[str, Any], currency: str) -> dict[str, Any] | None:
+    base, base_cfg = _normalize_price_fields(entry.get("base"))
+    if not any(base_cfg.values()):
+        return None  # base 全空，无有效阶梯价
+    context_tiers: list[dict[str, Any]] = []
+    raw_context = entry.get("context_tiers") or []
+    raw_service = entry.get("service_tiers") or []
+    if not isinstance(raw_context, (list, tuple)) or not isinstance(raw_service, (list, tuple)):
+        return None
+    for t in raw_context:
+        if not isinstance(t, dict):
+            continue
+        try:
+            threshold = int(t.get("threshold_tokens"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if threshold < 0:
+            continue
+        vals, cfg = _normalize_price_fields(t)
+        if not any(cfg.values()):
+            continue
+        context_tiers.append({"threshold_tokens": threshold, **vals})
+    context_tiers.sort(key=lambda x: x["threshold_tokens"])
+    service_tiers: list[dict[str, Any]] = []
+    for s in raw_service:
+        if not isinstance(s, dict):
+            continue
+        match = str(s.get("match") or "").strip()
+        if not match:
+            continue
+        mult: dict[str, float] = {}
+        for f in _PER_TOKEN_FIELDS:
+            mk = f + "_multiplier"
+            if _is_set(s.get(mk)):
+                try:
+                    mv = float(s[mk])
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(mv) and mv >= 0:
+                    mult[mk] = mv
+        if mult:
+            service_tiers.append({"match": match, **mult})
+    return {
+        "mode": "per_tier",
+        "base": base,
+        "configured": base_cfg,
+        "context_tiers": context_tiers,
+        "service_tiers": service_tiers,
+        "currency": currency,
+    }
+
+
+def _normalize_tiered_expr(entry: dict[str, Any], currency: str) -> dict[str, Any] | None:
+    expr = str(entry.get("expr") or "").strip()
+    if not expr:
+        return None
+    from .expr_eval import validate_tiered_expr
+
+    if validate_tiered_expr(expr) is not None:
+        return None  # 非法表达式丢弃
+    return {"mode": "tiered_expr", "expr": expr, "currency": currency}
+
+
+def normalize_pricing_schedules(raw: Any, *, strict: bool = False) -> dict[str, dict[str, Any]]:
+    """规范化分时定价策略；严格模式用于保存接口返回明确校验错误。"""
+    from .pricing_schedule import normalize_pricing_schedules as _normalize
+
+    return _normalize(raw, _normalize_user_entry, strict=strict)
+
+
+def get_pricing_schedules(config: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """返回合法的分时策略；损坏条目在运行时安全跳过。"""
+    raw = get_config(config, "pricing_schedules", {}) or {}
+    return normalize_pricing_schedules(raw, strict=False)
+
+
+def _to_float_or_zero(v: Any) -> float:
+    try:
+        f = float(v)
+        return f if math.isfinite(f) and f >= 0 else 0.0
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+# schema 中保留的「功能开关」键（保存时分离开关与详细配置）。
+# schema 仅保留总开关 enabled，其余所有参数走插件自有 config.json；
+# 故此处只同步 enabled（由 AstrBot 持久化到 <plugin>_config.json，
+# 供 WebUI 插件配置页显示）。
+SWITCH_KEYS: tuple[tuple[str | int, ...], ...] = (("enabled",),)
+
+
+def deep_merge(base: Any, *overrides: Any) -> Any:
+    """递归合并多个 dict（后者覆盖前者；非 dict 值直接覆盖）。纯函数。
+
+    用于把 ``CONFIG_DEFAULTS`` ⊕ 插件配置文件 ⊕ ``self.config``(开关) 合并为
+    运行时 ``self.cfg``。``base`` / ``overrides`` 中非 dict 的项按整体替换处理。
+    """
+    merged = deepcopy(base)
+    for ov in overrides:
+        if not isinstance(merged, dict) or not isinstance(ov, dict):
+            merged = deepcopy(ov)
+            continue
+        for k, v in ov.items():
+            if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+                merged[k] = deep_merge(merged[k], v)
+            else:
+                merged[k] = deepcopy(v)
+    return merged
+
+
+def _config_path(data_dir: str) -> str:
+    return os.path.join(data_dir, "config.json")
+
+
+def load_plugin_config(data_dir: str) -> dict[str, Any]:
+    """读取插件自有配置文件（``data_dir/config.json``）。失败 / 不存在返回 ``{}``。
+
+    AstrBot 不触碰此文件（不受 schema 裁剪影响），是详细配置的持久来源。
+    """
+    try:
+        path = _config_path(data_dir)
+        if not os.path.exists(path):
+            return {}
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_plugin_config(data_dir: str, cfg: dict[str, Any]) -> None:
+    """原子写插件自有配置文件（先写临时文件再 ``os.replace``，避免半写损坏）。"""
+    path = _config_path(data_dir)
+    os.makedirs(data_dir, exist_ok=True)
+    # 独立临时文件避免并发同步/保存相互覆盖同一个 .tmp 文件。
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=data_dir, prefix=".config-", delete=False
+        ) as f:
+            tmp = f.name
+            json.dump(cfg, f, ensure_ascii=False, indent=2, default=str, allow_nan=False)
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def migration_done(cfg: dict[str, Any] | None, name: str) -> bool:
+    """一次性迁移 ``name`` 是否已完成（读 config 的 ``migrations`` 块）。"""
+    migrations = cfg.get("migrations") if isinstance(cfg, dict) else None
+    return bool(isinstance(migrations, dict) and migrations.get(name))
+
+
+def mark_migration_done(cfg: dict[str, Any], name: str) -> None:
+    """在 ``cfg`` 上置位一次性迁移标记（原地修改；持久化由调用方负责）。"""
+    migrations = cfg.get("migrations") if isinstance(cfg, dict) else None
+    if not isinstance(migrations, dict):
+        migrations = {}
+        cfg["migrations"] = migrations
+    migrations[name] = True
+
+
+def switches_from_config(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """从 AstrBot 配置（``self.config``，仅含 schema 开关）抽取开关子集，供合并时覆盖。"""
+    out: dict[str, Any] = {}
+    if not isinstance(raw, dict):
+        return out
+    for path in SWITCH_KEYS:
+        # 沿路径取值；存在则写回 out 的同结构
+        cur_src: Any = raw
+        val: Any = _MISSING
+        for seg in path:
+            if isinstance(cur_src, dict) and seg in cur_src:
+                cur_src = cur_src[seg]
+                val = cur_src
+            else:
+                val = _MISSING
+                break
+        if val is not _MISSING:
+            _set_path(out, path, val)
+    return out
+
+
+_MISSING: Any = object()
+
+
+def _set_path(d: dict[str, Any], path: tuple[str | int, ...], val: Any) -> None:
+    for seg in path[:-1]:
+        d = d.setdefault(str(seg), {})  # type: ignore[assignment]
+    d[str(path[-1])] = val
+
+
+def coerce_to_default_type(value: Any, default: Any) -> Any:
+    """按 ``default`` 的类型强转 ``value``（校验用户输入，纯函数）。
+
+    bool/int/float/str/list 照型强转（数值 ``<0`` 归 0，非法回退默认）；dict 时若
+    default 有固定子键则逐子键按其默认类型强转（缺失补默认），default 为空 dict
+    （如 pricing）则接受任意 dict。用于保存配置前的类型校验。
+    """
+    # 注意：bool 是 int 子类，必须先判 bool。
+    if value is None:
+        return deepcopy(default)
+    if isinstance(default, bool):
+        if isinstance(value, str):
+            if value.strip().lower() in ("false", "0", "no", "off", ""):
+                return False
+            if value.strip().lower() in ("true", "1", "yes", "on"):
+                return True
+            return default
+        return bool(value)
+    if isinstance(default, int):
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError, OverflowError):
+            return int(default)
+    if isinstance(default, float):
+        try:
+            f = float(value)
+            return max(0.0, f) if math.isfinite(f) else float(default)
+        except (TypeError, ValueError, OverflowError):
+            return float(default)
+    if isinstance(default, str):
+        return str(value)
+    if isinstance(default, list):
+        return list(value) if isinstance(value, (list, tuple)) else list(default)
+    if isinstance(default, dict):
+        if default:
+            src = value if isinstance(value, dict) else {}
+            return {k: coerce_to_default_type(src.get(k), dv) for k, dv in default.items()}
+        return dict(value) if isinstance(value, dict) else {}
+    return value

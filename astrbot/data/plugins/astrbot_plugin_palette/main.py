@@ -1,0 +1,1658 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import random
+from contextlib import suppress
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+from pathlib import Path
+from typing import Any, Mapping, MutableMapping
+from urllib.parse import quote
+
+from sqlmodel import col, select
+
+from astrbot.api.star import Context, Star, register
+from astrbot.api.web import (
+    error_response,
+    file_response,
+    json_response,
+    request,
+    stream_response,
+)
+
+from .palette.constants import (
+    ALLOWED_BACKGROUND_EXTENSIONS,
+    AUTHOR,
+    DESCRIPTION,
+    PLUGIN_NAME,
+    ROUTE_PREFIX,
+    VERSION,
+)
+from .palette.media import (
+    MEDIA_TYPE_ANIMATED,
+    MEDIA_TYPE_SVG,
+    MEDIA_TYPE_VIDEO,
+    build_cover_from_animated_image,
+    cover_content_type,
+    delete_background_cover,
+    find_cover,
+    is_animated_image,
+    media_type_for_filename,
+    probe_media_type,
+    save_background_upload,
+    save_cover_image,
+)
+from .palette.colors import extract_theme_colors, normalize_hex_color
+from .palette.injector import ensure_dashboard_injection
+from .palette.paths import PalettePaths
+from .palette.theme import build_theme_css
+from .palette.thumbnails import (
+    delete_background_thumbnails,
+    ensure_background_thumbnail,
+)
+from .palette.file_tasks import run_file_task
+from .palette.uploads import (
+    UploadError,
+    UploadHooks,
+    UploadManager,
+)
+
+try:
+    from astrbot.api import logger as _logger
+except Exception:  # 测试环境 stub 不含 logger 时回退标准日志。
+    import logging
+
+    _logger = logging.getLogger(PLUGIN_NAME)
+
+BACKGROUND_ORIENTATIONS = {"landscape", "portrait"}
+BACKGROUND_POOLS = {"legacy", *BACKGROUND_ORIENTATIONS}
+
+
+def _serialized_config_update(handler):
+    """串行处理共享配置的读取和保存，防止线程等待期间快照互相覆盖。"""
+
+    @wraps(handler)
+    async def serialized(self, *args, **kwargs):
+        async with self._config_lock:
+            return await handler(self, *args, **kwargs)
+
+    return serialized
+
+
+@register(PLUGIN_NAME, AUTHOR, DESCRIPTION, VERSION)
+class PalettePlugin(Star):
+    """AstrBot 调色盘插件入口。"""
+
+    def __init__(self, context: Context, config: Mapping[str, Any] | None = None) -> None:
+        super().__init__(context)
+        self.config: Mapping[str, Any] = config if config is not None else {}
+        self._config_lock = asyncio.Lock()
+        self.paths = PalettePaths()
+        self.injection_status = ensure_dashboard_injection(self.paths)
+        self._ensure_config_for_existing_background()
+        self._uploads = UploadManager(
+            self.paths,
+            UploadHooks(
+                save_material=self._save_material_with_id,
+                commit_material=self._commit_prepared_background,
+                build_result=self._build_upload_result,
+                cleanup_candidate=self._cleanup_candidate_material,
+                find_committed_material=self._find_committed_material,
+            ),
+        )
+        for note in self._uploads.recover():
+            _logger.warning(f"[{PLUGIN_NAME}] {note}")
+
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/status",
+            self.get_status,
+            ["GET"],
+            "获取 AstrBot 调色盘状态",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/theme.css",
+            self.get_theme_css,
+            ["GET"],
+            "获取 AstrBot 调色盘主题 CSS",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/config",
+            self.get_config,
+            ["GET"],
+            "获取 AstrBot 调色盘配置摘要",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/config",
+            self.save_config,
+            ["POST"],
+            "保存 AstrBot 调色盘配置",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/theme-colors/recalculate",
+            self.recalculate_theme_colors,
+            ["POST"],
+            "重新读取背景图主题色",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/background-preview",
+            self.get_background_preview,
+            ["GET"],
+            "获取 AstrBot 调色盘当前背景预览",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/background-thumbnail",
+            self.get_background_thumbnail,
+            ["GET"],
+            "获取 AstrBot 调色盘背景缩略图",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/token-stats",
+            self.get_token_stats,
+            ["GET"],
+            "获取 AstrBot 调色盘模型 Token 明细统计",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/upload-background",
+            self.upload_background,
+            ["POST"],
+            "上传 AstrBot 调色盘背景素材",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/upload-background/<orientation>",
+            self.upload_background_for_orientation,
+            ["POST"],
+            "上传 AstrBot 调色盘指定方向背景素材",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/uploads/init",
+            self.init_chunked_upload,
+            ["POST"],
+            "创建 AstrBot 调色盘分块上传会话",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/uploads/<upload_id>/chunk/<index>",
+            self.upload_chunk,
+            ["POST"],
+            "上传 AstrBot 调色盘素材分块",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/uploads/<upload_id>/status",
+            self.get_chunked_upload_status,
+            ["GET"],
+            "查询 AstrBot 调色盘分块上传状态",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/uploads/<upload_id>/complete",
+            self.complete_chunked_upload,
+            ["POST"],
+            "完成 AstrBot 调色盘分块上传并入图库",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/uploads/<upload_id>/cancel",
+            self.cancel_chunked_upload,
+            ["POST"],
+            "取消 AstrBot 调色盘分块上传",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/background-cover",
+            self.get_background_cover,
+            ["GET"],
+            "读取 AstrBot 调色盘动态素材封面",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/backgrounds/select",
+            self.select_background,
+            ["POST"],
+            "切换 AstrBot 调色盘当前背景素材",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/backgrounds/delete",
+            self.delete_background,
+            ["POST"],
+            "删除 AstrBot 调色盘背景素材",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/backgrounds/random-select",
+            self.random_select_background,
+            ["POST"],
+            "随机切换 AstrBot 调色盘背景素材",
+        )
+        context.register_web_api(
+            f"{ROUTE_PREFIX}/backgrounds/<filename>",
+            self.get_background,
+            ["GET"],
+            "读取 AstrBot 调色盘背景素材",
+        )
+
+    async def get_status(self):
+        injection_status = ensure_dashboard_injection(self.paths)
+        self.injection_status = injection_status
+        return json_response(
+            {
+                "plugin": {
+                    "name": PLUGIN_NAME,
+                    "version": VERSION,
+                    "enabled": self._config_bool("enabled", True),
+                },
+                "paths": self.paths.to_public_dict(),
+                "injection": injection_status.to_dict(),
+                # 前端据此决定是否走分块上传；旧后端无此字段时仅小包回退旧接口。
+                "upload_protocol": self._uploads.capability(),
+            }
+        )
+
+    async def get_config(self):
+        return json_response(self._public_config())
+
+    @_serialized_config_update
+    async def save_config(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("配置格式不正确。")
+
+        try:
+            config = self._normalize_config(payload)
+            config = self._with_theme_colors(config)
+            self.injection_status = ensure_dashboard_injection(self.paths)
+            self._save_config(config)
+        except ValueError as exc:
+            return error_response(str(exc))
+
+        return json_response(
+            {
+                "message": "设置已保存。",
+                "config": self._public_config(),
+            }
+        )
+
+    async def upload_background(self):
+        return await self._upload_background_for_orientation("landscape")
+
+    async def upload_background_for_orientation(self, orientation: str):
+        return await self._upload_background_for_orientation(orientation)
+
+    async def _upload_background_for_orientation(self, orientation: Any):
+        form = await request.form()
+        files = await request.files()
+        upload_file = files.get("file")
+        if upload_file is None:
+            return error_response("请选择要上传的背景素材。")
+        normalized_orientation = self._normalize_background_orientation(
+            orientation or request.query.get("orientation") or form.get("orientation"),
+            default="landscape",
+        )
+        if normalized_orientation == "legacy":
+            normalized_orientation = "landscape"
+
+        saved_filename = ""
+        committed = False
+        try:
+            # 原素材/封面处理在锁外；成功后再基于最新配置合并图库。
+            saved_filename = await self._save_background_upload(upload_file)
+            await self._commit_prepared_background(
+                saved_filename, normalized_orientation
+            )
+            committed = True
+        except (Exception, asyncio.CancelledError) as exc:
+            if saved_filename and not committed:
+                with suppress(OSError):
+                    self._resolve_background(saved_filename).unlink()
+                delete_background_cover(self.paths.cover_dir, saved_filename)
+                delete_background_thumbnails(self.paths.thumbnail_dir, saved_filename)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return error_response(str(exc))
+
+        return json_response(
+            self._build_upload_result(saved_filename, normalized_orientation)
+        )
+
+    async def _commit_prepared_background(
+        self, saved_filename: str, normalized_orientation: str
+    ) -> None:
+        """已备素材并入最新图库并保存；新旧上传入口共用，抛错时配置未保存。"""
+
+        async with self._config_lock:
+            config = self._normalize_config(self._public_config())
+            current_key, images_key = self._background_pool_keys(normalized_orientation)
+            background_images = self._append_background_image(
+                config[images_key],
+                saved_filename,
+            )
+            config = {
+                **config,
+                current_key: config.get(current_key) or saved_filename,
+                images_key: background_images,
+            }
+            self.injection_status = ensure_dashboard_injection(self.paths)
+            if config.get(current_key) == saved_filename:
+                config = await run_file_task(
+                    self._with_theme_colors, config, force=True,
+                    orientation=normalized_orientation,
+                )
+            self._save_config(config)
+
+    def _build_upload_result(
+        self, saved_filename: str, normalized_orientation: str
+    ) -> dict[str, Any]:
+        """成功回执读取当前最新配置，不回填过期快照。"""
+
+        return {
+            "message": "背景素材已加入图库。",
+            "background_image": saved_filename,
+            "background_url": self._background_url(saved_filename),
+            "orientation": normalized_orientation,
+            "config": self._public_config(),
+        }
+
+    async def _save_material_with_id(self, reader, background_id: str) -> str:
+        return await save_background_upload(
+            reader, self.paths, background_id=background_id
+        )
+
+    def _candidate_material_filenames(self, material_id: str) -> list[str]:
+        """服务器预生成素材 ID 对应的候选文件名（只属于上传会话）。"""
+
+        prefix = f"background-{material_id}."
+        with suppress(OSError):
+            return [
+                path.name
+                for path in self.paths.background_dir.iterdir()
+                if path.is_file() and path.name.startswith(prefix)
+            ]
+        return []
+
+    def _cleanup_candidate_material(self, material_id: str) -> None:
+        for filename in self._candidate_material_filenames(material_id):
+            with suppress(OSError):
+                (self.paths.background_dir / filename).unlink()
+            delete_background_cover(self.paths.cover_dir, filename)
+            delete_background_thumbnails(self.paths.thumbnail_dir, filename)
+
+    def _find_committed_material(self, material_id: str) -> str:
+        """素材 ID 已被任一正式图库引用且原素材存在时返回文件名，否则空串。"""
+
+        prefix = f"background-{material_id}."
+        config = self._public_config()
+        names = {
+            *config["background_images"],
+            *config["landscape_background_images"],
+            *config["portrait_background_images"],
+            config["background_image"],
+            config["landscape_background_image"],
+            config["portrait_background_image"],
+        }
+        for name in names:
+            if (
+                name
+                and name.startswith(prefix)
+                and self._resolve_background(name).is_file()
+            ):
+                return name
+        return ""
+
+    async def init_chunked_upload(self):
+        payload = await request.json(default={})
+        try:
+            result = await self._uploads.init_session(
+                self._request_username(), payload
+            )
+        except UploadError as exc:
+            return error_response(str(exc))
+        return json_response(result)
+
+    async def upload_chunk(self, upload_id: str, index: str):
+        files = await request.files()
+        upload_file = files.get("file")
+        if upload_file is None:
+            return error_response("请选择要上传的分块。")
+        try:
+            result = await self._uploads.append_chunk(
+                self._request_username(), upload_id, index, upload_file
+            )
+        except UploadError as exc:
+            return error_response(str(exc))
+        return json_response(result)
+
+    async def get_chunked_upload_status(self, upload_id: str):
+        try:
+            result = await self._uploads.get_status(
+                self._request_username(), upload_id
+            )
+        except UploadError as exc:
+            return error_response(str(exc), status_code=404)
+        return json_response(result)
+
+    async def complete_chunked_upload(self, upload_id: str):
+        try:
+            result = await self._uploads.complete(
+                self._request_username(), upload_id
+            )
+        except UploadError as exc:
+            return error_response(str(exc))
+        return json_response(result)
+
+    async def cancel_chunked_upload(self, upload_id: str):
+        try:
+            result = await self._uploads.cancel(
+                self._request_username(), upload_id
+            )
+        except UploadError as exc:
+            return error_response(str(exc))
+        return json_response(result)
+
+    @staticmethod
+    def _request_username() -> str:
+        """会话绑定已鉴权用户身份；测试桩没有 username 时按匿名处理。"""
+
+        return str(getattr(request, "username", "") or "")
+
+    async def terminate(self) -> None:
+        """插件重载/终止时取消在途入库任务并等待真正结束。"""
+
+        await self._uploads.shutdown()
+
+    @_serialized_config_update
+    async def select_background(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("背景素材参数不正确。")
+
+        filename = str(payload.get("background_image") or "").strip()
+        if not filename:
+            return error_response("请选择要切换的背景素材。")
+        orientation = self._normalize_background_orientation(
+            payload.get("orientation"),
+            default="legacy",
+        )
+
+        try:
+            current_key, _ = self._background_pool_keys(orientation)
+            config = self._normalize_config(
+                {
+                    **self._public_config(),
+                    current_key: filename,
+                }
+            )
+            config = self._with_theme_colors(
+                config,
+                force=True,
+                orientation=orientation,
+            )
+            self._save_config(config)
+        except ValueError as exc:
+            return error_response(str(exc))
+
+        return json_response(
+            {
+                "message": "背景素材已切换。",
+                "config": self._public_config(),
+            }
+        )
+
+    @_serialized_config_update
+    async def delete_background(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("背景素材参数不正确。")
+
+        filename = str(payload.get("background_image") or "").strip()
+        if not filename:
+            return error_response("请选择要删除的背景素材。")
+        orientation = self._normalize_background_orientation(
+            payload.get("orientation"),
+            default="legacy",
+        )
+
+        try:
+            config = self._normalize_config(self._public_config())
+            is_known = any(
+                filename in config[self._background_pool_keys(pool)[1]]
+                for pool in BACKGROUND_POOLS
+            )
+            if not is_known:
+                raise ValueError("背景素材不在图库中。")
+
+            target_path = self._resolve_background(filename)
+            with suppress(FileNotFoundError):
+                target_path.unlink()
+            delete_background_thumbnails(self.paths.thumbnail_dir, filename)
+            delete_background_cover(self.paths.cover_dir, filename)
+
+            next_config = {**config}
+            should_refresh_colors = False
+            for pool in BACKGROUND_POOLS:
+                current_key, images_key = self._background_pool_keys(pool)
+                background_images = [
+                    item for item in next_config[images_key] if item != filename
+                ]
+                next_config[images_key] = background_images
+                if next_config[current_key] == filename:
+                    next_config[current_key] = (
+                        background_images[0] if background_images else ""
+                    )
+                    should_refresh_colors = True
+
+            color_warning = ""
+            if should_refresh_colors:
+                try:
+                    next_config = await asyncio.to_thread(
+                        self._with_theme_colors,
+                        next_config,
+                        force=True,
+                        orientation=orientation,
+                    )
+                except ValueError as exc:
+                    # 素材已删除，下一项封面损坏不能阻止清理配置引用。
+                    color_warning = f" 新背景主题色未更新：{exc}"
+            config = next_config
+            self._save_config(config)
+        except ValueError as exc:
+            return error_response(str(exc))
+
+        return json_response(
+            {
+                "message": f"背景素材已删除。{color_warning}",
+                "orientation": orientation,
+                "config": self._public_config(),
+            }
+        )
+
+    @_serialized_config_update
+    async def random_select_background(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        orientation = self._normalize_background_orientation(
+            payload.get("orientation"),
+            default="legacy",
+        )
+        # scheduled 为定时轮换标记：未传时保持手动随机与刷新随机的既有语义。
+        scheduled = self._normalize_bool(payload.get("scheduled"), False)
+        try:
+            config = self._normalize_config(self._public_config())
+            if scheduled and (
+                not config["enabled"] or not config["background_rotation_enabled"]
+            ):
+                return json_response(
+                    {
+                        "message": "定时轮换未开启，保持当前背景。",
+                        "config": self._public_config(),
+                    }
+                )
+            pool, current_background, background_images = self._random_background_pool(
+                config,
+                orientation,
+            )
+
+            if len(background_images) == 1 and current_background == background_images[0]:
+                return json_response(
+                    {
+                        "message": "图库中只有当前背景，无需随机切换。",
+                        "config": self._public_config(),
+                    }
+                )
+
+            candidates = [
+                filename
+                for filename in background_images
+                if filename != current_background
+            ]
+            if not candidates:
+                candidates = background_images
+            selected = random.choice(candidates)
+            current_key, _ = self._background_pool_keys(pool)
+            config = {
+                **config,
+                current_key: selected,
+            }
+            config = self._with_theme_colors(config, force=True, orientation=pool)
+            self._save_config(config)
+        except ValueError as exc:
+            # 定时轮换的异常（如图库为空）按静默失败处理：保留当前配置，等待下一间隔。
+            if scheduled:
+                return json_response(
+                    {
+                        "message": str(exc),
+                        "config": self._public_config(),
+                    }
+                )
+            return error_response(str(exc))
+
+        return json_response(
+            {
+                "message": "背景素材已随机切换。",
+                "orientation": pool,
+                "config": self._public_config(),
+            }
+        )
+
+    @_serialized_config_update
+    async def recalculate_theme_colors(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        orientation = self._normalize_background_orientation(
+            payload.get("orientation") or request.query.get("orientation"),
+            default="legacy",
+        )
+        try:
+            config = self._with_theme_colors(
+                self._normalize_config(self._public_config()),
+                force=True,
+                orientation=orientation,
+            )
+            self._save_config(config)
+        except ValueError as exc:
+            return error_response(str(exc))
+
+        return json_response(
+            {
+                "message": "主题色已重新读取。",
+                "config": self._public_config(),
+            }
+        )
+
+    async def get_background_preview(self):
+        filename = str(
+            request.query.get("filename") or self._config_str("background_image", "")
+        ).strip()
+        if not filename:
+            return json_response(
+                {
+                    "background_image": "",
+                    "data_url": "",
+                }
+            )
+
+        try:
+            path = self._resolve_background(filename, must_exist=True)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=404)
+
+        media_type = probe_media_type(path)
+        # 视频/SVG 不把原文件编成 base64（视频可能上百 MB），改用封面。
+        preview_path = path
+        if media_type in {MEDIA_TYPE_VIDEO, MEDIA_TYPE_SVG, MEDIA_TYPE_ANIMATED}:
+            if media_type == MEDIA_TYPE_ANIMATED:
+                await self._ensure_legacy_cover(path)
+            cover_path = find_cover(self.paths.cover_dir, filename)
+            if cover_path is None:
+                return json_response(
+                    {
+                        "background_image": filename,
+                        "data_url": "",
+                        "media_type": media_type,
+                    }
+                )
+            preview_path = cover_path
+        if preview_path is path:
+            content_type = ALLOWED_BACKGROUND_EXTENSIONS[path.suffix.lower()]
+        else:
+            content_type = cover_content_type(preview_path)
+        data = base64.b64encode(preview_path.read_bytes()).decode("ascii")
+        return json_response(
+            {
+                "background_image": filename,
+                "data_url": f"data:{content_type};base64,{data}",
+                "media_type": media_type,
+            }
+        )
+
+    async def get_background_thumbnail(self):
+        filename = str(
+            request.query.get("filename") or self._config_str("background_image", "")
+        ).strip()
+        if not filename:
+            return json_response(
+                {
+                    "background_image": "",
+                    "data_url": "",
+                }
+            )
+
+        try:
+            path = self._resolve_background(filename, must_exist=True)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=404)
+
+        media_type = probe_media_type(path)
+        thumbnail_source = path
+        if media_type in {MEDIA_TYPE_VIDEO, MEDIA_TYPE_SVG}:
+            # 视频/SVG 无法直接抽帧，缩略图来自封面；无封面时返回空预览，
+            # 由设置页显示类型占位而不是报错。
+            cover_path = find_cover(self.paths.cover_dir, filename)
+            if cover_path is None:
+                return json_response(
+                    {
+                        "background_image": filename,
+                        "content_type": "",
+                        "data_url": "",
+                        "media_type": media_type,
+                    }
+                )
+            thumbnail_source = cover_path
+        try:
+            thumbnail = await asyncio.to_thread(
+                ensure_background_thumbnail,
+                thumbnail_source,
+                self.paths.thumbnail_dir,
+                filename,
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=404)
+
+        data = base64.b64encode(thumbnail.path.read_bytes()).decode("ascii")
+        return json_response(
+            {
+                "background_image": filename,
+                "content_type": thumbnail.content_type,
+                "data_url": f"data:{thumbnail.content_type};base64,{data}",
+                "media_type": media_type,
+            }
+        )
+
+    async def get_token_stats(self):
+        days = self._normalize_stats_days(request.query.get("days"))
+        try:
+            payload = await self._build_token_stats(days)
+        except Exception:
+            return json_response(
+                {
+                    "supported": False,
+                    "days": days,
+                    "totals": self._empty_token_totals(),
+                    "models": [],
+                    "message": "当前 AstrBot 版本暂不支持模型 Token 明细统计。",
+                }
+            )
+        return json_response(payload)
+
+    async def get_background(self, filename: str):
+        try:
+            path = self._resolve_background(filename)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=404)
+
+        if not path.is_file():
+            return error_response("背景素材不存在。", status_code=404)
+
+        content_type = ALLOWED_BACKGROUND_EXTENSIONS[path.suffix.lower()]
+        headers = {
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if path.suffix.lower() == ".svg":
+            # SVG 上传时已清洗；直读地址再加 CSP 双保险，禁止脚本执行。
+            headers["Content-Security-Policy"] = (
+                "sandbox; default-src 'none'; style-src 'unsafe-inline'; "
+                "img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            )
+        return file_response(
+            path,
+            content_type=content_type,
+            headers=headers,
+        )
+
+    async def get_theme_css(self):
+        css = build_theme_css(self._public_config())
+        return stream_response(
+            [css],
+            content_type="text/css; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    def _public_config(self) -> dict[str, Any]:
+        background_image = self._config_str("background_image", "").strip()
+        background_images = self._public_background_images(background_image)
+        if background_image and background_image not in background_images:
+            background_image = ""
+        landscape_background_image = self._config_str(
+            "landscape_background_image",
+            "",
+        ).strip()
+        landscape_background_images = self._public_background_images(
+            landscape_background_image,
+            key="landscape_background_images",
+        )
+        if not landscape_background_images and background_images:
+            landscape_background_images = list(background_images)
+            if not landscape_background_image:
+                landscape_background_image = background_image
+        if landscape_background_image and landscape_background_image not in landscape_background_images:
+            landscape_background_image = ""
+
+        portrait_background_image = self._config_str(
+            "portrait_background_image",
+            "",
+        ).strip()
+        portrait_background_images = self._public_background_images(
+            portrait_background_image,
+            key="portrait_background_images",
+        )
+        if portrait_background_image and portrait_background_image not in portrait_background_images:
+            portrait_background_image = ""
+
+        fallback_background_image = self._select_theme_background(
+            {
+                "background_image": background_image,
+                "landscape_background_image": landscape_background_image,
+                "portrait_background_image": portrait_background_image,
+            }
+        )
+        direction_config = {
+            "background_image": background_image,
+            "landscape_background_image": landscape_background_image,
+            "portrait_background_image": portrait_background_image,
+        }
+
+        return {
+            "enabled": self._config_bool("enabled", True),
+            "dynamic_background_enabled": self._config_bool(
+                "dynamic_background_enabled",
+                True,
+            ),
+            "background_image": background_image,
+            "background_images": background_images,
+            "background_items": [
+                self._background_item(filename, filename == background_image)
+                for filename in background_images
+            ],
+            "landscape_background_image": landscape_background_image,
+            "landscape_background_images": landscape_background_images,
+            "landscape_background_items": [
+                self._background_item(filename, filename == landscape_background_image)
+                for filename in landscape_background_images
+            ],
+            "portrait_background_image": portrait_background_image,
+            "portrait_background_images": portrait_background_images,
+            "portrait_background_items": [
+                self._background_item(filename, filename == portrait_background_image)
+                for filename in portrait_background_images
+            ],
+            "background_fit": self._config_str("background_fit", "cover"),
+            "background_position": self._config_str(
+                "background_position",
+                "center center",
+            ),
+            "background_blur": self._config_int("background_blur", 0),
+            "background_dim": self._config_float("background_dim", 0.5),
+            "surface_opacity": self._config_float("surface_opacity", 0.0),
+            "stats_card_blur": self._config_int("stats_card_blur", 14),
+            # 公开配置统一规范化到 0~40：原生配置入口可能写入越界
+            # 值，运行时 CSS 按同一口径夹取，展示层不能原样透传。
+            "mobile_sidebar_glass": self._normalize_mobile_sidebar_glass(
+                self.config.get("mobile_sidebar_glass", 18)
+            ),
+            "text_enhancement_mode": self._config_str(
+                "text_enhancement_mode",
+                "soft_shadow",
+            ),
+            "text_enhancement_strength": self._config_float(
+                "text_enhancement_strength",
+                1.0,
+            ),
+            "background_grayscale": self._config_float("background_grayscale", 0.0),
+            "background_brightness": self._config_float(
+                "background_brightness",
+                1.0,
+            ),
+            "background_contrast": self._config_float("background_contrast", 1.0),
+            "background_saturation": self._config_float(
+                "background_saturation",
+                1.0,
+            ),
+            "random_background_on_load": self._config_bool(
+                "random_background_on_load",
+                False,
+            ),
+            "background_rotation_enabled": self._config_bool(
+                "background_rotation_enabled",
+                False,
+            ),
+            # 公开配置统一规范化：AstrBot 原生配置渲染器不读取
+            # minimum/maximum，越界值可能经原生入口写入；运行时按
+            # 1~1440 夹取执行，展示层必须返回同一口径。
+            "background_rotation_interval_minutes": self._normalize_rotation_interval(
+                self.config.get("background_rotation_interval_minutes", 30)
+            ),
+            "auto_theme_enabled": self._config_bool("auto_theme_enabled", True),
+            "detailed_token_stats_enabled": self._config_bool(
+                "detailed_token_stats_enabled",
+                False,
+            ),
+            "theme_primary": normalize_hex_color(
+                self._config_str("theme_primary", "")
+            ),
+            "theme_secondary": normalize_hex_color(
+                self._config_str("theme_secondary", "")
+            ),
+            "advanced_css": self._config_str("advanced_css", ""),
+            "background_url": self._background_url(background_image),
+            "landscape_background_url": self._background_url(
+                self._select_direction_background(direction_config, "landscape")
+            ),
+            "portrait_background_url": self._background_url(
+                self._select_direction_background(direction_config, "portrait")
+            ),
+            "fallback_background_url": self._background_url(fallback_background_image),
+            "background_media": self._background_media_info(background_image),
+            "landscape_background_media": self._background_media_info(
+                self._select_direction_background(direction_config, "landscape")
+            ),
+            "portrait_background_media": self._background_media_info(
+                self._select_direction_background(direction_config, "portrait")
+            ),
+            "fallback_background_media": self._background_media_info(
+                fallback_background_image
+            ),
+        }
+
+    def _config_bool(self, key: str, default: bool) -> bool:
+        value = self.config.get(key, default)
+        return value if isinstance(value, bool) else default
+
+    def _config_str(self, key: str, default: str) -> str:
+        value = self.config.get(key, default)
+        return value if isinstance(value, str) else default
+
+    def _config_int(self, key: str, default: int) -> int:
+        value = self.config.get(key, default)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return default
+
+    def _config_float(self, key: str, default: float) -> float:
+        value = self.config.get(key, default)
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int | float):
+            return float(value)
+        return default
+
+    def _normalize_config(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        current = self._public_config()
+        background_images = self._normalize_background_images(
+            payload.get("background_images", current["background_images"])
+        )
+        background_image = str(
+            payload.get("background_image", current["background_image"]) or ""
+        ).strip()
+        if background_image:
+            self._resolve_background(background_image, must_exist=True)
+            background_images = self._append_background_image(
+                background_images,
+                background_image,
+            )
+
+        landscape_background_images = self._normalize_background_images(
+            payload.get(
+                "landscape_background_images",
+                current["landscape_background_images"],
+            )
+        )
+        landscape_background_image = str(
+            payload.get(
+                "landscape_background_image",
+                current["landscape_background_image"],
+            )
+            or ""
+        ).strip()
+        if landscape_background_image:
+            self._resolve_background(landscape_background_image, must_exist=True)
+            landscape_background_images = self._append_background_image(
+                landscape_background_images,
+                landscape_background_image,
+            )
+
+        portrait_background_images = self._normalize_background_images(
+            payload.get(
+                "portrait_background_images",
+                current["portrait_background_images"],
+            )
+        )
+        portrait_background_image = str(
+            payload.get(
+                "portrait_background_image",
+                current["portrait_background_image"],
+            )
+            or ""
+        ).strip()
+        if portrait_background_image:
+            self._resolve_background(portrait_background_image, must_exist=True)
+            portrait_background_images = self._append_background_image(
+                portrait_background_images,
+                portrait_background_image,
+            )
+
+        background_fit = str(
+            payload.get("background_fit", current["background_fit"]) or "cover"
+        ).strip()
+        if background_fit not in {"cover", "contain", "auto", "stretch"}:
+            raise ValueError("背景填充方式不正确。")
+
+        background_position = str(
+            payload.get("background_position", current["background_position"])
+            or "center center"
+        ).strip()
+        if not background_position or len(background_position) > 80:
+            raise ValueError("背景位置不正确。")
+
+        text_enhancement_mode = str(
+            payload.get(
+                "text_enhancement_mode",
+                current["text_enhancement_mode"],
+            )
+            or "soft_shadow"
+        ).strip()
+        if text_enhancement_mode not in {"off", "soft_shadow", "stroke"}:
+            raise ValueError("文字增强模式不正确。")
+
+        theme_primary = normalize_hex_color(
+            payload.get("theme_primary", current["theme_primary"])
+        )
+        theme_secondary = normalize_hex_color(
+            payload.get("theme_secondary", current["theme_secondary"])
+        )
+
+        return {
+            "enabled": self._normalize_bool(
+                payload.get("enabled", current["enabled"]),
+                current["enabled"],
+            ),
+            "dynamic_background_enabled": self._normalize_bool(
+                payload.get(
+                    "dynamic_background_enabled",
+                    current["dynamic_background_enabled"],
+                ),
+                current["dynamic_background_enabled"],
+            ),
+            "background_image": background_image,
+            "background_images": background_images,
+            "landscape_background_image": landscape_background_image,
+            "landscape_background_images": landscape_background_images,
+            "portrait_background_image": portrait_background_image,
+            "portrait_background_images": portrait_background_images,
+            "background_fit": background_fit,
+            "background_position": background_position,
+            "background_blur": self._clamp_int(
+                payload.get("background_blur", current["background_blur"]),
+                0,
+                40,
+            ),
+            "background_dim": self._clamp_float(
+                payload.get("background_dim", current["background_dim"]),
+                0.0,
+                0.95,
+            ),
+            "surface_opacity": self._clamp_float(
+                payload.get("surface_opacity", current["surface_opacity"]),
+                0.0,
+                1.0,
+            ),
+            "stats_card_blur": self._clamp_int(
+                payload.get("stats_card_blur", current["stats_card_blur"]),
+                0,
+                40,
+            ),
+            "mobile_sidebar_glass": self._normalize_mobile_sidebar_glass(
+                payload.get("mobile_sidebar_glass", current["mobile_sidebar_glass"]),
+            ),
+            "text_enhancement_mode": text_enhancement_mode,
+            "text_enhancement_strength": self._clamp_float(
+                payload.get(
+                    "text_enhancement_strength",
+                    current["text_enhancement_strength"],
+                ),
+                0.0,
+                1.0,
+            ),
+            "background_grayscale": self._clamp_float(
+                payload.get("background_grayscale", current["background_grayscale"]),
+                0.0,
+                1.0,
+            ),
+            "background_brightness": self._clamp_float(
+                payload.get(
+                    "background_brightness",
+                    current["background_brightness"],
+                ),
+                0.5,
+                1.5,
+            ),
+            "background_contrast": self._clamp_float(
+                payload.get("background_contrast", current["background_contrast"]),
+                0.5,
+                1.5,
+            ),
+            "background_saturation": self._clamp_float(
+                payload.get(
+                    "background_saturation",
+                    current["background_saturation"],
+                ),
+                0.0,
+                2.0,
+            ),
+            "random_background_on_load": self._normalize_bool(
+                payload.get(
+                    "random_background_on_load",
+                    current["random_background_on_load"],
+                ),
+                current["random_background_on_load"],
+            ),
+            "background_rotation_enabled": self._normalize_bool(
+                payload.get(
+                    "background_rotation_enabled",
+                    current["background_rotation_enabled"],
+                ),
+                current["background_rotation_enabled"],
+            ),
+            "background_rotation_interval_minutes": self._normalize_rotation_interval(
+                payload.get(
+                    "background_rotation_interval_minutes",
+                    current["background_rotation_interval_minutes"],
+                )
+            ),
+            "auto_theme_enabled": self._normalize_bool(
+                payload.get("auto_theme_enabled", current["auto_theme_enabled"]),
+                current["auto_theme_enabled"],
+            ),
+            "detailed_token_stats_enabled": self._normalize_bool(
+                payload.get(
+                    "detailed_token_stats_enabled",
+                    current["detailed_token_stats_enabled"],
+                ),
+                current["detailed_token_stats_enabled"],
+            ),
+            "theme_primary": theme_primary,
+            "theme_secondary": theme_secondary,
+            "advanced_css": self._normalize_advanced_css(
+                payload.get("advanced_css", current["advanced_css"])
+            ),
+        }
+
+    def _ensure_config_for_existing_background(self) -> None:
+        with suppress(ValueError):
+            public_config = self._public_config()
+            current = self._normalize_config(public_config)
+            config = self._with_theme_colors(current)
+            raw_background_images = self.config.get("background_images", [])
+            raw_landscape_images = self.config.get("landscape_background_images", [])
+            raw_portrait_images = self.config.get("portrait_background_images", [])
+            if (
+                config != current
+                or raw_background_images != config["background_images"]
+                or raw_landscape_images != config["landscape_background_images"]
+                or raw_portrait_images != config["portrait_background_images"]
+            ):
+                self._save_config(config)
+
+    def _with_theme_colors(
+        self,
+        config: dict[str, Any],
+        *,
+        force: bool = False,
+        orientation: str | None = None,
+    ) -> dict[str, Any]:
+        filename = self._select_theme_background(config, orientation=orientation)
+        if not filename:
+            if force:
+                config = {**config, "theme_primary": "", "theme_secondary": ""}
+            return config
+
+        if (
+            not force
+            and normalize_hex_color(config.get("theme_primary"))
+            and normalize_hex_color(config.get("theme_secondary"))
+        ):
+            return config
+
+        color_source = self._theme_color_source(filename)
+        if color_source is None:
+            if force:
+                raise ValueError(
+                    "该素材暂无封面，无法提取主题色；"
+                    "请在设置页重新上传以生成封面。"
+                )
+            return config
+        if Path(filename).suffix.lower() in {".mp4", ".webm", ".svg"}:
+            colors = extract_theme_colors(color_source, strict=True)
+        else:
+            colors = extract_theme_colors(color_source)
+        return {
+            **config,
+            **colors.to_dict(),
+        }
+
+    def _theme_color_source(self, filename: str) -> Path | None:
+        """优先用持久化代表画面，旧图片无封面时继续使用原文件。"""
+
+        path = self._resolve_background(filename, must_exist=True)
+        if probe_media_type(path) in {MEDIA_TYPE_VIDEO, MEDIA_TYPE_SVG}:
+            return find_cover(self.paths.cover_dir, filename)
+        return find_cover(self.paths.cover_dir, filename) or path
+
+    def _save_config(self, config: dict[str, Any]) -> None:
+        if hasattr(self.config, "save_config"):
+            self.config.save_config(config)  # type: ignore[attr-defined]
+            return
+        if isinstance(self.config, MutableMapping):
+            self.config.clear()
+            self.config.update(config)
+            return
+        self.config = config
+
+    async def _save_background_upload(self, upload_file) -> str:
+        return await save_background_upload(upload_file, self.paths)
+
+    async def get_background_cover(self):
+        """读取素材封面（运行时静态兜底与设置页预览共用）。"""
+
+        filename = str(request.query.get("filename") or "").strip()
+        if not filename:
+            return error_response("请选择要读取的封面。", status_code=404)
+        try:
+            # 封面只服务仍存在的素材；旧动图在首次读取时补生成。
+            path = self._resolve_background(filename, must_exist=True)
+            await self._ensure_legacy_cover(path)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=404)
+        cover_path = find_cover(self.paths.cover_dir, filename)
+        if cover_path is None:
+            return error_response("该素材还没有封面。", status_code=404)
+        return file_response(
+            cover_path,
+            content_type=cover_content_type(cover_path),
+            headers={
+                "Cache-Control": "private, max-age=300",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def _ensure_legacy_cover(self, path: Path) -> None:
+        # 旧动图无需重新上传；首次请求封面时生成并持久化代表帧。
+        if find_cover(self.paths.cover_dir, path.name) is None and probe_media_type(path) == MEDIA_TYPE_ANIMATED:
+            cover = await asyncio.to_thread(build_cover_from_animated_image, path)
+            await asyncio.to_thread(save_cover_image, cover, self.paths.cover_dir, path.name)
+
+    def _resolve_background(self, filename: str, *, must_exist: bool = False) -> Path:
+        path = self.paths.resolve_background_file(filename)
+        if path.suffix.lower() not in ALLOWED_BACKGROUND_EXTENSIONS:
+            raise ValueError("背景素材文件类型不受支持。")
+        if must_exist and not path.is_file():
+            raise ValueError("背景素材不存在，请重新上传。")
+        return path
+
+    def _background_url(self, filename: str) -> str:
+        filename = filename.strip()
+        if not filename:
+            return ""
+        return (
+            f"/api/v1/plugins/extensions/{PLUGIN_NAME}/backgrounds/"
+            f"{quote(filename)}"
+        )
+
+    def _background_preview_url(self, filename: str) -> str:
+        filename = filename.strip()
+        if not filename:
+            return ""
+        return (
+            f"/api/v1/plugins/extensions/{PLUGIN_NAME}/background-preview"
+            f"?filename={quote(filename)}"
+        )
+
+    def _background_thumbnail_url(self, filename: str) -> str:
+        filename = filename.strip()
+        if not filename:
+            return ""
+        return (
+            f"/api/v1/plugins/extensions/{PLUGIN_NAME}/background-thumbnail"
+            f"?filename={quote(filename)}"
+        )
+
+    def _background_item(self, filename: str, selected: bool) -> dict[str, Any]:
+        media = self._background_media_info(filename)
+        size_bytes = 0
+        with suppress(OSError):
+            size_bytes = self._resolve_background(filename).stat().st_size
+        return {
+            "filename": filename,
+            "url": self._background_url(filename),
+            "thumbnail_url": self._background_thumbnail_url(filename),
+            "preview_url": self._background_preview_url(filename),
+            "media_type": media["media_type"],
+            "animated": media["animated"],
+            "cover_url": media["cover_url"],
+            "size_bytes": size_bytes,
+            "selected": selected,
+        }
+
+    def _background_media_info(self, filename: str) -> dict[str, Any]:
+        """公开配置中素材的播放相关信息；无素材时全部为空。"""
+
+        filename = filename.strip()
+        if not filename:
+            return {"media_type": "", "animated": False, "cover_url": ""}
+        animated = False
+        with suppress(ValueError):
+            path = self._resolve_background(filename, must_exist=True)
+            animated = is_animated_image(path)
+        return {
+            "media_type": media_type_for_filename(filename, animated=animated),
+            "animated": animated,
+            "cover_url": self._background_cover_url(filename),
+        }
+
+    def _background_cover_url(self, filename: str) -> str:
+        filename = filename.strip()
+        if not filename:
+            return ""
+        if find_cover(self.paths.cover_dir, filename) is None:
+            if probe_media_type(self._resolve_background(filename)) != MEDIA_TYPE_ANIMATED:
+                return ""
+        return (
+            f"/api/v1/plugins/extensions/{PLUGIN_NAME}/background-cover"
+            f"?filename={quote(filename)}"
+        )
+
+    def _public_background_images(
+        self,
+        current_background: str,
+        *,
+        key: str = "background_images",
+    ) -> list[str]:
+        background_images = self._normalize_background_images(
+            self.config.get(key, [])
+        )
+        if current_background:
+            with suppress(ValueError):
+                self._resolve_background(current_background, must_exist=True)
+                background_images = self._append_background_image(
+                    background_images,
+                    current_background,
+                )
+        return background_images
+
+    def _normalize_background_images(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+
+        background_images: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            filename = item.strip()
+            if not filename or filename in background_images:
+                continue
+            with suppress(ValueError):
+                self._resolve_background(filename, must_exist=True)
+                background_images.append(filename)
+        return background_images
+
+    @staticmethod
+    def _append_background_image(
+        background_images: list[str],
+        filename: str,
+    ) -> list[str]:
+        filename = filename.strip()
+        if not filename or filename in background_images:
+            return list(background_images)
+        return [*background_images, filename]
+
+    @staticmethod
+    def _normalize_background_orientation(value: Any, *, default: str) -> str:
+        if isinstance(value, str):
+            orientation = value.strip().lower()
+            if orientation in BACKGROUND_POOLS:
+                return orientation
+        return default
+
+    @staticmethod
+    def _background_pool_keys(orientation: str) -> tuple[str, str]:
+        if orientation == "landscape":
+            return "landscape_background_image", "landscape_background_images"
+        if orientation == "portrait":
+            return "portrait_background_image", "portrait_background_images"
+        return "background_image", "background_images"
+
+    @staticmethod
+    def _select_theme_background(
+        config: Mapping[str, Any],
+        orientation: str | None = None,
+    ) -> str:
+        if orientation in BACKGROUND_ORIENTATIONS:
+            filename = PalettePlugin._select_direction_background(config, orientation)
+            if filename:
+                return filename
+        if orientation == "legacy":
+            legacy_filename = str(config.get("background_image") or "").strip()
+            if legacy_filename:
+                return legacy_filename
+        for key in (
+            "landscape_background_image",
+            "portrait_background_image",
+            "background_image",
+        ):
+            filename = str(config.get(key) or "").strip()
+            if filename:
+                return filename
+        return ""
+
+    @staticmethod
+    def _select_direction_background(
+        config: Mapping[str, Any],
+        orientation: str,
+    ) -> str:
+        if orientation == "portrait":
+            keys = (
+                "portrait_background_image",
+                "background_image",
+                "landscape_background_image",
+            )
+        else:
+            keys = (
+                "landscape_background_image",
+                "background_image",
+                "portrait_background_image",
+            )
+        for key in keys:
+            filename = str(config.get(key) or "").strip()
+            if filename:
+                return filename
+        return ""
+
+    def _random_background_pool(
+        self,
+        config: Mapping[str, Any],
+        orientation: str,
+    ) -> tuple[str, str, list[str]]:
+        if orientation == "landscape":
+            ordered = ("landscape", "legacy", "portrait")
+        elif orientation == "portrait":
+            ordered = ("portrait", "legacy", "landscape")
+        else:
+            ordered = ("legacy", "landscape", "portrait")
+
+        for pool in ordered:
+            current_key, images_key = self._background_pool_keys(pool)
+            images = list(config.get(images_key) or [])
+            if images:
+                return pool, str(config.get(current_key) or "").strip(), images
+        raise ValueError("图库中还没有可随机的背景素材。")
+
+    async def _build_token_stats(self, days: int) -> dict[str, Any]:
+        from astrbot.core.db.po import ProviderStat
+
+        db = self.context.get_db()
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        now_local = datetime.now(local_tz)
+        range_start_local = (now_local - timedelta(days=days)).replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        query_start_utc = range_start_local.astimezone(timezone.utc)
+
+        async with db.get_db() as session:
+            result = await session.execute(
+                select(ProviderStat)
+                .where(
+                    ProviderStat.agent_type == "internal",
+                    ProviderStat.created_at >= query_start_utc,
+                )
+                .order_by(col(ProviderStat.created_at).desc())
+            )
+            records = result.scalars().all()
+
+        totals = self._empty_token_totals()
+        models: dict[str, dict[str, Any]] = defaultdict(self._empty_model_token_row)
+        for record in records:
+            provider_id = str(record.provider_id or "unknown")
+            provider_model = str(record.provider_model or "Unknown")
+            model_key = f"{provider_id}::{provider_model}"
+            input_tokens = int(record.token_input_other or 0)
+            cached_tokens = int(record.token_input_cached or 0)
+            output_tokens = int(record.token_output or 0)
+
+            row = models[model_key]
+            row["model_key"] = model_key
+            row["provider_id"] = provider_id
+            row["provider_model"] = provider_model
+            row["input_tokens"] += input_tokens
+            row["cached_tokens"] += cached_tokens
+            row["output_tokens"] += output_tokens
+            row["total_tokens"] += input_tokens + cached_tokens + output_tokens
+            row["calls"] += 1
+
+            totals["input_tokens"] += input_tokens
+            totals["cached_tokens"] += cached_tokens
+            totals["output_tokens"] += output_tokens
+            totals["total_tokens"] += input_tokens + cached_tokens + output_tokens
+            totals["calls"] += 1
+
+        for row in models.values():
+            row["cache_hit_rate"] = self._cache_hit_rate(
+                row["input_tokens"],
+                row["cached_tokens"],
+            )
+        totals["cache_hit_rate"] = self._cache_hit_rate(
+            totals["input_tokens"],
+            totals["cached_tokens"],
+        )
+
+        return {
+            "supported": True,
+            "days": days,
+            "totals": totals,
+            "models": sorted(
+                models.values(),
+                key=lambda item: item["total_tokens"],
+                reverse=True,
+            ),
+        }
+
+    @staticmethod
+    def _normalize_stats_days(value: Any) -> int:
+        try:
+            days = int(value)
+        except (TypeError, ValueError):
+            days = 1
+        return days if days in {1, 3, 7} else 1
+
+    @staticmethod
+    def _empty_token_totals() -> dict[str, int | float]:
+        return {
+            "input_tokens": 0,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "calls": 0,
+            "cache_hit_rate": 0.0,
+        }
+
+    @staticmethod
+    def _empty_model_token_row() -> dict[str, Any]:
+        return {
+            "model_key": "",
+            "provider_id": "unknown",
+            "provider_model": "Unknown",
+            "input_tokens": 0,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "calls": 0,
+            "cache_hit_rate": 0.0,
+        }
+
+    @staticmethod
+    def _cache_hit_rate(input_tokens: int, cached_tokens: int) -> float:
+        denominator = input_tokens + cached_tokens
+        if denominator <= 0:
+            return 0.0
+        return cached_tokens / denominator
+
+    @staticmethod
+    def _normalize_bool(value: Any, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off", ""}:
+                return False
+        if isinstance(value, int) and value in {0, 1}:
+            return bool(value)
+        return default
+
+    @staticmethod
+    def _normalize_rotation_interval(value: Any) -> int:
+        """轮换间隔分钟数：无效值回退默认 30，有效值限制到 1~1440。"""
+
+        if isinstance(value, bool):
+            return 30
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return 30
+        return min(max(number, 1), 1440)
+
+    @staticmethod
+    def _normalize_mobile_sidebar_glass(value: Any) -> int:
+        """移动端侧栏毛玻璃强度：无效值回退默认 18，有效值限制到 0~40。"""
+
+        if isinstance(value, bool):
+            return 18
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return 18
+        return min(max(number, 0), 40)
+
+    @staticmethod
+    def _clamp_int(value: Any, minimum: int, maximum: int) -> int:
+        if isinstance(value, bool):
+            return minimum
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return minimum
+        return min(max(number, minimum), maximum)
+
+    @staticmethod
+    def _clamp_float(value: Any, minimum: float, maximum: float) -> float:
+        if isinstance(value, bool):
+            return minimum
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return minimum
+        return min(max(number, minimum), maximum)
+
+    @staticmethod
+    def _normalize_advanced_css(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return value[:20000]

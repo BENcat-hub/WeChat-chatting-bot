@@ -1,0 +1,224 @@
+"""汇率模块。
+
+维护一份以 USD 为基准的汇率表（``1 USD = rate 单位货币X``），提供纯函数
+:func:`convert` 做任意货币间换算，以及异步 :func:`sync_rates` 从免费 API
+（``open.er-api.com``，无需 key）刷新本地汇率。
+
+设计要点：
+
+- **USD 锚定**：内置 ``DEFAULT_PRICING`` 与历史用户定价均以 USD 计价，汇率表以
+  USD 为锚存储，主货币切换时不需改汇率表，只需交叉换算。
+- **本地优先**：汇率存在插件 ``config.json``（由 ``config.py`` 持久化），
+  仅在用户于设置页点「立即同步」时联网刷新；无网时用内置静态表兜底，不阻断。
+- **纯函数换算**：:func:`convert` 不依赖任何 IO，便于单测。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from datetime import UTC, datetime
+from typing import Any
+
+# 内置静态汇率表（1 USD = rate 单位货币X），随版本更新。
+# 作为首次启动与无网兜底；数值仅供参考，精度不保证。
+DEFAULT_RATES: dict[str, float] = {
+    "USD": 1.0,
+    "CNY": 7.2,
+    "EUR": 0.92,
+    "GBP": 0.79,
+    "JPY": 150.0,
+    "KRW": 1350.0,
+    "INR": 83.0,
+    "HKD": 7.8,
+    "SGD": 1.35,
+    "TWD": 32.0,
+    "RUB": 90.0,
+    "BRL": 5.0,
+}
+
+# 货币代码 → 显示符号（用于文案/前端展示）。
+CURRENCY_SYMBOLS: dict[str, str] = {
+    "USD": "$",
+    "CNY": "¥",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+    "KRW": "₩",
+    "INR": "₹",
+    "HKD": "HK$",
+    "SGD": "S$",
+    "TWD": "NT$",
+    "RUB": "₽",
+    "BRL": "R$",
+}
+
+
+def currency_to_symbol(code: str | None) -> str:
+    """货币代码 → 显示符号，未知代码回退代码本身。"""
+    c = str(code or "").strip().upper()
+    return CURRENCY_SYMBOLS.get(c, c or "$")
+
+
+# 免费汇率 API（无需 key，返回各货币对 USD 汇率）。
+_RATES_API = "https://open.er-api.com/v6/latest/USD"
+
+
+def convert(
+    amount: float,
+    from_cur: str,
+    to_cur: str,
+    rates: dict[str, float] | None,
+) -> float:
+    """把 ``amount`` 从 ``from_cur`` 换算到 ``to_cur``（经 USD 中转，纯函数）。
+
+    换算公式：``amount × (rate_to / rate_from)``。
+
+    兜底策略（任一货币不在 rates / DEFAULT_RATES 中，或汇率非法 / <=0）：
+    返回原值——绝不把未知货币隐式当作 USD（rate=1），否则用非内置货币
+    （VND/CAD 等）定价的成本会被再乘目标汇率、虚增数个数量级。
+    同货币直接返回原值。
+
+    Args:
+        amount: 待换算金额。
+        from_cur: 源货币代码（如 ``"USD"``）。
+        to_cur: 目标货币代码（如 ``"CNY"``）。
+        rates: 生效汇率表（来自 config）；为空时回退 DEFAULT_RATES。
+
+    Returns:
+        换算后的金额（float）。
+    """
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if not math.isfinite(amount):
+        return 0.0
+    fc = str(from_cur or "").strip().upper()
+    tc = str(to_cur or "").strip().upper()
+    if not fc or not tc or fc == tc:
+        return amount
+    tbl = rates if rates else DEFAULT_RATES
+    r_from = _lookup_rate(fc, tbl)
+    r_to = _lookup_rate(tc, tbl)
+    if r_from is None or r_from <= 0 or r_to is None or r_to <= 0:
+        return amount  # 任一货币缺汇率，返回原值
+    return round(amount * (r_to / r_from), 8)
+
+
+def _lookup_rate(cur: str, rates: dict[str, float]) -> float | None:
+    """查某货币汇率：rates 优先 → DEFAULT_RATES；缺失或非法返回 ``None``。
+
+    不兜底 1.0——``None`` 让 :func:`convert` 把「查不到」与「无汇率」归一为
+    返回原值，而不是把未知货币隐式当作 USD。
+    """
+    v = rates.get(cur)
+    if v is None:
+        v = DEFAULT_RATES.get(cur)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) and f > 0 else None
+
+
+def get_main_currency(cfg: Any) -> str:
+    """读取主货币代码（默认 ``"USD"``）。
+
+    兼容历史 ``"$"`` 值——自动归一化为 ``"USD"``。
+    """
+    raw = cfg.get("currency_symbol") if isinstance(cfg, dict) else None
+    cur = str(raw or "USD").strip().upper()
+    if cur in ("$", "＄", "USD"):
+        return "USD"
+    return cur
+
+
+def get_rates(cfg: Any) -> dict[str, float]:
+    """读取生效汇率表（合并 config 与 DEFAULT_RATES，config 优先）。"""
+    raw = cfg.get("exchange_rates") if isinstance(cfg, dict) else None
+    out: dict[str, float] = dict(DEFAULT_RATES)
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                value = float(v)
+            except (TypeError, ValueError):
+                continue
+            code = str(k).strip().upper()
+            if code and math.isfinite(value) and value > 0:
+                out[code] = value
+    out["USD"] = 1.0
+    return out
+
+
+def get_rate_updated_at(cfg: Any) -> str:
+    """读取汇率最近同步时间（ISO，空=未同步过）。"""
+    if isinstance(cfg, dict):
+        return str(cfg.get("exchange_rates_updated_at") or "")
+    return ""
+
+
+async def sync_rates(timeout: float = 10.0) -> tuple[dict[str, float], str, str]:
+    """从免费 API 同步最新汇率，返回 (rates, updated_at, error)。
+
+    调用 ``open.er-api.com/v6/latest/USD``，解析 ``rates`` 字段。成功返回
+    更新后的汇率表与当前 UTC 时间；失败返回 ``(DEFAULT_RATES, "", errmsg)``。
+
+    本函数只负责取数与解析，不写 config（由调用方持久化）。阻塞的
+    urllib 请求在线程中执行（本函数跑在事件循环上，「立即同步」点击
+    期间不能卡住整个 bot）。
+
+    Args:
+        timeout: 请求超时秒数。
+
+    Returns:
+        ``(rates, updated_at, error)``。error 非空表示失败（此时 rates 为静态表）。
+    """
+    import asyncio
+
+    return await asyncio.to_thread(_sync_rates_blocking, timeout)
+
+
+def _sync_rates_blocking(timeout: float) -> tuple[dict[str, float], str, str]:
+    """:func:`sync_rates` 的同步实现（仅可在工作线程中调用）。"""
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            _RATES_API, headers={"Accept": "application/json", "User-Agent": "cost-control/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8"))
+        raw_rates = data.get("rates") if isinstance(data, dict) else None
+        if not isinstance(raw_rates, dict) or "USD" not in raw_rates:
+            return dict(DEFAULT_RATES), "", "汇率 API 返回数据格式异常"
+        # 保留数值型，过滤非法
+        rates: dict[str, float] = {}
+        for k, v in raw_rates.items():
+            try:
+                value = float(v)
+            except (TypeError, ValueError):
+                continue
+            code = str(k).strip().upper()
+            if code and math.isfinite(value) and value > 0:
+                rates[code] = value
+        if not any(code != "USD" for code in rates):
+            return dict(DEFAULT_RATES), "", "汇率 API 未返回有效汇率"
+        # 确保基准 USD=1.0
+        rates["USD"] = 1.0
+        updated_at = datetime.now(UTC).isoformat()
+        return rates, updated_at, ""
+    except Exception as e:
+        return dict(DEFAULT_RATES), "", str(e)
+
+
+__all__ = [
+    "DEFAULT_RATES",
+    "convert",
+    "get_main_currency",
+    "get_rates",
+    "get_rate_updated_at",
+    "sync_rates",
+]

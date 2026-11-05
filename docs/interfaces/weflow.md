@@ -204,3 +204,17 @@
 ---
 
 **未确认清单（不得当作结论）**：SNS 系列各端点参数/响应字段；`/api/v1/contacts`、`/api/v1/group-members` 的完整字段；语音附件的 HTTP 暴露情况；WeFlow 是否严格只读访问微信库；微信版本号是否有硬校验。
+
+## 8. 2026-11-04 复活记录（5.0 源码树 + 沙箱下的启动姿势）
+
+2026-11-03 的误删把 `weflow/node_modules` 与 `dist-electron` 带走了，只剩源码。恢复步骤（都实测过）：
+
+1. `dist-electron/` 从 10-29 分享包补回（`main.js` 1.5MB，10-16 构建产物）。
+2. `npm ci --ignore-scripts`（546 包）。镜像 TLS 被 Watt Toolkit 中间人，需要 `NODE_TLS_REJECT_UNAUTHORIZED=0`；直接 `npm ci` 会挂在 `ffmpeg-static` 的 GitHub 下载。
+3. `ffmpeg-static` 的二进制从 6.3.2 的 `resources\app.asar.unpacked\node_modules\ffmpeg-static\ffmpeg.exe` 拷过来（82MB）。
+4. electron 43 走本地缓存：`ELECTRON_CACHE=%LOCALAPPDATA%\electron\Cache`，并且 **`TEMP` 必须指到工作区**（系统 Temp 的 `mkdtemp` 是 EPERM）。
+5. 启动：`node_modules\electron\dist\electron.exe . --no-sandbox`，**`ELECTRON_RUN_AS_NODE` 必须真正清掉**（设成空串也算设置，会撞 `Assertion failed: (isolate_data->snapshot_data()) != nullptr`），**不要加 `--enable-logging`**（同样触发该断言）。
+
+`wcdb_api.dll` 已经是打过补丁的版本（`0x80dc1` = `7F CD 6E 7F` ≈ 2037-09，`.pristine` 是原件），所以不需要重装 6.3.2 —— 6.3.2 那份混淆 DLL 本来也修不了。
+
+DSH 沙箱下（只有工作区可写）额外需要 `--user-data-dir` 指向一份**完整镜像**的 `%APPDATA%\weflow`：缺 `Local State` 会导致 `safe:` 字段解不开，表现为「请先在设置页面配置解密密钥 / httpApiToken not configured」。镜像只读不写真实配置，微信数据库始终原样。

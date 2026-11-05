@@ -15,8 +15,11 @@ synthetic events, which is the part MCP cannot do (its latch is what used to sti
 import ctypes
 import json
 import ctypes.wintypes as wt
+import logging
 import os
 import time
+
+log = logging.getLogger("wxui")
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -117,6 +120,146 @@ def human_busy(window=_HUMAN_WINDOW):
     return idle > since_own + 0.15
 
 
+def wait_for_human_idle(need_s=1.6, max_wait_s=180.0, poll_s=0.4, on_wait=None):
+    """等人停手再动桌面（2026-11-03 用户要求：我在用键鼠时别抢鼠标）。
+
+    返回 `(ok, waited_s)`：`ok=True` 表示已经连续 `need_s` 秒没有人碰键鼠，可以开干；
+    `ok=False` 表示等到 `max_wait_s` 人还在用，调用方该把这条消息延期而不是硬抢。
+
+    判据用两条一起看：`_idle_seconds()`（系统级空闲）≥ need_s，且 `human_busy()`
+    为假（后者会排除我们自己刚投出去的合成事件，否则每次发完都会被自己判成"有人在用"）。
+    """
+    try:
+        need_s = max(0.0, float(need_s))
+        max_wait_s = max(0.0, float(max_wait_s))
+        poll_s = max(0.05, float(poll_s))
+    except (TypeError, ValueError):
+        need_s, max_wait_s, poll_s = 1.6, 180.0, 0.4
+    if not human_busy() and _idle_seconds() >= need_s:
+        return True, 0.0
+    t0 = time.monotonic()
+    announced = False
+    while time.monotonic() - t0 < max_wait_s:
+        if not human_busy() and _idle_seconds() >= need_s:
+            return True, time.monotonic() - t0
+        if not announced and on_wait is not None:
+            announced = True
+            try:
+                on_wait()
+            except Exception:  # noqa: BLE001 - 日志回调不许影响发送
+                pass
+        time.sleep(poll_s)
+    return False, time.monotonic() - t0
+
+
+def wait_for_human_idle(need_s=1.6, max_wait_s=180.0, poll_s=0.4, on_wait=None):
+    """等人停手再动桌面（2026-11-03 用户要求：我在用键鼠时别抢鼠标）。
+
+    返回 `(ok, waited_s)`：`ok=True` 表示已经连续 `need_s` 秒没人碰键鼠，可以开干；
+    `ok=False` 表示等到 `max_wait_s` 人还在用，调用方该把这条消息延期而不是硬抢。
+
+    判据两条一起看：`_idle_seconds()`（系统级空闲）≥ need_s，且 `human_busy()` 为假
+    （后者排除我们自己刚投出去的合成事件，否则每次发完都会被自己判成"有人在用"）。
+    """
+    try:
+        need_s = max(0.0, float(need_s))
+        max_wait_s = max(0.0, float(max_wait_s))
+        poll_s = max(0.05, float(poll_s))
+    except (TypeError, ValueError):
+        need_s, max_wait_s, poll_s = 1.6, 180.0, 0.4
+    if not human_busy() and _idle_seconds() >= need_s:
+        return True, 0.0
+    t0 = time.monotonic()
+    announced = False
+    while time.monotonic() - t0 < max_wait_s:
+        if not human_busy() and _idle_seconds() >= need_s:
+            return True, time.monotonic() - t0
+        if not announced and on_wait is not None:
+            announced = True
+            try:
+                on_wait()
+            except Exception:  # noqa: BLE001 - 日志回调不许影响发送
+                pass
+        time.sleep(poll_s)
+    return False, time.monotonic() - t0
+
+
+def input_ok(slop_px=1):
+    """当前桌面能不能被我们注入输入。
+
+    锁屏、UAC 安全桌面、非交互会话时 SendInput 会被静默丢弃 —— 调用方若继续按
+    「窗口没重绘」推断，就会把微信误判成冻结并去重启它（2026-11-02 实测踩过）。
+    这里只认事实：把光标挪两个像素再看回来，没动就是没有输入权限。
+    """
+    try:
+        x, y = cursor_pos()
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        move(x + 2, y)
+        time.sleep(0.02)
+        nx, ny = cursor_pos()
+        movable = abs(nx - x) >= slop_px or abs(ny - y) >= slop_px
+        try:
+            move(x, y)
+        except Exception:  # noqa: BLE001
+            pass
+        return bool(movable)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def input_desktop_name():
+    """当前输入桌面的名字：正常交互是 `Default`；锁屏/安全桌面是 `Winlogon` 等。
+
+    2026-11-04 实测：屏幕锁着的时候 `SetCursorPos` 直接返回 0、光标纹丝不动，
+    但 `OpenInputDesktop` 仍然成功、`GetForegroundWindow()` 也非 0 —— 只看这两个
+    会把锁屏误判成 UIPI（提权）。桌面名才是判据。
+    """
+    try:
+        hdesk = user32.OpenInputDesktop(0, False, 0x0100)  # DESKTOP_READOBJECTS
+        if not hdesk:
+            return ""
+        try:
+            # GetUserObjectInformationW(hObj, UOI_NAME=2, ...)
+            buf = ctypes.create_unicode_buffer(256)
+            need = ctypes.c_ulong(0)
+            if user32.GetUserObjectInformationW(hdesk, 2, buf, ctypes.sizeof(buf),
+                                                ctypes.byref(need)):
+                return buf.value
+            return ""
+        finally:
+            user32.CloseDesktop(hdesk)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def input_block_reason():
+    """说清楚「为什么推不动光标」——锁屏/安全桌面，还是本进程被 UIPI 挡住。
+
+    2026-11-04：同一句 `restart the bridge elevated` 把两种完全不同的情况都说成提权
+    问题。实测这台机器锁屏时 `SetCursorPos` 也返回 0，提权一个字节用没有。
+    判据：输入桌面名是不是 `Default`。
+    返回 (ok, reason)；ok=True 时 reason 为空串。
+    """
+    try:
+        movable = input_ok()
+    except Exception:  # noqa: BLE001
+        movable = False
+    if movable:
+        return True, ""
+
+    name = input_desktop_name()
+    if name and name.lower() != "default":
+        return False, (f"desktop is '{name}' — the screen is locked (or a secure desktop is up); "
+                       "unlock the screen, then resend")
+    if not name:
+        return False, ("cannot obtain the input desktop — the session has no interactive desktop "
+                       "(RDP disconnected?); reconnect, then resend")
+    return False, ("cursor cannot move on the 'Default' desktop — this process is below the target "
+                   "window's integrity level (UIPI); start the bridge elevated")
+
+
 def grab(region, path):
     """Screenshot a screen region with BitBlt and save it as PNG. Returns the path."""
     left, top, right, bottom = [int(v) for v in region]
@@ -144,9 +287,51 @@ def grab(region, path):
     return path
 
 
+INPUT_BLOCKED = False
+_BLOCKED_AT = [0.0]   # 上次判定"没有输入权限"的时刻（monotonic），用于 120 秒后重探
+
+
+def cursor_pos():
+    p = wt.POINT()
+    user32.GetCursorPos(ctypes.byref(p))
+    return (int(p.x), int(p.y))
+
+
 def move(x, y):
+    """把光标挪到 (x, y)，并自检它是不是真的动了。
+
+    2026-11-02：UIPI / 非提权上下文里 `SetCursorPos` 会**静默失败** —— 返回 0、
+    `GetLastError` 还是 0、光标纹丝不动，于是后面每一次 click / paste 都变成
+    「调用成功但什么也没发生」，最终表现为 `send 超时（45s）` / `未验证送达`，
+    看起来特别像「微信卡了」。这里一旦发现推不动就置 `INPUT_BLOCKED`，
+    让 wxui.send() 立刻用「进程没有桌面输入权限」报错，而不是陪它熬 45 秒。
+    """
+    global INPUT_BLOCKED
+    before = cursor_pos()
     user32.SetCursorPos(int(x), int(y))
     _touch()
+    now = cursor_pos()
+    if abs(now[0] - int(x)) > 2 or abs(now[1] - int(y)) > 2:
+        # 2026-11-03 假阳性：用户同时在动鼠标时，我们推完读回来的是他的手的位置，
+        # 旧代码据此把进程判成"没有输入权限"并永久缓存，之后每条消息都被拦。
+        # 现在补两件事：① 再推一次（人可能只是刚好路过）；② 只有当光标**连起点都没
+        # 离开过**才算真的推不动。
+        user32.SetCursorPos(int(x), int(y))
+        _touch()
+        now2 = cursor_pos()
+        if abs(now2[0] - int(x)) <= 2 and abs(now2[1] - int(y)) <= 2:
+            return
+        if now2 != before and not INPUT_BLOCKED:
+            log.info("[winio] 光标没停在目标点（now=%s want=(%s, %s), 起点=%s）"
+                     "—— 视为你正在用鼠标，不判定输入被拦", now2, x, y, before)
+            return
+        if not INPUT_BLOCKED:
+            INPUT_BLOCKED = True
+            _BLOCKED_AT[0] = time.monotonic()
+            log.warning("[winio] 光标推不动（SetCursorPos 连续两次无效，now=%s want=(%s, %s)）"
+                        " —— 本进程没有桌面输入权限，微信发送必然失败；"
+                        "请用提权方式启动 bridge（见 docs/WECHAT-INPUT-IL-20261102.md）",
+                        now2, x, y)
 
 
 _CLICK_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "wxui-clickstate.json")
@@ -189,6 +374,29 @@ def click(x, y, settle=0.02):
         user32.SendInput(1, ctypes.byref(ev), ctypes.sizeof(INPUT))
         _touch()
         time.sleep(0.01)
+
+
+def double_click(x, y, gap=0.09):
+    """真·双击：两次 down/up 挤在系统双击时间内，**故意**绕过 `click` 的双击抑制。
+
+    2026-10-29 用户反馈：「冻结后双击窗口顶部就可以解冻，不需要退出重开」。实测复现：
+    无覆盖层时按 Esc 把 MMUI 渲染子窗弄死（悬停会话行 ratio 0.4248→0.0000），之后
+    程序化的 SC_MAXIMIZE/SC_RESTORE 都救不回来，只有**真鼠标双击标题栏**能救活
+    （ratio 回到 0.4248）。所以这里要的就是合成一次 WM_LBUTTONDBLCLK，不能再补间隔。
+    """
+    if human_busy():
+        raise HumanBusy("human is using the mouse")
+    user32.SetCursorPos(int(x), int(y))
+    _touch()
+    time.sleep(0.05)
+    for _ in range(2):
+        for flag in (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP):
+            ev = INPUT(type=INPUT_MOUSE)
+            ev.mi = MOUSEINPUT(0, 0, 0, flag, 0, None)
+            user32.SendInput(1, ctypes.byref(ev), ctypes.sizeof(INPUT))
+            _touch()
+            time.sleep(0.012)
+        time.sleep(max(0.0, float(gap)))
 
 
 def wheel(notches, x=None, y=None, settle=0.02, batch=True):

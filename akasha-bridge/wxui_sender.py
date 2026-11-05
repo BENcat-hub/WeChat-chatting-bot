@@ -200,6 +200,24 @@ class WxuiSender(WeMessengerSender):
         except Exception as exc:  # noqa: BLE001
             log.debug("[wxui] 尝试缓存写入失败: %s", exc)
 
+    def _forget_attempt(self, key: tuple) -> None:
+        """撤销一次「尝试」记录（2026-11-03）。
+
+        人在用键鼠时 wxui 会先等、等不到就返回 deferred —— 那条消息其实**一个字都没发**，
+        但如果照样留下 attempt 记录，接下来 120 秒内队列和入口去重都会把它当成「刚发过」
+        而跳过，最后被判成重发放弃。延期不是尝试，必须把记录撤掉。
+        """
+        cache = self._attempt_cache()
+        if cache.pop(str(key), None) is None:
+            return
+        try:
+            tmp = self._attempt_cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(cache, fh, ensure_ascii=False)
+            os.replace(tmp, self._attempt_cache_path)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("[wxui] 尝试缓存回滚失败: %s", exc)
+
     def _attempted_recently(self, key: tuple, window: float | None = None) -> bool:
         window = self._attempt_hold_s if window is None else float(window)
         cache = self._attempt_cache()
@@ -241,6 +259,9 @@ class WxuiSender(WeMessengerSender):
         # 不会让消息被误判成已送达而丢掉。
         self._remember_attempt(dedupe_key)
         ok, data = self._scheduled_run("send", {"target": target, "text": text}, target)
+        if data.get("deferred"):
+            # 人在用键鼠 → 这条没发出去，别把它记成「刚尝试过」（见 _forget_attempt）
+            self._forget_attempt(dedupe_key)
         if ok:
             self._remember_send(dedupe_key)
         if not ok and self._retryable(data) and not data.get("_enqueued") and not data.get("no_requeue"):
@@ -289,6 +310,28 @@ class WxuiSender(WeMessengerSender):
         if not ok and self._retryable(data) and not data.get("_enqueued") and not data.get("no_requeue"):
             self._block_contact(contact)
             self._enqueue("send-image", spec, contact, data)
+        return ok
+
+    def send_sticker(self, contact: str, sticker_path: str) -> bool:
+        """表情包：wxui 没有「表情面板」通道，退回图片通道发送（微信里同样是一张图）。
+
+        WeeMessenger 的真表情通道需要 :9877 常驻服务，现未运行；`image_mode=sticker`
+        时先试它，失败/未配置就退化到 send_image —— GIF 会原样发出（imgutil 只转 WebP），
+        回读验证能读到 delivered_as=image。
+        """
+        if not sticker_path or not os.path.exists(sticker_path):
+            log.error("[wxui] 表情包不存在: %s", sticker_path)
+            return False
+        if self.image_mode == "sticker":
+            try:
+                if super().send_sticker(contact, sticker_path):
+                    log.info("[wxui] 表情包（WeeMessenger 真表情通道）→ %s", contact)
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[wxui] WeeMessenger 表情通道不可用（%s），改走图片通道", exc)
+        ok = self.send_image(contact, sticker_path)
+        log.info("[wxui] 表情包%s → %s | %s", "已送达" if ok else "发送失败", contact,
+                 os.path.basename(sticker_path))
         return ok
 
     def send_file(self, contact: str, file_path: str) -> bool:
@@ -793,10 +836,16 @@ class WxuiSender(WeMessengerSender):
         静默丢掉。
         """
         text = str((data or {}).get("error") or "")
+        # 2026-11-03：新增「人在用键鼠 → 延期」这一种。它不是发失败，而是「还没轮到发」，
+        # 和全屏占用一样不该消耗重试次数（否则用户在电脑前待几分钟，队列就把消息放弃了）。
+        if (data or {}).get("deferred") or (data or {}).get("human_wait_s"):
+            return True
         return ("FULLSCREEN_HOLD" in text
                 or "could not bring WeChat to the foreground" in text
                 or "is covered by another window" in text
                 or "user is using the desktop" in text
+                or "you kept using the mouse/keyboard" in text
+                or "deferred: user is using the computer" in text
                 or (data or {}).get("fullscreen_hold") is not None)
 
     @staticmethod
@@ -1013,6 +1062,10 @@ class WxuiSender(WeMessengerSender):
                 continue
             self._remember_attempt(replay_key)
             ok, data = self._scheduled_run(subcmd, {**spec, "commit": True}, target)
+            if data.get("deferred"):
+                # 2026-11-03：人还在用键鼠，这条根本没发 → 撤掉 attempt 记录，
+                # 下一轮（人停手后）就能立刻重放，而不是被 120s 去重挡住再判放弃。
+                self._forget_attempt(replay_key)
             if ok:
                 stat["resent"] += 1
                 key = self._content_key(it.get("kind"), spec, target)

@@ -1,0 +1,6 @@
+{
+ "umo": "default:FriendMessage:1046707093",
+ "created_at": "2026-10-24 03:37:02.256572",
+ "updated_at": "2026-10-24 03:37:20.385093",
+ "raw": "[{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"\\u5bf9\\u65b9\\u64a4\\u56de\\u4e86\\u4e00\\u6761\\u6d88\\u606f\\uff08rawid\\uff1a7576548987305479133\\uff09 \\u5185\\u5bb9\\u4e3a\\u201c\\u672a\\u77e5\\u5185\\u5bb9\\u201d\"}, {\"type\": \"text\", \"text\": \"<system_reminder>User ID: 1046707093, Nickname: \\u6587\\u5b57\\u90e8\\u5218\\u5f66\\u4f3615195987749\\nCurrent datetime: 2026-10-24 11:37 (CST), Weekday: Saturday</system_reminder>\"}]}, {\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"\\u64a4\\u56de\\u7684\\u6d88\\u606f\\u6211\\u8fd9\\u8fb9\\u770b\\u4e0d\\u5230\\uff0c\\u6743\\u9650\\u4e0d\\u591f\\u67e5\\u4e0d\\u4e86\"}]}]"
+}

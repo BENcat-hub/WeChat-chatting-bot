@@ -133,11 +133,24 @@ def _serve(pipe_name, idle_s):
     inbox = queue.Queue()
 
     def _accept_loop():
+        # 2026-11-05：**一次 accept 失败就会把整个服务变成僵尸**。
+        # 原来的写法是 `except Exception: return` —— 任何一次异常（最典型的是
+        # 「低完整性进程来连高完整性服务的管道」→ WinError 5，或者 wait 超时
+        # WinError 121）都会让接受线程永久退出：进程还活着、管道名还占着，
+        # 但再也没有人 accept，后续所有客户端只能拿到
+        # `OSError: [WinError 121] 信号灯超时时间已到`。
+        # wxui 于是永远连不上 → 退回 Windows OCR → 读不出会话名 → 发送 45s 超时。
+        # 现在：异常只记一行日志、歇 0.2s 继续 accept。
         while True:
             try:
-                inbox.put(listener.accept())
-            except Exception:  # noqa: BLE001
+                conn = listener.accept()
+            except (KeyboardInterrupt, SystemExit):
                 return
+            except Exception as exc:  # noqa: BLE001
+                log("accept 失败（已忽略，继续监听）: %s: %s" % (type(exc).__name__, exc))
+                time.sleep(0.2)
+                continue
+            inbox.put(conn)
 
     threading.Thread(target=_accept_loop, daemon=True).start()
     last = time.time()

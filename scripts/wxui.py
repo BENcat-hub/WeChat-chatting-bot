@@ -34,6 +34,15 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
+
+# 2026-10-29 21:5x：wxui 自己是被 bridge 以 CREATE_NO_WINDOW 拉起的（**没有控制台**）。
+# 这种父进程再 spawn 任何 console 子系统子进程（powershell / taskkill / python.exe）时，
+# Windows 会给子进程新建一个**可见控制台窗口**并在桌面上闪一下 —— 用户看到的「Python 窗口
+# 又弹出来了」就是它。所有 spawn 点都必须带 CREATE_NO_WINDOW，或直接改用 GUI 子系统的
+# pythonw.exe（根本不会分配控制台）。
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+_DETACHED_PROCESS = 0x00000008
+
 sys.path.insert(0, HERE)
 from wmcp import Client  # noqa: E402
 
@@ -695,6 +704,18 @@ def shot(client, region, keep_dir, tries=2):
     """
     _SHOT_ERR[0] = ""
     cfg_now = config()
+    # 2026-11-02 事故：DSH 自己的窗口（Chrome_WidgetWin_1，标题为空）盖在微信上面时，
+    # 微信**仍然是前台窗口**，`_foreground_is_wechat` 判「可以抓」，于是 BitBlt 抓到的是 DSH
+    # 的像素 —— 侧栏认不出人、搜索面板判成「没打开」，bridge 每条消息都超时进重发队列
+    # （13:06–13:08 黎栀/陈奥琦全部「文字未验证送达」）。
+    # 现在每次抓屏前都问一遍 Windows「这块区域此刻真的属于微信吗」，被盖住就先把它顶上来。
+    try:
+        _ready = ensure_wechat_ready(cfg_now)
+        if not _ready.get("ok"):
+            log.warning("[wxui] 抓屏前检查：微信不可用（%s）——这张图可能不是微信",
+                        _ready.get("reason") or "unknown")
+    except Exception as exc:                                   # noqa: BLE001
+        log.info("[wxui] 抓屏前检查失败（忽略）：%s", _brief(exc))
     if _native_on(cfg_now, "native_shots") and _foreground_is_wechat(cfg_now):
         # 原生 BitBlt 抓屏：局部区域 ~30ms，而 windows-mcp 的 Screenshot 走 JSON-RPC + base64
         # 要 ~240ms。抓不到就退回 MCP（例如区域越界、被最小化窗口挡住）。
@@ -851,12 +872,21 @@ _OCR_STATE = {"spawn_at": 0.0, "spawns": 0, "pid": None, "last_error": ""}
 
 
 def _ocr_python(cfg=None):
-    """RapidOCR 用的解释器：优先 .venv-ocr，其次 $WXUI_OCR_PYTHON。"""
+    """RapidOCR 用的解释器：优先 .venv-ocr，其次 $WXUI_OCR_PYTHON。
+
+    优先返回同目录的 **pythonw.exe**：它是 GUI 子系统程序，永远不会分配控制台窗口，
+    也不会因为 venv 的 python.exe 启动器再 re-exec 一次真实解释器时冒出一个可见窗口
+    （2026-10-29 实测：用 python.exe 时那个窗口真的会出现在桌面上）。
+    """
     env = os.environ.get("WXUI_OCR_PYTHON")
     if env and os.path.exists(env):
         return env
-    p = os.path.abspath(os.path.join(ROOT, ".venv-ocr", "Scripts", "python.exe"))
-    return p if os.path.exists(p) else None
+    scripts = os.path.join(ROOT, ".venv-ocr", "Scripts")
+    for name in ("pythonw.exe", "python.exe"):
+        p = os.path.abspath(os.path.join(scripts, name))
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def _ocr_pipe_name(cfg):
@@ -876,12 +906,21 @@ def _ocr_spawn(cfg):
     script = os.path.join(HERE, "ocr_server.py")
     if not os.path.exists(script):
         return False
-    flags = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
+    # 只用 DETACHED_PROCESS：父进程（wxui oneshot）退出后服务还能活着。
+    # **不要再叠加 CREATE_NO_WINDOW**——MSDN 明确写它和 DETACHED_PROCESS 一起用时会被
+    # 忽略，而且 DETACHED 的语义只是「不继承父控制台」，venv 的 python.exe 启动器会再
+    # re-exec 一次真实解释器，那一步照样能凭空造出一个可见控制台窗口（2026-10-29 实测
+    # 桌面上出现过标题为 `.venv-ocr\Scripts\python.exe` 的 ConsoleWindowClass 窗口）。
+    # 真正的保险是 _ocr_python() 返回的 pythonw.exe + 下面的 SW_HIDE。
+    flags = _DETACHED_PROCESS
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
     try:
         proc = subprocess.Popen(
             [py, script, "--serve", "--pipe", _ocr_pipe_name(cfg),
              "--idle", str(int((cfg or {}).get("ocr_idle_s", 1800) or 1800))],
-            cwd=HERE, creationflags=flags,
+            cwd=HERE, creationflags=flags, startupinfo=si,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True)
     except Exception as exc:  # noqa: BLE001
@@ -1431,6 +1470,34 @@ def _point_belongs_to(hwnd, point):
         return None, 0
 
 
+def _raise_above_cover(cfg, hwnd, point):
+    """把微信临时顶到最上层（越过置顶窗），让 point 重新属于微信。
+
+    2026-10-30 22:17 事故：DSH（pid 77984）置顶窗盖住微信搜索框，`_point_belongs_to`
+    正确地拒绝点下去，但整个 `open_chat_by_search` 直接失败 → 语音气泡脚本抛异常 →
+    bridge 回落成「wav 文件卡片」发给用户。也就是说「守卫太严」把一次可恢复的遮挡
+    变成了功能降级。
+
+    做法：HWND_TOPMOST → HWND_NOTOPMOST。这样微信会在置顶层里排到最前，退回普通层时
+    仍然压在那个置顶窗上面（直到用户再次激活它）。不抢焦点（SWP_NOACTIVATE），
+    失败不抛异常，只是返回 False 让调用方走原来的拒绝路径。
+    """
+    user32 = ctypes.windll.user32
+    try:
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE = 0x0002, 0x0001, 0x0010
+        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        user32.SetWindowPos(int(hwnd), -1, 0, 0, 0, 0, flags)   # HWND_TOPMOST
+        time.sleep(0.12)
+        user32.SetWindowPos(int(hwnd), -2, 0, 0, 0, 0, flags)   # HWND_NOTOPMOST
+        time.sleep(0.12)
+    except Exception:  # noqa: BLE001
+        return False
+    own, pid = _point_belongs_to(hwnd, point)
+    log.info("[wxui] 覆盖层处理：把微信顶到最上层后 point=%s 归属=%s (pid=%s)",
+             list(point), own, pid)
+    return own is True
+
+
 def _pixels_belong_to(hwnd, rect, probes=((0.35, 0.5), (0.5, 0.3), (0.5, 0.5), (0.5, 0.7), (0.7, 0.5))):
     """窗口矩形内抽样几个点，看屏幕上真正显示的是不是这个进程的窗口。
 
@@ -1487,6 +1554,28 @@ def _covered_names(on_top):
     if not names:
         return ""
     return "，最上层是 %s" % " / ".join(names)
+
+
+def _pin_topmost_temporarily(hwnd, seconds=30.0):
+    """把微信顶成置顶层并**保留**几秒，之后自动取消（还原桌面观感）。
+
+    2026-11-02 事故：盖住微信的是本机一个**置顶**的 cmd.exe 控制台窗。常规的
+    「HWND_TOPMOST → HWND_NOTOPMOST」只是让它插队一次，退回普通层立刻又被那个置顶窗
+    压住 —— 于是截图永远读到别人的界面。置顶窗口只能被更高的置顶窗口压过去，所以这里
+    先留着置顶（这一轮抓屏/点击就能正常进行），再定时拆掉。
+    """
+    user32 = ctypes.windll.user32
+    try:
+        user32.SetWindowPos(int(hwnd), -1, 0, 0, 0, 0, 0x0003 | 0x0010)   # HWND_TOPMOST, NOACTIVATE
+    except Exception:                                                # noqa: BLE001
+        return False
+    try:
+        import threading
+        threading.Timer(max(5.0, float(seconds)),
+                        lambda: user32.SetWindowPos(int(hwnd), -2, 0, 0, 0, 0, 0x0003 | 0x0010)).start()
+    except Exception:                                                # noqa: BLE001
+        pass
+    return True
 
 
 def ensure_wechat_ready(cfg, raise_it=True):
@@ -2194,7 +2283,8 @@ def set_clipboard_image(path, animated=None):
     env = dict(os.environ)
     env["WXUI_CLIP_PATH"] = abs_path
     r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                       capture_output=True, text=True, env=env)
+                       capture_output=True, text=True, env=env,
+                       creationflags=_CREATE_NO_WINDOW)
     return r.returncode == 0, (r.stderr or "").strip()[:200]
 
 
@@ -2616,6 +2706,11 @@ def ui_render_alive(cfg, rect, wait_s=0.45):
     """
     if winio is None:
         return {"alive": None, "ratio": None, "error": "winio unavailable"}
+    # 2026-11-02：没有桌面输入权限时悬浮根本不会发生，两行都「不重绘」→ 会被误判成
+    # 渲染进程冻结并触发「重启微信」这种破坏性恢复。这里先问一句，问不出来就别下结论。
+    if hasattr(winio, "input_ok") and not winio.input_ok():
+        return {"alive": None, "ratio": None,
+                "error": "desktop input blocked (cursor cannot move) — cannot probe repaint"}
     ready = ensure_wechat_ready(cfg)
     if not ready.get("ok"):
         return {"alive": None, "ratio": None,
@@ -2675,9 +2770,11 @@ def _record_restart():
 
 
 def restart_wechat(cfg):
-    """重启微信客户端 —— 半冻结唯一有效的恢复手段（2026-10-28 22:55 实测）。
+    """重启微信客户端 —— 半冻结的**最后手段**。
 
-    只在「探活确认死了 + 发送需要 GUI」时才调用；有冷却与次数上限，避免和用户抢电脑。
+    2026-10-29 用户实测纠正了旧结论：双击窗口顶部条就能解冻，不必退出重开
+    （`ui_titlebar_refresh`，本机已复现）。所以这个函数现在只在「双击标题栏也救不回来」
+    时才调用；冷却与次数上限照旧，避免和用户抢电脑。
     """
     exe = str(cfg.get("wechat_exe") or r"C:\Program Files\Tencent\Weixin\Weixin.exe")
     out = {"ok": False, "steps": []}
@@ -2686,7 +2783,8 @@ def restart_wechat(cfg):
         return out
     log.warning("[wxui] 微信 UI 已冻结，尝试自动重启（这是自愈，不是普通操作）")
     try:
-        subprocess.run(["taskkill", "/IM", "Weixin.exe", "/F"], capture_output=True, timeout=15)
+        subprocess.run(["taskkill", "/IM", "Weixin.exe", "/F"], capture_output=True, timeout=15,
+                       creationflags=_CREATE_NO_WINDOW)
         out["steps"].append("taskkill")
     except Exception as exc:  # noqa: BLE001
         out["steps"].append("taskkill failed: %s" % exc)
@@ -2694,14 +2792,15 @@ def restart_wechat(cfg):
     while time.time() < deadline:
         try:
             r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe"],
-                               capture_output=True, timeout=8)
+                               capture_output=True, timeout=8,
+                               creationflags=_CREATE_NO_WINDOW)
             if b"Weixin.exe" not in (r.stdout or b""):
                 break
         except Exception:  # noqa: BLE001
             break
         time.sleep(0.5)
     try:
-        subprocess.Popen([exe], close_fds=True)
+        subprocess.Popen([exe], close_fds=True, creationflags=_DETACHED_PROCESS)
         out["steps"].append("started")
     except Exception as exc:  # noqa: BLE001
         out["error"] = "start failed: %s" % exc
@@ -2841,6 +2940,15 @@ def _search_result_pick(client, cfg, rect, target):
     聊天头部 OCR 复核。
     """
     left, top, right, bottom = rect
+    # 2026-11-02 事故：这条路径直接 shot_ex()，**没有**走过 ensure_wechat_ready。
+    # 微信被 DSH 窗口盖住时，OCR 读到的是 DSH 的界面 → 没有「最常使用/搜索网络结果」分区
+    # → 报成 "search panel not detected (paste may not have landed)"，把「被遮挡」误诊成
+    # 「粘贴没进去」，于是重发队列一直堆着。先过闸，把真实原因写清楚。
+    _ready = ensure_wechat_ready(cfg)
+    if not _ready.get("ok"):
+        return None, {"error": "wechat window is covered: %s" % (_ready.get("reason") or "unknown"),
+                      "window": {k: _ready.get(k) for k in
+                                 ("visible", "iconic", "foreground", "covered_before", "raised_ok")}}
     region = [left + int(cfg.get("sidebar_capture_x_offset", 90)),
               top + int(cfg.get("search_results_y_offset_px", 100)),
               left + int(cfg.get("sidebar_capture_x2_offset", 560)),
@@ -3003,9 +3111,14 @@ def open_chat_by_search(client, cfg, rect, target):
         _sb = _search_box_point(cfg, rect)
         _own, _pid = _point_belongs_to(hwnd, _sb)
         if _own is False:
-            dbg["error"] = ("search box at %s is covered by another window (pid=%s); "
-                            "refusing to click/paste" % (list(_sb), _pid))
-            return False, dbg
+            # 被置顶窗盖住时先试着把微信顶上去再点一次（2026-10-30 22:17：守卫直接
+            # 放弃，结果语音气泡整条失败、回落成 wav 文件发给用户）。
+            if cfg.get("overlay_raise_above", True) and _raise_above_cover(cfg, hwnd, _sb):
+                _own, _pid = _point_belongs_to(hwnd, _sb)
+            if _own is False:
+                dbg["error"] = ("search box at %s is covered by another window (pid=%s); "
+                                "refusing to click/paste" % (list(_sb), _pid))
+                return False, dbg
         if cfg.get("search_use_ctrl_f", False):
             client.call("Shortcut", {"shortcut": "ctrl+f"})
             time.sleep(float(cfg.get("search_focus_wait_s", 0.35)))
@@ -3083,6 +3196,9 @@ def open_chat_by_search(client, cfg, rect, target):
             return False, dbg
         # 同一道防误点闸：结果行坐标此刻必须仍属于微信（别把点击打进盖在上面的置顶窗口）。
         _own, _pid = _point_belongs_to(wx_h, point)
+        if _own is False and cfg.get("overlay_raise_above", True):
+            _raise_above_cover(cfg, wx_h, point)
+            _own, _pid = _point_belongs_to(wx_h, point)
         if _own is False:
             dbg["error"] = ("search result row at %s is covered by another window (pid=%s)"
                             % (list(point), _pid))
@@ -3646,6 +3762,112 @@ def _identity_recheck(cfg, target):
     return True, reason or "header unreadable (allow)"
 
 
+def weflow_account(cfg=None):
+    """WeFlow 自己认为在服务的微信号（WeFlow-config.json 的 myWxid）。"""
+    cfg = cfg or {}
+    path = cfg.get("weflow_config_path") or os.path.join(
+        os.environ.get("APPDATA", os.path.expanduser("~")), "weflow", "WeFlow-config.json"
+    )
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            return str(json.load(fh).get("myWxid") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def active_wechat_account(cfg):
+    """微信此刻真正在写的号：xwechat_files 里 message_0.db 最新改动的那个目录。
+
+    判据只有「文件还在长」这一条 —— 登录中转号会换目录，旧号的库随即静止，
+    这是 2026-10-30 那次「发出去但回读不到」的直接指纹。
+    """
+    cfg = cfg or {}
+    root = cfg.get("xwechat_files_root") or os.path.join(
+        os.path.expanduser("~"), "Documents", "xwechat_files"
+    )
+    best, best_ts = "", 0.0
+    try:
+        entries = [d for d in os.listdir(root) if d.lower().startswith("wxid_")]
+    except Exception:  # noqa: BLE001
+        return ""
+    for name in entries:
+        db = os.path.join(root, name, "db_storage", "message", "message_0.db")
+        try:
+            ts = os.path.getmtime(db)
+        except Exception:  # noqa: BLE001
+            ts = 0.0
+        if ts > best_ts:
+            best, best_ts = name, ts
+    return best
+
+
+def weflow_latest_ts(cfg):
+    """WeFlow 里最新一条会话消息的秒级时间戳；0 表示拿不到。"""
+    try:
+        rows = api(cfg, "/api/v1/sessions", limit=50).get("sessions", [])
+    except Exception:  # noqa: BLE001
+        return 0
+    return max([int(s.get("lastTimestamp") or 0) for s in rows] or [0])
+
+
+def ensure_account_matches(cfg):
+    """发送闸门：回读源必须对着「现在登录的号」，否则一个字都不发。
+
+    WeFlow-config.json 里的 myWxid 会被微信转号甩在后面（2026-10-30 / 11-04 都出现过），
+    而 WeFlow 自身往往是跟着登录号读库的。所以判定分两层：
+      1) myWxid 与「正在写的库」一致 → 直接放行；
+      2) 不一致时看 WeFlow 的最新消息时间：还在 15 分钟以内说明它读的就是活号，
+         只需把 config 对账（scripts/wxui_account_align.py --auto），发送照常；
+         否则判定回读失效 → 拦住并排队（此时还没发，排队不会重复）。
+    """
+    cfg = cfg or {}
+    info = {"ok": True, "weflow": "", "active": "", "reason": ""}
+    if not bool(cfg.get("account_guard", True)):
+        info["reason"] = "account_guard disabled"
+        return True, info
+    active = active_wechat_account(cfg)
+    wfx = weflow_account(cfg)
+    info.update(weflow=wfx, active=active)
+    if active and wfx and active == wfx:
+        info["reason"] = "aligned (%s)" % active
+        return True, info
+    latest = weflow_latest_ts(cfg)
+    info["weflow_latest"] = latest
+    info["weflow_latest_age_s"] = int(time.time() - latest) if latest else None
+    if not latest:
+        # 连 WeFlow 都问不到 → 回读结果不可信，这时发出去的消息注定「看起来没送达」，
+        # 重试就是给对方刷重复。在这儿停下（还没发，排队是安全的）。
+        info["ok"] = False
+        info["reason"] = "WeFlow unreachable (myWxid=%s, wechat writing %s)" % (wfx or "?", active or "?")
+        return False, info
+    # 问得到就放行：号对不上只是「配置过期」，真正的重复风险由 readback_blind() 兜
+    # （它按会话判回读是否变瞎，retryable=False 且 no_requeue）。这里只记账。
+    info["reason"] = (
+        "WeFlow myWxid=%s 过期（微信在写 %s），但回读可用（最新消息 %s）；"
+        "跑 scripts/wxui_account_align.py --auto 对账"
+        % (wfx or "?", active or "?", time.strftime("%m-%d %H:%M", time.localtime(latest)))
+    )
+    log.warning("[wxui] ⚠️ 账号配置过期但回读可用：%s", info["reason"])
+    return True, info
+
+
+def readback_blind(cfg, talker, since_time, slack_s=180):
+    """回读是不是「瞎的」：WeFlow 对这个人根本没有最近消息。
+
+    重试的前提是「回读有可能变 True」。如果 WeFlow 里这个会话最新的消息比这次发送的
+    起点还早 3 分钟，那它现在看不到这条消息（游标坏了 / 账号不对 / 同步停摆），
+    再试多少次都是 False —— 此时继续重试就是纯粹的重复发送（2026-10-30 实测）。
+    """
+    try:
+        msgs = api(cfg, "/api/v1/messages", talker=talker, limit=3).get("messages", [])
+    except Exception:  # noqa: BLE001
+        return False
+    if not msgs:
+        return True
+    newest = max(int(m.get("createTime") or 0) for m in msgs)
+    return newest < (since_time - slack_s)
+
+
 def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, client=None):
 
     """Send text, retrying with a fresh read-back check until it is verified delivered.
@@ -3684,6 +3906,57 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
     if not talker:
         plan.update(ok=False, error="target not found in WeFlow session list / contacts",
                     retryable=False, known=[s.get("displayName") for s in rows[:20]])
+        return plan
+
+    # 输入闸门（2026-11-02）：本进程若连光标都推不动（UIPI / 非提权），后面每一次
+    # click / paste 都是「调用成功但没效果」，最后只会以「45s 超时」「未验证送达」
+    # 的形式报警，特别容易被误判成微信卡了。在这里一次说清楚。
+    if winio is not None and not winio.input_ok():
+        _reason = ""
+        try:
+            _fn = getattr(winio, "input_block_reason", None)
+            if _fn is not None:
+                _ok2, _reason = _fn()
+        except Exception:  # noqa: BLE001
+            _reason = ""
+        plan.update(ok=False, retryable=True,
+                    error=_reason or ("desktop input is blocked for this process (cursor cannot move) "
+                                      "— see docs/WECHAT-INPUT-IL-20261102.md"))
+        return plan
+
+    # 人在用键鼠就等他停手（2026-11-03 用户要求：「加一个键鼠使用中的时候延迟发送的
+    # 功能，不然会抢鼠标」）。原来遇到 human_busy 直接 no_requeue 丢掉，用户一动鼠标
+    # 那条消息就静默消失；现在改成先等，等到他连续 `defer_to_human_idle_s` 秒没碰键鼠
+    # 再发；等满 `defer_to_human_max_wait_s` 还在用才延期（retryable，进重发队列）。
+    if winio is not None and cfg.get("defer_to_human", True):
+        _need = float(cfg.get("defer_to_human_idle_s", 1.6))
+        _maxw = float(cfg.get("defer_to_human_max_wait_s", 180))
+        _idle_ok, _waited = winio.wait_for_human_idle(
+            need_s=_need, max_wait_s=_maxw,
+            poll_s=float(cfg.get("defer_to_human_poll_s", 0.4)),
+            on_wait=lambda: log.info("[wxui] ⏳ 你在用键鼠，这条先等着（最多等 %.0fs）target=%s",
+                                     _maxw, target),
+        )
+        plan["human_wait_s"] = round(_waited, 1)
+        if not _idle_ok:
+            plan.update(ok=False, retryable=True, deferred=True,
+                        error="deferred: you kept using the mouse/keyboard for %.0fs "
+                              "(will resend when idle)" % _waited)
+            log.info("[wxui] ⏸ 等了 %.0fs 还在用键鼠，这条延期发送 target=%s", _waited, target)
+            return plan
+        if _waited >= 0.5:
+            log.info("[wxui] ▶ 你停手了（等了 %.1fs），继续发送 target=%s", _waited, target)
+
+    # 账号闸门（2026-10-30）：回读源对不上登录号时一个字都不发 —— 那种情况下
+    # 每条消息都会「发出去了但回读不到」，重试只会给同一个人再发几份。
+    # 注意这里 **还没发**，所以排队重试是安全的（不会重复）；真正的重复风险只来自
+    # 「发出去之后回读不到」，那条走 readback_blind 闸门（no_requeue=True）。
+    _acc_ok, _acc = ensure_account_matches(cfg)
+    plan["account"] = _acc
+    if not _acc_ok:
+        plan.update(ok=False, retryable=True, no_requeue=False,
+                    error="account mismatch (queued until WeFlow is realigned): %s" % _acc.get("reason"))
+        log.error("[wxui] ⛔ 暂缓发送（回读源与登录号不一致，等对账后再发）：%s", _acc.get("reason"))
         return plan
 
     attempts_max = max(1, int(cfg.get("send_attempts", 3)))
@@ -3802,6 +4075,10 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                     _win = plan.get("window_rect") or restored_rect(find_wechat(cfg))
                     _ib = input_box_point(cfg, _win)
                     _own, _pid = _point_belongs_to(find_wechat(cfg), _ib)
+                    if _own is False and cfg.get("overlay_raise_above", True):
+                        # 先试着把微信顶到最上层再判一次；能救回来就继续发，别整条失败。
+                        _raise_above_cover(cfg, find_wechat(cfg), _ib)
+                        _own, _pid = _point_belongs_to(find_wechat(cfg), _ib)
                     if _own is False:
                         raise RuntimeError("input box at %s is covered by another window "
                                            "(pid=%s); refusing to type" % (list(_ib), _pid))
@@ -3856,6 +4133,17 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                     attempt_log.append({"attempt": attempt, "stage": "identity_after_send",
                                         "why": _id2_why})
                     break
+            if not found and attempt >= 1 and readback_blind(cfg, talker, t_start):
+                # 回读是瞎的（WeFlow 看不到这个会话的任何新消息）：再试只会再发一份。
+                # 2026-10-30：账号不一致时就是这样，同一个人收到 3~4 份同样的内容。
+                plan.update(error=("readback blind: WeFlow shows no new message for this chat "
+                                   "since the attempt started; refusing to resend "
+                                   "(check the WeChat account vs WeFlow myWxid)"),
+                            retryable=False, no_requeue=True)
+                attempt_log.append({"attempt": attempt, "stage": "readback_blind"})
+                log.error("[wxui] ⛔ 回读不可用（WeFlow 会话没有新消息），停止重试以免发重复 "
+                          "target=%s", target)
+                break
             if found:
                 # 只有拿到回读确认才算「输入框已空、窗口仍在原位」，下一条才敢走热路径
                 _warm_mark(target, plan.get("window_rect"), header_verified=True, clean=True)
@@ -3908,6 +4196,16 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
     if not talker:
         plan.update(ok=False, error="target not found in WeFlow session list / contacts",
                     retryable=False, known=[s.get("displayName") for s in rows[:20]])
+        return plan
+
+    # 账号闸门（2026-10-30）：回读源对不上登录号时一个字都不发。这里还没发，
+    # 所以排队重试安全（不会重复）；发出去后回读不到才走 readback_blind 的 no_requeue。
+    _acc_ok, _acc = ensure_account_matches(cfg)
+    plan["account"] = _acc
+    if not _acc_ok:
+        plan.update(ok=False, retryable=True, no_requeue=False,
+                    error="account mismatch (queued until WeFlow is realigned): %s" % _acc.get("reason"))
+        log.error("[wxui] ⛔ 暂缓发送（回读源与登录号不一致，等对账后再发）：%s", _acc.get("reason"))
         return plan
 
     attempts_max = max(1, int(cfg.get("send_attempts", 3)))

@@ -63,7 +63,7 @@ logger = get_module_logger(__name__)
 
 
 TTS_BLOCK_PATTERN = re.compile(r"<t{2,}s\b[^>]*>.*?</t{2,}s>", re.IGNORECASE | re.DOTALL)
-TTS_TAG_PATTERN = re.compile(r"</?t{2,}s\b[^>]*>", re.IGNORECASE)
+TTS_TAG_PATTERN = re.compile(r"</?(?:pc_)?t{2,}s\b[^>]*>", re.IGNORECASE)
 TTS_BLOCK_TOKEN_PATTERN = re.compile(r"\[\[TTSBLOCK:([0-9a-f]{16})\]\]")
 PRIVATE_TTS_BLOCK_TOKEN_PATTERN = re.compile(r"\[\[PCTTS:([0-9a-f]{16})\]\]")
 EMOTION_TAG_PATTERN = re.compile(r"\[([^\[\]\n]{1,24})\]")
@@ -1178,7 +1178,7 @@ class TtsEnhancementMixin:
 
     def _strip_any_tts_markup(self, text: str) -> str:
         cleaned = re.sub(r"</?pc[_-]?tts\b[^>]*>", "", str(text or ""), flags=re.IGNORECASE)
-        cleaned = re.sub(r"</?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
         return cleaned.strip()
 
     @staticmethod
@@ -1319,7 +1319,7 @@ class TtsEnhancementMixin:
             protected[token] = match.group(0)
             return f"[[PCTTS:{token}]]"
 
-        return re.sub(r"<tts>.*?</tts>", repl, normalized, flags=re.IGNORECASE | re.DOTALL)
+        return re.sub(r"<tts>.*?</(?:pc_)?tts>", repl, normalized, flags=re.IGNORECASE | re.DOTALL)
 
     def _restore_protected_tts_blocks(self, text: str, event: Any) -> str:
         source = str(text or "")
@@ -1695,7 +1695,7 @@ class TtsEnhancementMixin:
         cleaned = self._normalize_tts_tags(text)
         cleaned = self._strip_or_keep_emotion_tags(cleaned, provider_kind=provider_kind)
         cleaned = re.sub(r"</?tts>", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"</?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
         return _single_line(cleaned, 2000)
 
     @staticmethod
@@ -1776,7 +1776,7 @@ class TtsEnhancementMixin:
             return ""
 
         cleaned = re.sub(
-            r"<tts\b[^>]*>(.*?)</tts>",
+            r"<(?:pc_)?tts\b[^>]*>(.*?)</tts>",
             _replace,
             source,
             flags=re.IGNORECASE | re.DOTALL,
@@ -3561,7 +3561,7 @@ TTS 朗读文本：
         if (
             tts_enabled
             and self._tts_setting("tts_generation_mode", "fast_tag") != "postprocess"
-            and re.search(r"<tts\b[^>]*>.*?</tts>", normalized, flags=re.IGNORECASE | re.DOTALL)
+            and re.search(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", normalized, flags=re.IGNORECASE | re.DOTALL)
         ):
             normalized, full_scope_fallback = self._enforce_full_tts_scope_markup(
                 normalized,
@@ -5277,7 +5277,7 @@ Provider 规则：{emotion_rule}
         event: Any = None,
     ) -> str:
         normalized = self._normalize_tts_tags(str(text or ""))
-        visible = re.sub(r"<tts\b[^>]*>.*?</tts>", "", normalized, flags=re.IGNORECASE | re.DOTALL)
+        visible = re.sub(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", "", normalized, flags=re.IGNORECASE | re.DOTALL)
         visible = re.sub(TTS_TAG_PATTERN, "", visible).strip()
         if visible:
             return self._sanitize_tts_visible_text(
@@ -5319,7 +5319,7 @@ Provider 规则：{emotion_rule}
         normalized = self._normalize_tts_tags(str(text or ""))
         if self._tts_setting("tts_conversion_scope", "partial") != "full":
             return normalized, ""
-        if not re.search(r"<tts\b[^>]*>.*?</tts>", normalized, flags=re.IGNORECASE | re.DOTALL):
+        if not re.search(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", normalized, flags=re.IGNORECASE | re.DOTALL):
             return normalized, ""
 
         voice_lang = self._tts_voice_language_for_event(event)
@@ -5337,7 +5337,7 @@ Provider 规则：{emotion_rule}
         ):
             authored_matches = list(
                 re.finditer(
-                    r"<tts\b[^>]*>.*?</tts>",
+                    r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>",
                     normalized,
                     flags=re.IGNORECASE | re.DOTALL,
                 )
@@ -5391,7 +5391,7 @@ Provider 规则：{emotion_rule}
         ):
             matches = list(
                 re.finditer(
-                    r"<tts\b[^>]*>.*?</tts>",
+                    r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>",
                     normalized,
                     flags=re.IGNORECASE | re.DOTALL,
                 )
@@ -5440,7 +5440,7 @@ Provider 规则：{emotion_rule}
             # substantially more visible content than the foreign block can cover.
             # Rebuild those cases from the complete visible source.
             visible = re.sub(
-                r"<tts\b[^>]*>.*?</tts>",
+                r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>",
                 "",
                 normalized,
                 flags=re.IGNORECASE | re.DOTALL,
@@ -5751,7 +5751,7 @@ Provider 规则：{emotion_rule}
                 else:
                     output.append(Plain(spoken))
             pos = match.end()
-        after = re.sub(r"</?t{2,}s\b[^>]*>", "", normalized[pos:], flags=re.IGNORECASE).strip()
+        after = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", normalized[pos:], flags=re.IGNORECASE).strip()
         visible_override = self._sanitize_tts_visible_text(
             getattr(event, "_private_companion_tts_visible_text_override", ""),
             max_chars=1000,

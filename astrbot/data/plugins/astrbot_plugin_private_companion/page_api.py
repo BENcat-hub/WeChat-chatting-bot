@@ -20186,11 +20186,11 @@ class PrivateCompanionPageApi(
             return ""
         if re.search(r"<t{2,}s\b[^>]*>.*?</t{2,}s>", source, flags=re.IGNORECASE | re.DOTALL):
             outside = re.sub(r"<t{2,}s\b[^>]*>.*?</t{2,}s>", "", source, flags=re.IGNORECASE | re.DOTALL)
-            outside = re.sub(r"</?t{2,}s\b[^>]*>", "", outside, flags=re.IGNORECASE).strip()
+            outside = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", outside, flags=re.IGNORECASE).strip()
             if re.search(r"[\u4e00-\u9fff]", outside):
                 source = outside
             else:
-                source = re.sub(r"</?t{2,}s\b[^>]*>", "", source, flags=re.IGNORECASE)
+                source = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", source, flags=re.IGNORECASE)
         if re.search(r"[\u3040-\u30ff]", source) and re.search(r"[\u4e00-\u9fff]", source):
             units = re.findall(r".*?[。！？!?…~～]+|.+$", source, flags=re.DOTALL)
             kept = [unit.strip() for unit in units if unit.strip() and not re.search(r"[\u3040-\u30ff]", unit)]

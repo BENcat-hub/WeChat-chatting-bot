@@ -195,7 +195,7 @@ _SEGMENTED_PROTECTED_FILE_SUFFIX_PATTERN = re.compile(
 _SEGMENTED_PROTECTED_LITERAL_PATTERN = re.compile(
     r"(?is)"
     r"<(?:image|img|video|record|audio|file)\b[^>]*(?:>.*?</(?:image|img|video|record|audio|file)>|/?>)"
-    r"|<tts\b[^>]*>.*?</tts>"
+    r"|<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>"
     r"|<[^>\n]{1,240}\bpath=\"[^\"]{1,500}\"[^>\n]*>"
     r"|<[^>\n]{1,240}\b(?:url|src)=\"[^\"]{1,500}\"[^>\n]*>"
     r"|(?i:\b(?:https?://|www\.)[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)"

@@ -1,0 +1,2564 @@
+"""Web API Mixin。
+
+通过 AstrBot 的 ``register_web_api`` 机制对外暴露 REST 接口，供 Plugin Page
+前端（``pages/dashboard/``）通过 bridge SDK（``AstrBotPluginPage.apiGet`` /
+``apiPost``）拉取数据。
+
+源码约束（已核对 ``astrbot/core/star/context.py`` + ``dashboard/server.py``，
+版本 4.25.5）：
+- ``Context.register_web_api(route, view_handler, methods, desc)`` —— **全部必填**，
+  handler 为 Quart view function（签名 ``async def handler(**kwargs)``），URL 路径
+  变量经 Werkzeug 匹配进 ``kwargs``；query / body 通过**全局** ``quart.request``
+  读取（``await request.json`` / ``request.args``）。
+- 最终 URL：``http://<host>/api/plug/<route>``（dashboard 统一加 ``/api/plug/``
+  前缀，route **不自动**含插件名 → 必须自带命名空间防全局路由冲突）。
+- 返回 ``dict`` / ``list`` 由 Quart 自动 JSON 序列化；``datetime`` 经
+  ``AstrBotJSONProvider`` 转 ISO。
+- 认证：需 dashboard JWT；Plugin Page 通过 bridge 由父级 SPA 代发（自动带 JWT）。
+
+降级原则：每个 handler 独立 try/except，失败返回 ``{"success": False, ...}``，
+绝不抛出未捕获异常。
+
+⚠️ 响应信封选用 ``{"success": True, "data": ...}``（而非 AstrBot 标准的
+``{"status": "ok", "data": ...}``）。原因（已核对参考插件 message_recorder
++ bridge 行为）：Plugin Page bridge 的父级 SPA 复用 AstrBot 的 dashboard API
+客户端，该客户端的响应拦截器会**自动解包标准 ``{status, data}`` 信封**——对
+``{status:"ok", data}`` 直接 resolve 解包后的 ``data``，故前端拿到的 ``r``
+是裸业务数据、不再含 ``status`` 字段，前端按 ``r.status`` 判定会落空。改用非
+标准的 ``{success, data}`` 信封后，父级不识别 ``status`` 字段即**原样透传**，
+前端再自行 ``extractData``（见 ``pages/dashboard/app.js``），与 message_recorder
+完全一致、跨版本稳定。
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+
+from .attributor import ESTIMATION_NOTE
+from .budget import resolve_tz
+from .config import (
+    CONFIG_DEFAULTS,
+    coerce_to_default_type,
+    deep_merge,
+    get_config,
+    normalize_budget_override,
+    normalize_fallback_provider,
+    save_plugin_config,
+    switches_from_config,
+)
+from .default_pricing import DEFAULT_PRICING
+from .price_sources import merged_provider_config
+from .pricing_clusters import (
+    build_provider_pricing_clusters,
+    normalize_pricing_multipliers,
+)
+
+PLUGIN_NAME = "astrbot_plugin_cost_control"
+
+# 缓存诊断说明：展示端统一引用，确保口径一致。
+CACHE_NOTE = (
+    "命中率 = cache_read / (cache_read + 非缓存输入 + cache_creation)；优化潜力按平均命中率分档："
+    "≥80% 优秀 / 60–80% 低 / 40–60% 中 / <40% 高。"
+)
+
+
+def _iso_utc(dt: datetime | None) -> str | None:
+    """把 ORM 读回的 datetime 序列化为带 UTC 偏移的 ISO 串（纯函数，便于测试）。
+
+    ``CacheEvent`` / ``CostSupplement`` 的 ``created_at`` 以 aware UTC 写入，但
+    SQLite DATETIME 存储格式不含时区偏移，读回为 naive（墙钟即 UTC）。前端
+    ``new Date()`` 对无偏移的 ISO 串按浏览器本地时区解析，会导致显示时间偏差
+    一个时区偏移量，故此处统一补 ``+00:00``；已带 tzinfo 的值原样输出。
+    """
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
+
+
+def _attach_selection_price(sel: dict[str, Any], catalog: Any) -> None:
+    """给单个 selection 条目附生效价格摘要（prompt/completion → input/output 映射）。"""
+    from .cost import catalog_field_values
+
+    entry = catalog.prices.get(str(sel.get("price_key") or ""))
+    if entry is not None:
+        sel["price"] = catalog_field_values(entry.to_dict())
+
+
+def _find_newapi_source_by_url(cfg: dict[str, Any], root: str) -> str | None:
+    """按归一化 base_url 在 price_sources 中查找已有的 New API 源（URL 去重判据）。"""
+    norm = lambda u: str(u or "").strip().rstrip("/").lower()  # noqa: E731
+
+    target = norm(root)
+    if not target:
+        return None
+    raw = cfg.get("price_sources") if isinstance(cfg, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    for sid, sc in raw.items():
+        if not isinstance(sid, str) or not sid.startswith("newapi:"):
+            continue
+        if isinstance(sc, dict) and norm(sc.get("base_url")) == target:
+            return sid
+    return None
+
+
+def _deleted_provider_residues(
+    provider_models: list[dict[str, Any]],
+    usage_by_provider: dict[str, dict[str, int]],
+    user_pricing: dict[str, Any],
+    pricing_schedules: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """汇总已不在当前配置中的 Provider 用量/定价残留（纯函数，便于测试）。"""
+    configured_ids = {
+        str(p.get("id") or "").strip()
+        for p in provider_models
+        if isinstance(p, dict) and str(p.get("id") or "").strip()
+    }
+    schedule_providers = {
+        str(target or "").split("|", 1)[0]
+        for target in (pricing_schedules or {})
+        if str(target or "").strip()
+    }
+    residue_ids = (set(usage_by_provider) | set(user_pricing) | schedule_providers) - configured_ids
+    out: list[dict[str, Any]] = []
+    for pid in residue_ids:
+        pid_s = str(pid or "").strip()
+        if not pid_s:
+            continue
+        usage = usage_by_provider.get(pid_s, {})
+        item = {
+            "provider_id": pid_s,
+            "tokens": int(usage.get("tokens", 0) or 0),
+            "count": int(usage.get("count", 0) or 0),
+            "has_pricing": pid_s in user_pricing,
+        }
+        if pid_s in schedule_providers:
+            item["has_pricing_schedule"] = True
+        out.append(item)
+    out.sort(key=lambda x: (-x["tokens"], x["provider_id"]))
+    return out
+
+
+def _normalize_api_pricing_entry(entry: Any) -> dict[str, Any]:
+    """Reject invalid writes before the tolerant config loader can turn them into zero."""
+    import math
+
+    from .config import _normalize_user_entry
+
+    fields = ("input", "input_cached", "output", "cache_creation")
+
+    def is_set(value: Any) -> bool:
+        return value is not None and not (isinstance(value, str) and not value.strip())
+
+    def number(value: Any, label: str) -> float:
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            result = float(value)
+        except (TypeError, ValueError, OverflowError) as e:
+            raise ValueError(f"{label} 必须是非负有限数") from e
+        if not math.isfinite(result) or result < 0:
+            raise ValueError(f"{label} 必须是非负有限数")
+        return result
+
+    def price_fields(raw: Any, label: str, *, suffix: str = "") -> bool:
+        if not isinstance(raw, dict):
+            raise ValueError(f"{label} 必须是对象")
+        configured = False
+        for field in fields:
+            key = field + suffix
+            if is_set(raw.get(key)):
+                number(raw[key], f"{label}.{key}")
+                configured = True
+        return configured
+
+    if not isinstance(entry, dict):
+        raise ValueError("定价条目必须是对象")
+    mode = str(entry.get("mode") or "per_token").strip().lower()
+    if mode == "per_token":
+        price_fields(entry, "pricing")
+    elif mode in ("per_turn", "per_request"):
+        number(entry.get("price"), "pricing.price")
+    elif mode == "per_tier":
+        if not price_fields(entry.get("base"), "pricing.base"):
+            raise ValueError("pricing.base 至少填写一项单价")
+        for key in ("context_tiers", "service_tiers"):
+            tiers = entry.get(key, [])
+            if not isinstance(tiers, list):
+                raise ValueError(f"pricing.{key} 必须是数组")
+            for index, tier in enumerate(tiers):
+                label = f"pricing.{key}[{index}]"
+                if not isinstance(tier, dict):
+                    raise ValueError(f"{label} 必须是对象")
+                if key == "context_tiers":
+                    threshold = tier.get("threshold_tokens")
+                    number(threshold, f"{label}.threshold_tokens")
+                    try:
+                        if int(threshold) != float(threshold):
+                            raise ValueError
+                    except (TypeError, ValueError, OverflowError) as e:
+                        raise ValueError(f"{label}.threshold_tokens 必须是非负整数") from e
+                    if not price_fields(tier, label):
+                        raise ValueError(f"{label} 至少填写一项单价")
+                else:
+                    if not isinstance(tier.get("match"), str) or not tier["match"].strip():
+                        raise ValueError(f"{label}.match 不能为空")
+                    if not price_fields(tier, label, suffix="_multiplier"):
+                        raise ValueError(f"{label} 至少填写一项倍率")
+    normalized = _normalize_user_entry(entry)
+    if normalized is None:
+        raise ValueError("定价模式、阶梯结构或计费表达式无效")
+    return normalized
+
+
+class WebApiMixin:
+    """注册 REST Web API 路由的 Mixin。"""
+
+    # 配置写端点在读取 request 后，从 self.cfg 快照到 save_plugin_config 的读改写
+    # 区间均为无 await 的同步段，因此单进程 Quart 事件循环内不会交错。若未来启用
+    # 多 worker/多进程写同一 data_dir，必须把这里升级为进程间文件锁。
+
+    # 由 ``Main`` 宿主提供（Mixin 不定义 ``__init__``）。
+    context: Any
+    config: Any
+    # 兄弟 Mixin 提供。
+    build_report: Any
+    get_budgets: Any
+    get_budgets_cost: Any
+    get_budget_overrides: Any
+    get_fallback_providers: Any
+    query_usage: Any
+    query_usage_grouped: Any
+    query_supplements: Any
+    query_user_token_total: Any
+    query_user_cost_total: Any
+    query_usage_timeseries: Any
+    query_cache_events: Any
+    cleanup_old_supplements: Any
+    delete_supplements_by_provider: Any
+    delete_usage_by_provider: Any
+    purge_module: Any
+    # AiDiagMixin 提供。
+    run_ai_diag: Any
+    get_cached_diag: Any
+    _get_default_provider_id: Any
+    _get_provider_display_name: Any
+    get_pricing: Any
+    get_data_dir: Any
+    register_cron: Any
+    daily_report: Any
+
+    def _invalidate_runtime_pricing(self, reason: str) -> None:
+        invalidate = getattr(self, "invalidate_pricing_cache", None)
+        if callable(invalidate):
+            invalidate(reason)
+
+    def register_routes(self) -> None:
+        """注册所有 Web API 路由（在 ``Main.initialize`` 中调用，幂等）。
+
+        route 自带 ``/astrbot_plugin_cost_control/`` 命名空间。任何注册异常仅记日志，
+        不阻断插件加载（对应端点不可用，其余能力不受影响）。
+        """
+        try:
+            reg = self.context.register_web_api
+            prefix = f"/{PLUGIN_NAME}"
+            routes: list[tuple[str, Any, list[str], str]] = [
+                (f"{prefix}/overview", self.api_overview, ["GET"], "总览聚合报表"),
+                (
+                    f"{prefix}/alerts",
+                    self.api_alerts,
+                    ["GET"],
+                    "总览告警列表（缓存率/未定价/预算等）",
+                ),
+                (f"{prefix}/report", self.api_report, ["GET"], "综合报表（同 overview）"),
+                (f"{prefix}/compare", self.api_compare, ["GET"], "环比对比（当前 vs 上一窗口）"),
+                (f"{prefix}/timeline", self.api_timeline, ["GET"], "时序趋势（按天/小时分桶）"),
+                (f"{prefix}/records", self.api_records, ["GET"], "每请求明细记录"),
+                (
+                    f"{prefix}/records/aggregate",
+                    self.api_records_aggregate,
+                    ["GET"],
+                    "明细二级聚合（按模型/会话）",
+                ),
+                (f"{prefix}/budgets", self.api_budgets, ["GET"], "预算配置与消耗"),
+                (f"{prefix}/providers", self.api_providers, ["GET"], "可用 Provider 列表"),
+                (f"{prefix}/cache", self.api_cache, ["GET"], "缓存命中率与诊断事件"),
+                (f"{prefix}/attribution", self.api_attribution, ["GET"], "归因报表"),
+                (f"{prefix}/pricing", self.api_pricing, ["GET"], "模型单价表"),
+                (f"{prefix}/config", self.api_config, ["GET"], "当前插件配置"),
+                (f"{prefix}/actions/cleanup", self.api_action_cleanup, ["POST"], "手动清理"),
+                (f"{prefix}/actions/purge", self.api_action_purge, ["POST"], "按模块清空数据"),
+                (
+                    f"{prefix}/actions/delete_provider_data",
+                    self.api_action_delete_provider_data,
+                    ["POST"],
+                    "删除已下线 Provider 的历史数据",
+                ),
+                (f"{prefix}/actions/report", self.api_action_report, ["POST"], "手动推送日报"),
+                (
+                    f"{prefix}/actions/save_config",
+                    self.api_action_save_config,
+                    ["POST"],
+                    "保存预算/策略配置（热生效）",
+                ),
+                (
+                    f"{prefix}/actions/sync_rates",
+                    self.api_action_sync_rates,
+                    ["POST"],
+                    "同步最新汇率",
+                ),
+                (
+                    f"{prefix}/ai_provider",
+                    self.api_ai_provider,
+                    ["GET"],
+                    "查询默认 AI Provider",
+                ),
+                (
+                    f"{prefix}/ai_diag",
+                    self.api_ai_diag,
+                    ["POST"],
+                    "AI 智能成本诊断",
+                ),
+                (
+                    f"{prefix}/ai_diag_last",
+                    self.api_ai_diag_last,
+                    ["GET"],
+                    "上次 AI 诊断缓存结果",
+                ),
+                (
+                    f"{prefix}/pricing/sync",
+                    self.api_pricing_sync,
+                    ["POST"],
+                    "拉取价格源并更新价格目录",
+                ),
+                (
+                    f"{prefix}/pricing/catalog",
+                    self.api_pricing_catalog,
+                    ["GET"],
+                    "价格目录（源状态+条目，不含 raw）",
+                ),
+                (
+                    f"{prefix}/pricing/sources/detect",
+                    self.api_pricing_detect,
+                    ["POST"],
+                    "探测 provider 是否为 New API 价格源",
+                ),
+                (
+                    f"{prefix}/pricing/select",
+                    self.api_pricing_select,
+                    ["POST"],
+                    "保存用户选定的价格源",
+                ),
+                (
+                    f"{prefix}/pricing/select/reset",
+                    self.api_pricing_select_reset,
+                    ["POST"],
+                    "清除用户价格源选择",
+                ),
+                (
+                    f"{prefix}/pricing/expr/validate",
+                    self.api_pricing_expr_validate,
+                    ["POST"],
+                    "校验 tiered_expr 计费表达式",
+                ),
+            ]
+            for route, handler, methods, desc in routes:
+                try:
+                    reg(route, handler, methods, desc)
+                except Exception:
+                    pass  # 单条失败不影响其它端点
+        except Exception:
+            pass
+
+    # ===== 通用辅助 =====
+
+    @staticmethod
+    def _ok(data: Any = None, **extra: Any) -> dict[str, Any]:
+        out: dict[str, Any] = {"success": True}
+        if data is not None:
+            out["data"] = data
+        out.update(extra)
+        return out
+
+    @staticmethod
+    def _err(message: str) -> dict[str, Any]:
+        return {"success": False, "error": message}
+
+    @staticmethod
+    def _param(name: str, default: str = "") -> str:
+        """从 Quart 全局 ``request.args`` 读 query 参数（延迟导入）。"""
+        try:
+            from quart import request
+
+            return request.args.get(name, default)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _parse_iso(s: str | None, *, is_end: bool = False) -> datetime | None:
+        """把 ISO 字符串解析为 aware UTC datetime（失败返回 None）。
+
+        接受 ``2026-06-15``（按 UTC 00:00）、``2026-06-15T01:02:03``、
+        带偏移的 ISO。无时区信息者按 UTC 处理。
+
+        Args:
+            is_end: True 时纯日期输入取当天最后一微秒（查询 end 使用 <=）。
+        """
+        if not s:
+            return None
+        try:
+            from datetime import UTC, timedelta
+
+            raw = str(s).strip()
+            is_date_only = len(raw) == 10 and raw[4] == "-" and raw[7] == "-"
+            # 纯日期补全为 00:00:00
+            if is_date_only:
+                raw = raw + "T00:00:00"
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            else:
+                dt = dt.astimezone(UTC)
+            # 仅 end 参数：包容当天，排除次日午夜。
+            if is_end and is_date_only:
+                dt = dt + timedelta(days=1) - timedelta(microseconds=1)
+            return dt
+        except Exception:
+            return None
+
+    @staticmethod
+    def _supplement_to_dict(
+        s: Any,
+        pricing: dict[str, Any] | None = None,
+        main_cur: str = "$",
+        rates: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """把 ``CostSupplement`` 行序列化为 JSON 友好 dict。
+
+        ``pricing`` 非空时按生效定价算出本条成本 ``cost``（未定价为 0.0）。per_request
+        模式单条无法独立计费（需 distinct request_id 聚合），此处按 0 近似。
+
+        若记录有固化的 ``cost_amount`` + ``currency_symbol``，则 ``cost`` 按当前汇率
+        从固化的原始货币换算到主货币 ``main_cur``，``cost_original`` 保留原始金额；
+        否则 ``cost`` 由 pricing 即时算出（回退，用于历史未回填行）。
+        """
+        from .cost import TieredExprEvaluationError, compute_cost_in_main
+        from .exchange_rates import convert
+
+        created = getattr(s, "created_at", None)
+        token_input_other = int(getattr(s, "token_input_other", 0) or 0)
+        token_input_cached = int(getattr(s, "token_input_cached", 0) or 0)
+        token_output = int(getattr(s, "token_output", 0) or 0)
+        cache_creation = getattr(s, "cache_creation", None)
+
+        cost_amount = getattr(s, "cost_amount", None)
+        currency_symbol = getattr(s, "currency_symbol", None)
+
+        cost: float | None = 0.0
+        cost_original = None
+        cost_error = None
+        if cost_amount is not None:
+            # 有固化金额 → 按当前汇率换算到主货币
+            cost_original = round(float(cost_amount), 6)
+            cur = str(currency_symbol or "USD")
+            cost = round(convert(cost_original, cur, main_cur, rates or {}), 6)
+        elif pricing is not None:
+            # 回退：无固化金额，按定价即时算并换算到主货币；expr 失败置 None 而非打挂接口
+            try:
+                cost = round(
+                    compute_cost_in_main(
+                        {
+                            "token_input_other": token_input_other,
+                            "token_input_cached": token_input_cached,
+                            "token_output": token_output,
+                            "cache_creation": cache_creation,
+                            "billing_context": getattr(s, "billing_context", None),
+                            "created_at": created,
+                        },
+                        getattr(s, "provider_id", None) or None,
+                        getattr(s, "provider_model", None),
+                        pricing,
+                        main_cur,
+                        rates or {},
+                    ),
+                    6,
+                )
+            except TieredExprEvaluationError as e:
+                cost = None
+                cost_error = str(e)
+
+        return {
+            "umo": getattr(s, "umo", "") or "",
+            "provider_id": getattr(s, "provider_id", "") or "",
+            "provider_model": getattr(s, "provider_model", None),
+            "conversation_id": getattr(s, "conversation_id", None),
+            "token_input_other": token_input_other,
+            "token_input_cached": token_input_cached,
+            "token_output": token_output,
+            "cache_creation": cache_creation,
+            "cache_read": getattr(s, "cache_read", None),
+            "injection_total": getattr(s, "injection_total", None),
+            "attribution": getattr(s, "attribution", None),
+            "cost": cost,
+            "cost_error": cost_error,
+            "cost_original": cost_original,
+            "currency_symbol": currency_symbol,
+            "pricing_period_id": getattr(s, "pricing_period_id", None),
+            "pricing_period_name": getattr(s, "pricing_period_name", None),
+            "created_at": _iso_utc(created),
+        }
+
+    # ===== 端点 =====
+
+    async def api_overview(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /overview``：总览聚合报表（用量 / 成本 / 缓存 / 归因）。"""
+        try:
+            window = self._param("window", "daily") or "daily"
+            report = await self.build_report(window=window)
+            return self._ok(report)
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_ai_provider(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /ai_provider``：查询当前 AI 诊断 Provider 及可用列表。
+
+        返回 ``provider_id`` / ``provider_name`` / ``available``，以及
+        ``providers``（所有可用的 chat_completion provider 供前端下拉选择）。
+        """
+        try:
+            from .config import get_config
+
+            cfg = getattr(self, "cfg", None) or {}
+            configured_id = get_config(cfg, "ai_diag_provider_id", "") or ""
+            provider_id = configured_id or self._get_default_provider_id()
+            provider_name = self._get_provider_display_name(provider_id)
+
+            # 收集所有可用的 provider 供前端选择（与 /providers 端点同源，
+            # 确保下拉列表与预算页一致）
+            providers: list[dict[str, str]] = []
+            try:
+                for entry in self._collect_provider_models():
+                    pid = str(entry.get("id") or "").strip()
+                    if not pid:
+                        continue
+                    model = str(entry.get("model") or "").strip()
+                    name = f"{model} ({pid})" if model else pid
+                    providers.append({"id": pid, "name": name})
+            except Exception:
+                pass
+
+            return self._ok(
+                {
+                    "provider_id": provider_id,
+                    "provider_name": provider_name,
+                    "available": provider_id is not None,
+                    "providers": providers,
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_ai_diag(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /ai_diag``：执行 AI 智能成本诊断。
+
+        收集5个维度数据（成本/缓存/归因/预算/定价），调用默认 LLM Provider
+        综合分析，返回结构化 JSON 结论（评分/风险/建议）。成功后自动缓存。
+        """
+        try:
+            result = await self.run_ai_diag()
+            return self._ok(result)
+        except Exception as e:
+            return self._err(f"{type(e).__name__}: {e}")
+
+    async def api_ai_diag_last(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /ai_diag_last``：返回上次诊断缓存结果 + 时效信息。
+
+        前端据此决定是否直接展示旧结果（<2h）或回到一键诊断（>2h）。
+        """
+        try:
+            return self._ok(self.get_cached_diag())
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_alerts(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /alerts``：总览页顶部告警列表（黄色提醒，引导用户处理）。
+
+        Query：``window``（daily|weekly|monthly，默认 daily）—— 仅影响缓存率
+        统计的窗口；未定价 / 预算告警基于全量历史与当前配置，不受窗口影响。
+
+        每条告警：``{level, code, title, detail, tab}``。``tab`` 为前端目标页
+        （cache|pricing|budgets），用于点击跳转。任一子检查异常降级跳过，绝不
+        阻断其它告警。
+        """
+        alerts: list[dict[str, Any]] = []
+        window = self._param("window", "daily") or "daily"
+
+        # 1. 缓存命中率偏低（与 /cache 同口径，但独立查询避免互相依赖）
+        try:
+            from datetime import UTC, datetime
+
+            from .analytics import report_window_start
+            from .cache_diag import hit_rate
+
+            now = datetime.now(UTC)
+            tz = resolve_tz(self.context)
+            refresh = str(get_config(getattr(self, "cfg", None), "refresh_time", "00:00"))
+            start = report_window_start(window, now, tz, refresh)
+            sups = await self.query_supplements(start=start, limit=5000)
+            rates: list[float] = []
+            for s in sups:
+                cache_read = getattr(s, "cache_read", None)
+                if cache_read is None:
+                    cache_read = getattr(s, "token_input_cached", None)
+                rate = hit_rate(
+                    cache_read,
+                    getattr(s, "token_input_other", None),
+                    getattr(s, "cache_creation", None),
+                )
+                if rate >= 0:
+                    rates.append(rate)
+            samples = len(rates)
+            avg = round(sum(rates) / samples, 1) if samples else 0.0
+            # 样本>=5 且命中率<30% 才告警，避免小样本噪音
+            if samples >= 5 and avg < 30:
+                alerts.append(
+                    {
+                        "level": "warn",
+                        "code": "low_cache_rate",
+                        "title": "缓存命中率偏低",
+                        "detail": (
+                            f"当前窗口平均缓存命中率 {avg}%（{samples} 样本）。"
+                            "缓存命中单价仅为非缓存的 1/10，提升命中率可显著降低成本。"
+                            "排查 system prompt 稳定性、上下文重置、工具定义频繁变化。"
+                        ),
+                        "tab": "cache",
+                    }
+                )
+        except Exception:
+            pass
+
+        # 2. 存在未定价模型（与 /pricing 同口径）
+        try:
+            from .cost import resolve_pricing
+
+            pricing = self.get_pricing()
+            unpriced_count = 0
+            unpriced_tokens = 0
+            rows = await self.query_usage_grouped(by="provider_model")
+            for r in rows:
+                provider_id = r.get("provider_id") or ""
+                model = r.get("provider_model") or ""
+                if model and resolve_pricing(provider_id or None, model, pricing) is None:
+                    unpriced_count += 1
+                    unpriced_tokens += (
+                        int(r.get("token_input_other", 0) or 0)
+                        + int(r.get("token_input_cached", 0) or 0)
+                        + int(r.get("token_output", 0) or 0)
+                    )
+            if unpriced_count > 0:
+                alerts.append(
+                    {
+                        "level": "warn",
+                        "code": "unpriced_models",
+                        "title": "存在未定价模型",
+                        "detail": (
+                            f"检测到 {unpriced_count} 个模型未配置定价"
+                            f"（涉及 {unpriced_tokens} token 用量），其成本被计为 $0，"
+                            "导致成本统计偏低。请前往定价页为对应 provider 设置单价。"
+                        ),
+                        "tab": "pricing",
+                    }
+                )
+        except Exception:
+            pass
+
+        # 3. 预算超限 / 接近超限（复用 /budgets 的全局维度判定）
+        try:
+            from .budget import _DIM_ORDER, day_window_start, month_window_start, total_tokens
+
+            cfg = getattr(self, "cfg", None)
+            limits = self.get_budgets()
+            limits_cost = self.get_budgets_cost()
+            now = datetime.now(UTC)
+            tz = resolve_tz(self.context)
+            refresh = str(get_config(cfg, "refresh_time", "00:00"))
+            d_start = day_window_start(refresh, now, tz)
+            m_start = month_window_start(now, tz)
+            day_total = total_tokens(await self.query_usage(start=d_start))
+            month_total = total_tokens(await self.query_usage(start=m_start))
+
+            has_cost = any(float(limits_cost.get(d, 0) or 0) > 0 for d in _DIM_ORDER)
+            if has_cost:
+                from .cost import compute_cost_grouped_in_main
+                from .exchange_rates import get_main_currency, get_rates
+
+                _main_cur = get_main_currency(cfg)
+                _rates = get_rates(cfg)
+                pricing = self.get_pricing()
+                day_cost = compute_cost_grouped_in_main(
+                    await self.query_usage_cost_rows(pricing, start=d_start),
+                    pricing,
+                    _main_cur,
+                    _rates,
+                )
+                month_cost = compute_cost_grouped_in_main(
+                    await self.query_usage_cost_rows(pricing, start=m_start),
+                    pricing,
+                    _main_cur,
+                    _rates,
+                )
+            else:
+                day_cost = month_cost = 0.0
+
+            dim_used_t = {"global_daily": day_total, "global_monthly": month_total}
+            dim_used_c = {"global_daily": day_cost, "global_monthly": month_cost}
+            dim_label = {"global_daily": "每日全局", "global_monthly": "每月全局"}
+
+            # 将各维度 cost 限额换算到主货币（budgets_cost_currency 可能设了独立货币）
+            from .config import get_budgets_cost_currency
+            from .exchange_rates import convert as _conv_alert
+            from .exchange_rates import get_main_currency, get_rates
+
+            _alert_bcc = get_budgets_cost_currency(cfg)
+            _alert_main = get_main_currency(cfg)
+            _alert_rates = get_rates(cfg)
+
+            exceeded_dims: list[str] = []
+            near_dims: list[str] = []
+            for d in _DIM_ORDER:
+                lt = float(limits.get(d, 0) or 0)
+                lc_raw = float(limits_cost.get(d, 0) or 0)
+                d_cur = str(_alert_bcc.get(d, "") or "") or _alert_main
+                lc = (
+                    round(_conv_alert(lc_raw, d_cur, _alert_main, _alert_rates), 6)
+                    if lc_raw > 0 and d_cur != _alert_main
+                    else lc_raw
+                )
+                for metric, limit, used in (
+                    ("token", lt, dim_used_t.get(d, 0)),
+                    ("cost", lc, dim_used_c.get(d, 0)),
+                ):
+                    if limit <= 0:
+                        continue
+                    ratio = used * 100.0 / limit
+                    label = f"{dim_label.get(d, d)}·{metric}"
+                    if used >= limit:
+                        exceeded_dims.append(f"{label}（{ratio:.0f}%）")
+                    elif ratio >= 80:
+                        near_dims.append(f"{label}（{ratio:.0f}%）")
+
+            if exceeded_dims:
+                alerts.append(
+                    {
+                        "level": "warn",
+                        "code": "budget_exceeded",
+                        "title": "预算已超限",
+                        "detail": (
+                            f"以下 {len(exceeded_dims)} 项预算已超限："
+                            + "、".join(exceeded_dims[:4])
+                            + ("…" if len(exceeded_dims) > 4 else "")
+                            + "。请前往预算页调整限额或超限策略。"
+                        ),
+                        "tab": "budgets",
+                    }
+                )
+            if near_dims:
+                alerts.append(
+                    {
+                        "level": "warn",
+                        "code": "budget_near_limit",
+                        "title": "预算接近超限",
+                        "detail": (
+                            f"以下 {len(near_dims)} 项预算使用率超过 80%："
+                            + "、".join(near_dims[:4])
+                            + ("…" if len(near_dims) > 4 else "")
+                            + "。建议提前关注用量趋势。"
+                        ),
+                        "tab": "budgets",
+                    }
+                )
+        except Exception:
+            pass
+
+        return self._ok(alerts)
+
+    async def api_report(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /report``：综合报表（与 overview 等价，保留独立语义）。"""
+        return await self.api_overview(**kwargs)
+
+    async def api_compare(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /compare``：当前窗口 vs 上一窗口的 cost/count/tokens 环比。
+
+        Query：``window``（daily|weekly|monthly，默认 daily）。当前窗口与报表口径
+        一致，上一窗口为紧邻的等长（月度按自然月）上一段（见
+        :func:`analytics.compare_windows`）。``previous`` 为 0 时对应 ``delta`` 百分比
+        为 ``null``（前端显示「新增」）。
+        """
+        try:
+            from datetime import UTC, datetime, timedelta
+
+            from .analytics import compare_windows
+            from .budget import total_tokens
+
+            window = self._param("window", "daily") or "daily"
+            now = datetime.now(UTC)
+            tz = resolve_tz(self.context)
+            refresh = str(get_config(getattr(self, "cfg", None), "refresh_time", "00:00"))
+            cur_start, cur_end, prev_start, prev_end = compare_windows(window, now, tz, refresh)
+            pricing = self.get_pricing()
+            from .config import get_currency_symbol, get_rates
+
+            main_cur = get_currency_symbol(getattr(self, "cfg", None))
+            rates = get_rates(getattr(self, "cfg", None))
+            from .cost import compute_cost_grouped_in_main
+
+            async def _stats(start: datetime, end: datetime) -> dict[str, Any]:
+                usage = await self.query_usage(start=start, end=end)
+                rows = await self.query_usage_cost_rows(pricing, start=start, end=end)
+                cost = compute_cost_grouped_in_main(rows, pricing, main_cur, rates)
+                return {
+                    "cost": cost,
+                    "count": int(usage.get("count", 0) or 0),
+                    "tokens": total_tokens(usage),
+                }
+
+            cur = await _stats(cur_start, cur_end)
+            prev = await _stats(prev_start, prev_end - timedelta(microseconds=1))
+
+            def _pct(c: float, p: float) -> float | None:
+                return round((c - p) * 100.0 / p, 1) if p > 0 else None
+
+            label = "昨日" if window == "daily" else "近 7 天" if window == "weekly" else "近 30 天"
+            return self._ok(
+                {
+                    "window": window,
+                    "current": cur,
+                    "previous": prev,
+                    "delta": {
+                        "cost_pct": _pct(cur["cost"], prev["cost"]),
+                        "count_pct": _pct(cur["count"], prev["count"]),
+                        "tokens_pct": _pct(cur["tokens"], prev["tokens"]),
+                    },
+                    "label": label,
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_timeline(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /timeline``：用量 / 调用次数时序（基于 ProviderStat 全量历史）。
+
+        Query：``days``（默认 14，上限 90）、``bucket``（day|hour，默认 day）、
+        ``umo`` / ``provider`` / ``model``（可选筛选）。
+        """
+        try:
+            from datetime import UTC, timedelta
+
+            try:
+                days = max(1, min(90, int(self._param("days", "14"))))
+            except (TypeError, ValueError):
+                days = 14
+            bucket = self._param("bucket", "day") or "day"
+            end = datetime.now(UTC)
+            start = end - timedelta(days=days)
+            umo = self._param("umo") or None
+            provider = self._param("provider") or None
+            model = self._param("model") or None
+            series = await self.query_usage_timeseries(
+                start=start,
+                end=end,
+                bucket=bucket,
+                umo=umo,
+                provider=provider,
+                model=model,
+            )
+
+            # 按桶计算成本趋势：拉取 (bucket, model) 粒度用量 → 逐桶按模型定价核算
+            cost_series: list[dict[str, Any]] = []
+            try:
+                from .cost import compute_row_cost_in_main
+                from .exchange_rates import get_main_currency, get_rates
+
+                pricing = self.get_pricing()
+                _mc = get_main_currency(getattr(self, "cfg", None))
+                _rt = get_rates(getattr(self, "cfg", None))
+                model_rows = await self.query_usage_cost_timeseries(
+                    pricing,
+                    start=start,
+                    end=end,
+                    bucket=bucket,
+                    umo=umo,
+                    provider=provider,
+                    model=model,
+                )
+                # 按 bucket 聚合成本
+                bucket_cost: dict[str, float] = {}
+                for mr in model_rows:
+                    bk = str(mr.get("bucket") or "")
+                    if not bk:
+                        continue
+                    c = compute_row_cost_in_main(mr, pricing, _mc, _rt)
+                    bucket_cost[bk] = bucket_cost.get(bk, 0.0) + c
+                cost_series = [
+                    {"bucket": bk, "cost": round(v, 6)} for bk, v in sorted(bucket_cost.items())
+                ]
+            except Exception:
+                pass
+
+            return self._ok(
+                {
+                    "series": series,
+                    "cost_series": cost_series,
+                    "bucket": bucket,
+                    "days": days,
+                    "coverage_note": "基于 ProviderStat 全量历史（按 UTC 分桶，展示为本地日）",
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_records(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /records``：每请求补充明细（umo / model / token 三类 / cache / 归因）。
+
+        Query：``umo`` / ``provider`` / ``model``（可选筛选）、``start`` / ``end``
+        （ISO）、``order_by``（created_at|token_input_other|token_output|umo）、
+        ``order_dir``（desc|asc）、``limit``（默认 100，上限 1000）。
+        """
+        try:
+            umo = self._param("umo") or None
+            provider = self._param("provider") or None
+            model = self._param("model") or None
+            start = self._parse_iso(self._param("start"))
+            end = self._parse_iso(self._param("end"), is_end=True)
+            try:
+                limit = max(1, min(1000, int(self._param("limit", "100"))))
+            except (TypeError, ValueError):
+                limit = 100
+            order_by = self._param("order_by", "created_at") or "created_at"
+            order_dir = self._param("order_dir", "desc") or "desc"
+            rows = await self.query_supplements(
+                umo=umo,
+                provider_id=provider,
+                provider_model=model,
+                start=start,
+                end=end,
+                limit=limit,
+                order_by=order_by,
+                order_dir=order_dir,
+            )
+            pricing = self.get_pricing()
+            from .config import get_currency_symbol, get_rates
+
+            main_cur = get_currency_symbol(getattr(self, "cfg", None))
+            rates = get_rates(getattr(self, "cfg", None))
+            return self._ok([self._supplement_to_dict(r, pricing, main_cur, rates) for r in rows])
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_records_aggregate(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /records/aggregate``：按模型 / provider / 会话聚合 ProviderStat 用量。
+
+        Query：``by``（model|provider|umo，默认 model）、``umo`` / ``provider`` / ``model``
+        （可选）、``start`` / ``end``（ISO）。返回每组的 token 三类、条数、成本、占比。
+        """
+        try:
+            by = self._param("by", "model") or "model"
+            if by not in ("model", "provider", "umo"):
+                by = "model"
+            start = self._parse_iso(self._param("start"))
+            end = self._parse_iso(self._param("end"), is_end=True)
+            umo = self._param("umo") or None
+            provider = self._param("provider") or None
+            model = self._param("model") or None
+            pricing = self.get_pricing()
+            from .config import get_currency_symbol, get_rates
+
+            main_cur = get_currency_symbol(getattr(self, "cfg", None))
+            rates = get_rates(getattr(self, "cfg", None))
+            from .cost import compute_row_cost_in_main
+
+            # model / provider 维度：用 (provider_id, provider_model) 底层行精确算成本
+            # （按 provider_id 匹配用户定价），再二次聚合到请求维度。会话维度另外
+            # 查询每个会话的 Provider/模型明细，避免把已定价的消耗显示为免费。
+            groups: dict[str, dict[str, Any]] = {}
+            if by == "umo":
+                rows = await self.query_usage_grouped(
+                    by="umo",
+                    umo=umo,
+                    provider=provider,
+                    model=model,
+                    start=start,
+                    end=end,
+                )
+                for r in rows:
+                    key = r.get("key") or ""
+                    g = groups.setdefault(
+                        key,
+                        {
+                            "key": key,
+                            "count": 0,
+                            "tokens": 0,
+                            "token_input_other": 0,
+                            "token_input_cached": 0,
+                            "token_output": 0,
+                            "cost": 0.0,
+                        },
+                    )
+                    tio = int(r.get("token_input_other", 0) or 0)
+                    tic = int(r.get("token_input_cached", 0) or 0)
+                    tio_out = int(r.get("token_output", 0) or 0)
+                    g["count"] += int(r.get("count", 0) or 0)
+                    g["tokens"] += tio + tic + tio_out
+                    g["token_input_other"] += tio
+                    g["token_input_cached"] += tic
+                    g["token_output"] += tio_out
+                    if key:
+                        cost_rows = await self.query_usage_cost_rows(
+                            pricing,
+                            umo=key,
+                            provider=provider,
+                            model=model,
+                            start=start,
+                            end=end,
+                        )
+                        g["cost"] += sum(
+                            compute_row_cost_in_main(row, pricing, main_cur, rates)
+                            for row in cost_rows
+                        )
+            else:
+                pm_rows = await self.query_usage_cost_rows(
+                    pricing,
+                    umo=umo,
+                    provider=provider,
+                    model=model,
+                    start=start,
+                    end=end,
+                )
+                for r in pm_rows:
+                    key = (r.get("provider_model") if by == "model" else r.get("provider_id")) or ""
+                    g = groups.setdefault(
+                        key,
+                        {
+                            "key": key,
+                            "count": 0,
+                            "tokens": 0,
+                            "token_input_other": 0,
+                            "token_input_cached": 0,
+                            "token_output": 0,
+                            "cost": 0.0,
+                        },
+                    )
+                    tio = int(r.get("token_input_other", 0) or 0)
+                    tic = int(r.get("token_input_cached", 0) or 0)
+                    tio_out = int(r.get("token_output", 0) or 0)
+                    g["count"] += int(r.get("count", 0) or 0)
+                    g["tokens"] += tio + tic + tio_out
+                    g["token_input_other"] += tio
+                    g["token_input_cached"] += tic
+                    g["token_output"] += tio_out
+                    g["cost"] += compute_row_cost_in_main(r, pricing, main_cur, rates)
+
+            total_tokens = sum(int(g["tokens"]) for g in groups.values())
+            out: list[dict[str, Any]] = []
+            for g in groups.values():
+                g["cost"] = round(float(g["cost"]), 6)
+                g["pct"] = round(g["tokens"] * 100.0 / total_tokens, 1) if total_tokens else 0.0
+                out.append(g)
+            out.sort(key=lambda x: x["cost"], reverse=True)
+            return self._ok(
+                {
+                    "by": by,
+                    "total_tokens": total_tokens,
+                    "groups": out,
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_budgets(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /budgets``：预算配置 + 5 维全局消耗 + 局部阈值 + 备用 Provider 库。
+
+        返回结构：
+        ```
+        {
+          "limits": {dim: int},
+          "limits_cost": {dim: float},
+          "dimensions": {dim: {token: {limit, used, ratio, exceeded, top_key, note}, cost: ...}},
+          "overrides": [
+            {id, enabled, target_type, target_value, token_limit, cost_limit,
+             on_exceeded, stop_message, fallback_provider_ids, fallback_token_limit,
+             current: {token: {used, ratio, exceeded}, cost: {used, ratio, exceeded}}},
+            ...
+          ],
+          "fallback_providers": [{id, enabled, note}, ...],
+          "global_default_on_exceeded": "stop"|"fallback"|"warn",
+        }
+        ```
+        全局维度给精确消耗；局部维度（per_session/per_user/per_model）给「本周期消耗
+        最多的会话/模型」代表值（运行时按请求 umo/model 实时拦截，无单一全局值）。
+        """
+        try:
+            from datetime import UTC, datetime
+
+            from .budget import (
+                _DIM_ORDER,
+                day_window_start,
+                default_on_exceeded,
+                get_budget_overrides,
+                get_fallback_providers,
+                month_window_start,
+                total_tokens,
+            )
+
+            cfg = getattr(self, "cfg", None)
+            limits = self.get_budgets()
+            limits_cost = self.get_budgets_cost()
+            has_cost = any(float(limits_cost.get(d, 0) or 0) > 0 for d in _DIM_ORDER)
+            now = datetime.now(UTC)
+            tz = resolve_tz(self.context)
+            refresh = str(get_config(cfg, "refresh_time", "00:00"))
+            d_start = day_window_start(refresh, now, tz)
+            m_start = month_window_start(now, tz)
+            day_usage = await self.query_usage(start=d_start)
+            month_usage = await self.query_usage(start=m_start)
+            day_total = total_tokens(day_usage)
+            month_total = total_tokens(month_usage)
+
+            # 局部维度的代表值：今日消耗最多的会话 / 模型
+            top_session = await self.query_usage_grouped(by="umo", start=d_start)
+            top_session.sort(key=lambda r: total_tokens(r), reverse=True)
+            ses_used = total_tokens(top_session[0]) if top_session else 0
+            ses_key = str((top_session[0] or {}).get("key", "")) if top_session else ""
+            top_model = await self.query_usage_grouped(by="provider_model", start=d_start)
+            top_model.sort(key=lambda r: total_tokens(r), reverse=True)
+            mod_used = total_tokens(top_model[0]) if top_model else 0
+            mod_key = str((top_model[0] or {}).get("provider_model", "")) if top_model else ""
+
+            # 主货币 + 汇率（成本维度统一换算到主货币口径）
+            from .exchange_rates import get_main_currency, get_rates
+
+            main_cur = get_main_currency(cfg)
+            rates = get_rates(cfg)
+
+            if has_cost:
+                from .cost import compute_cost_grouped_in_main
+
+                pricing = self.get_pricing()
+                day_cost = compute_cost_grouped_in_main(
+                    await self.query_usage_cost_rows(pricing, start=d_start),
+                    pricing,
+                    main_cur,
+                    rates,
+                )
+                month_cost = compute_cost_grouped_in_main(
+                    await self.query_usage_cost_rows(pricing, start=m_start),
+                    pricing,
+                    main_cur,
+                    rates,
+                )
+                ses_cost = (
+                    compute_cost_grouped_in_main(
+                        await self.query_usage_cost_rows(pricing, umo=ses_key, start=d_start),
+                        pricing,
+                        main_cur,
+                        rates,
+                    )
+                    if ses_key
+                    else 0.0
+                )
+                mod_cost = (
+                    compute_cost_grouped_in_main(
+                        await self.query_usage_cost_rows(pricing, model=mod_key, start=d_start),
+                        pricing,
+                        main_cur,
+                        rates,
+                    )
+                    if mod_key
+                    else 0.0
+                )
+            else:
+                day_cost = month_cost = ses_cost = mod_cost = 0.0
+
+            # 全局 cost 限额可能带每维度货币（budgets_cost_currency），统一换算到主货币。
+            # limits_cost 保留原始值供前端编辑框初始值，limits_cost_main 供展示/判定。
+            from .config import get_budgets_cost_currency
+            from .exchange_rates import convert as _conv
+
+            _bcc = get_budgets_cost_currency(cfg)
+            limits_cost_main: dict[str, float] = {}
+            for _d in _DIM_ORDER:
+                _lc_raw = float(limits_cost.get(_d, 0) or 0)
+                _d_cur = str(_bcc.get(_d, "") or "") or main_cur
+                limits_cost_main[_d] = (
+                    round(_conv(_lc_raw, _d_cur, main_cur, rates), 6)
+                    if _lc_raw > 0 and _d_cur != main_cur
+                    else _lc_raw
+                )
+
+            def _part(limit: Any, used: Any) -> dict[str, Any]:
+                limit = float(limit or 0)
+                used = float(used or 0)
+                return {
+                    "limit": limit,
+                    "used": used,
+                    "ratio": round(used * 100.0 / limit, 1) if limit > 0 else 0.0,
+                    "exceeded": limit > 0 and used >= limit,
+                }
+
+            def _dim_entry(
+                key: str, used_t: Any, used_c: Any, top_key: str = "", note: str = ""
+            ) -> dict[str, Any]:
+                return {
+                    "token": {
+                        **_part(limits.get(key, 0), used_t),
+                        "top_key": top_key,
+                        "note": note,
+                    },
+                    "cost": {
+                        **_part(limits_cost_main.get(key, 0), used_c),
+                        "top_key": top_key,
+                        "note": note,
+                    },
+                }
+
+            # ===== 局部阈值：聚合每条规则的实时 used =====
+            overrides_raw = get_budget_overrides(cfg)
+            pricing = self.get_pricing() if has_cost or overrides_raw else {}
+            if has_cost or overrides_raw:
+                from .cost import compute_cost_grouped_in_main
+
+            overrides_out: list[dict[str, Any]] = []
+            for idx, ov in enumerate(overrides_raw):
+                used_t_v = 0.0
+                used_c_v = 0.0
+                tt = str(ov.get("target_type") or "")
+                tv = str(ov.get("target_value") or "")
+                try:
+                    if tt == "umo":
+                        if ov.get("token_limit", 0) > 0:
+                            used_t_v = float(
+                                total_tokens(await self.query_usage(umo=tv, start=d_start))
+                            )
+                        if ov.get("cost_limit", 0) > 0:
+                            used_c_v = compute_cost_grouped_in_main(
+                                await self.query_usage_cost_rows(pricing, umo=tv, start=d_start),
+                                pricing,
+                                main_cur,
+                                rates,
+                            )
+                    elif tt == "provider":
+                        if ov.get("token_limit", 0) > 0:
+                            used_t_v = float(
+                                total_tokens(await self.query_usage(provider=tv, start=d_start))
+                            )
+                        if ov.get("cost_limit", 0) > 0:
+                            used_c_v = compute_cost_grouped_in_main(
+                                await self.query_usage_cost_rows(
+                                    pricing, provider=tv, start=d_start
+                                ),
+                                pricing,
+                                main_cur,
+                                rates,
+                            )
+                    elif tt == "user":
+                        if ov.get("token_limit", 0) > 0 and hasattr(self, "query_user_token_total"):
+                            used_t_v = float(await self.query_user_token_total(tv, d_start))
+                        if ov.get("cost_limit", 0) > 0 and hasattr(self, "query_user_cost_total"):
+                            used_c_v = round(
+                                await self.query_user_cost_total(
+                                    tv, d_start, pricing, main_cur, rates
+                                ),
+                                6,
+                            )
+                except Exception:
+                    # 单条 override 聚合失败不影响其它条
+                    pass
+
+                def _ratio(used: float, limit: Any) -> dict[str, Any]:
+                    limit_f = float(limit or 0)
+                    return {
+                        "limit": round(limit_f, 6),
+                        "used": round(used, 6),
+                        "ratio": round(used * 100.0 / limit_f, 1) if limit_f > 0 else 0.0,
+                        "exceeded": limit_f > 0 and used >= limit_f,
+                    }
+
+                # override 的 cost_limit 可能带 cost_currency，先换算到主货币再比较/展示。
+                # cost_limit / cost_currency 保留原始值供前端编辑框；current.cost 用主货币口径。
+                _ov_lc = float(ov.get("cost_limit") or 0.0)
+                _ov_cur = str(ov.get("cost_currency") or "") or main_cur
+                _ov_lc_main = (
+                    round(_conv(_ov_lc, _ov_cur, main_cur, rates), 6)
+                    if _ov_lc > 0 and _ov_cur != main_cur
+                    else _ov_lc
+                )
+                overrides_out.append(
+                    {
+                        "id": f"ovo_{idx}",
+                        "enabled": bool(ov.get("enabled", True)),
+                        "target_type": tt,
+                        "target_value": tv,
+                        "token_limit": int(ov.get("token_limit") or 0),
+                        "cost_limit": float(ov.get("cost_limit") or 0.0),
+                        "cost_currency": str(ov.get("cost_currency") or ""),
+                        "on_exceeded": str(ov.get("on_exceeded") or "stop"),
+                        "stop_message": str(ov.get("stop_message") or ""),
+                        "fallback_provider_ids": list(ov.get("fallback_provider_ids") or []),
+                        "fallback_token_limit": int(ov.get("fallback_token_limit") or 0),
+                        "current": {
+                            "token": _ratio(used_t_v, ov.get("token_limit", 0)),
+                            "cost": _ratio(used_c_v, _ov_lc_main),
+                        },
+                    }
+                )
+
+            fallback_providers = get_fallback_providers(cfg)
+
+            # 各维度 cost 限额的独立货币（budgets_cost_currency）
+            from .config import get_currency_symbol
+            from .exchange_rates import get_rate_updated_at
+
+            return self._ok(
+                {
+                    "limits": limits,
+                    "limits_cost": limits_cost,
+                    "limits_cost_main": limits_cost_main,
+                    "limits_cost_currency": get_budgets_cost_currency(cfg),
+                    "currency_symbol": get_currency_symbol(cfg),
+                    "exchange_rates": rates,
+                    "exchange_rates_updated_at": get_rate_updated_at(cfg),
+                    "dimensions": {
+                        "global_daily": _dim_entry("global_daily", day_total, day_cost),
+                        "global_monthly": _dim_entry("global_monthly", month_total, month_cost),
+                        "per_session_daily": _dim_entry(
+                            "per_session_daily",
+                            ses_used,
+                            ses_cost,
+                            ses_key,
+                            "今日消耗最多的会话",
+                        ),
+                        "per_user_daily": _dim_entry(
+                            "per_user_daily",
+                            ses_used,
+                            ses_cost,
+                            ses_key,
+                            "展示为今日消耗最多的会话；运行时按请求 user_id 跨会话聚合拦截",
+                        ),
+                        "per_model_daily": _dim_entry(
+                            "per_model_daily",
+                            mod_used,
+                            mod_cost,
+                            mod_key,
+                            "今日消耗最多的模型",
+                        ),
+                    },
+                    "overrides": overrides_out,
+                    "fallback_providers": fallback_providers,
+                    "global_default_on_exceeded": default_on_exceeded(cfg),
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    def _collect_provider_models(self) -> list[dict[str, Any]]:
+        """从 ``context.get_config()`` 遍历 provider 配置，返回 provider + 候选模型列表。
+
+        每个 provider 读 ``id`` / ``type`` / ``provider_source_id`` / 顶层 ``model``
+        （主模型，回退
+        ``model_config.model``）/ 顶层 ``model_list``（候选模型数组，回退
+        ``model_config.model_list``，每项 ``model_name`` / ``enable``），合并主模型
+        + 启用候选，按 id 去重，并用 ``provider_sources`` 补供应商名称，返回
+        ``[{id, model, type, candidates, supplier_id, supplier_name}]``。
+
+        字段位置：4.25.5 起 provider 的 ``model`` / ``model_list`` 在顶层（已核对
+        ``astrbot/core/config/default.py``），旧版在 ``model_config`` 内，故两层兼容。
+        三级降级：顶层/model_config 读 model → 回退 ``get_all_providers().meta()``
+        单 model → 空列表。全步骤 try 包裹，绝不抛异常。
+        """
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        # 1. 优先从主配置读 provider 全量模型（含 model_list 候选）
+        try:
+            cfg = self.context.get_config() or {}
+            prov_list = cfg.get("provider") if isinstance(cfg, dict) else None
+            source_list = cfg.get("provider_sources") if isinstance(cfg, dict) else None
+            source_by_id: dict[str, dict[str, Any]] = {}
+            if isinstance(source_list, list):
+                for source in source_list:
+                    if not isinstance(source, dict):
+                        continue
+                    source_id = str(source.get("id") or "").strip()
+                    if source_id:
+                        source_by_id[source_id] = source
+            if isinstance(prov_list, list):
+                for p in prov_list:
+                    try:
+                        if not isinstance(p, dict):
+                            continue
+                        pid = str(p.get("id") or "").strip()
+                        if not pid or pid in seen:
+                            continue
+                        seen.add(pid)
+                        supplier_id = str(p.get("provider_source_id") or "").strip()
+                        source = source_by_id.get(supplier_id, {})
+                        supplier_id = supplier_id or pid
+                        supplier_name = str(
+                            source.get("name")
+                            or source.get("display_name")
+                            or source.get("id")
+                            or p.get("provider_source_name")
+                            or supplier_id
+                        ).strip()
+                        ptype = str(p.get("type") or source.get("type") or "")
+                        mc = p.get("model_config") or {}
+                        if not isinstance(mc, dict):
+                            mc = {}
+                        # 主模型:顶层 model(4.25.5+) → model_config.model(旧版)
+                        main_model = str(p.get("model") or mc.get("model") or "").strip() or None
+                        candidates: list[str] = []
+                        # 候选列表:顶层 model_list → model_config.model_list
+                        ml = p.get("model_list")
+                        if ml is None:
+                            ml = mc.get("model_list")
+                        if isinstance(ml, list):
+                            for it in ml:
+                                if not isinstance(it, dict):
+                                    continue
+                                if not it.get("enable", True):
+                                    continue
+                                m = str(it.get("model_name") or it.get("model") or "").strip()
+                                if m and m not in candidates:
+                                    candidates.append(m)
+                        if main_model and main_model not in candidates:
+                            candidates.insert(0, main_model)
+                        out.append(
+                            {
+                                "id": pid,
+                                "model": main_model or "",
+                                "type": ptype,
+                                "candidates": candidates,
+                                "supplier_id": supplier_id,
+                                "supplier_name": supplier_name or supplier_id,
+                            }
+                        )
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        # 2. 运行时 get_all_providers().meta() 兜底:补 model 为空的 provider,并追加
+        #    配置里没有的运行时 provider(meta() 字段最可靠,解决个别 provider type
+        #    配置结构特殊导致顶层 model 读不到的情况)。
+        try:
+            all_provs = self.context.get_all_providers()
+        except Exception:
+            all_provs = []
+        by_id: dict[str, dict[str, Any]] = {e["id"]: e for e in out}
+        for p in all_provs or []:
+            try:
+                meta = p.meta()
+                pid = str(getattr(meta, "id", "") or "").strip()
+                if not pid:
+                    continue
+                model = str(getattr(meta, "model", "") or "").strip()
+                mtype = str(getattr(meta, "type", "") or "")
+                if pid in by_id:
+                    entry = by_id[pid]
+                    if not entry["model"] and model:
+                        entry["model"] = model
+                    if model and model not in entry["candidates"]:
+                        entry["candidates"].insert(0, model)
+                    if not entry["type"] and mtype:
+                        entry["type"] = mtype
+                elif pid not in seen:
+                    seen.add(pid)
+                    entry = {
+                        "id": pid,
+                        "model": model,
+                        "type": mtype,
+                        "candidates": [model] if model else [],
+                        "supplier_id": pid,
+                        "supplier_name": pid,
+                    }
+                    by_id[pid] = entry
+                    out.append(entry)
+            except Exception:
+                continue
+        return out
+
+    async def api_providers(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /providers``：astrbot 当前配置的 Provider 列表（含候选模型）。
+
+        经 :meth:`_collect_provider_models` 取全部 provider 及其候选模型。任一步异常
+        兜空，绝不抛出。
+        """
+        try:
+            return self._ok({"providers": self._collect_provider_models()})
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_cache(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /cache``：缓存命中率 + 所有会话最近的破坏诊断事件。
+
+        Query：``window``（daily|weekly|monthly，默认 daily）按报表窗口
+        （见 :func:`analytics.report_window_start`）过滤命中率与 token 聚合统计；
+        ``limit``（默认 100，上限 500）。token 总量为**窗口全量**（SQL 聚合），
+        命中率基于最近 ``limit`` 条样本（见 ``sampled_supplements``）。
+        缓存破坏事件始终取最近 ``limit`` 条，**不受 window 影响**。
+        """
+        try:
+            from datetime import UTC, datetime
+
+            from .analytics import report_window_start
+
+            try:
+                limit = max(1, min(500, int(self._param("limit", "100"))))
+            except (TypeError, ValueError):
+                limit = 100
+            window = self._param("window", "daily") or "daily"
+            now = datetime.now(UTC)
+            tz = resolve_tz(self.context)
+            refresh = str(get_config(getattr(self, "cfg", None), "refresh_time", "00:00"))
+            start = report_window_start(window, now, tz, refresh)
+            sups = await self.query_supplements(start=start, limit=limit)
+            from .cache_diag import hit_rate
+
+            rates: list[float] = []
+            for s in sups:
+                cache_read = getattr(s, "cache_read", None)
+                if cache_read is None:
+                    cache_read = getattr(s, "token_input_cached", None)
+                rate = hit_rate(
+                    cache_read,
+                    getattr(s, "token_input_other", None),
+                    getattr(s, "cache_creation", None),
+                )
+                if rate >= 0:
+                    rates.append(rate)
+            # 窗口总量走 SQL 全量聚合（supplements 只取了最近 limit 条样本，
+            # 直接求和会把窗口总量截断成样本总量）；命中率仍基于样本计算。
+            total_input_other, total_input_cached, total_output = (
+                await self.sum_supplement_tokens(start=start)
+            )
+            avg = round(sum(rates) / len(rates), 1) if rates else 0.0
+
+            events: list[dict[str, Any]] = []
+            try:
+                ev_rows = await self.query_cache_events(limit=50)
+                for r in ev_rows:
+                    created = getattr(r, "created_at", None)
+                    events.append(
+                        {
+                            "umo": getattr(r, "umo", "") or "",
+                            "type": getattr(r, "type", "") or "",
+                            "severity": getattr(r, "severity", "medium") or "medium",
+                            "detail": getattr(r, "detail", "") or "",
+                            "before": getattr(r, "before", None),
+                            "after": getattr(r, "after", None),
+                            "created_at": _iso_utc(created),
+                        }
+                    )
+            except Exception:
+                events = []
+            return self._ok(
+                {
+                    "cache_hit_rate": avg,
+                    "samples": len(rates),
+                    "total_input_other": total_input_other,
+                    "total_input_cached": total_input_cached,
+                    "total_output": total_output,
+                    "sampled_supplements": len(sups),
+                    "events": events,
+                    "cache_note": CACHE_NOTE,
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_attribution(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /attribution``：最近请求的归因（各组件占比 + 注入量）。
+
+        Query：``window``（daily|weekly|monthly，默认 daily）按与总览一致的报表窗口
+        （见 :func:`analytics.report_window_start`）过滤；``limit``（默认 50，上限 500）。
+        """
+        try:
+            from datetime import UTC, datetime
+
+            from .analytics import report_window_start
+
+            try:
+                limit = max(1, min(500, int(self._param("limit", "50"))))
+            except (TypeError, ValueError):
+                limit = 50
+            window = self._param("window", "daily") or "daily"
+            now = datetime.now(UTC)
+            tz = resolve_tz(self.context)
+            refresh = str(get_config(getattr(self, "cfg", None), "refresh_time", "00:00"))
+            start = report_window_start(window, now, tz, refresh)
+            sups = await self.query_supplements(start=start, limit=limit)
+            items: list[dict[str, Any]] = []
+            comps: dict[str, list[int]] = {
+                "system": [],
+                "tools": [],
+                "history": [],
+                "user": [],
+                "extra": [],
+            }
+            for s in sups:
+                attr = getattr(s, "attribution", None)
+                inj = getattr(s, "injection_total", None)
+                created = getattr(s, "created_at", None)
+                item: dict[str, Any] = {
+                    "umo": getattr(s, "umo", "") or "",
+                    "injection_total": inj,
+                    "attribution": attr,
+                    "created_at": _iso_utc(created),
+                }
+                items.append(item)
+                if isinstance(attr, dict):
+                    for k in comps:
+                        v = attr.get(k)
+                        if isinstance(v, int):
+                            comps[k].append(v)
+            avg = {k: round(sum(v) / len(v)) if v else 0 for k, v in comps.items()}
+            return self._ok(
+                {"recent": items, "avg_components": avg, "estimation_note": ESTIMATION_NOTE}
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_pricing(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /pricing``：定价页所需全部数据。
+
+        返回 ``{provider_models, deleted_providers, user_pricing, defaults,
+        pricing_clusters, pricing_multipliers, unpriced}``：
+
+        - ``provider_models``：当前 AstrBot 配置的全部 provider 及其候选模型（见
+          :meth:`_collect_provider_models`），供前端按 provider 展示与编辑。
+        - ``deleted_providers``：已不在当前配置中、但仍有历史用量或自定义定价的
+          Provider 残留，供前端明确标注并提供精确删除入口。
+        - ``user_pricing``：用户自定义定价（``cfg["pricing"]``，key=provider_id）。
+        - ``defaults``：内置出厂默认单价（``DEFAULT_PRICING``，key=模型名，per_token），
+          供前端折叠区只读展示与 per_token 预填基准。
+        - ``pricing_clusters``：当前 AstrBot Provider 按 ``provider_source_id`` 聚合的目录；
+          只包含现有 Provider/模型，不展开完整内置价格库。
+        - ``pricing_multipliers``：用户为 AstrBot Provider Source 聚类设置的倍率
+          （缺省聚类视为 1 倍）。
+        - ``unpriced``：全量历史（``query_usage_grouped(by="provider_model")``）中
+          :func:`cost.resolve_pricing` 解析不到定价的 (provider,model)——其成本被计
+          为 0，会使成本统计偏低，需提示用户补定价。附 token 量表明失真影响范围。
+        """
+        try:
+            from .cost import resolve_pricing
+
+            pricing = self.get_pricing()
+            unpriced: list[dict[str, Any]] = []
+            usage_by_provider: dict[str, dict[str, int]] = {}
+            # provider_id → 实际运行时模型名列表（来自用量记录，与成本计算同源）。
+            # 配置里的 model / candidates 可能是路由名 / auto / 空，但运行时实际
+            # 调用的模型名能匹配内置默认——用这些名字作为 matched_default 的回退。
+            runtime_models: dict[str, list[str]] = {}
+            try:
+                rows = await self.query_usage_grouped(by="provider_model")
+                for r in rows:
+                    provider_id = r.get("provider_id") or ""
+                    model = r.get("provider_model") or ""
+                    tokens = (
+                        int(r.get("token_input_other", 0) or 0)
+                        + int(r.get("token_input_cached", 0) or 0)
+                        + int(r.get("token_output", 0) or 0)
+                    )
+                    if provider_id:
+                        agg = usage_by_provider.setdefault(provider_id, {"tokens": 0, "count": 0})
+                        agg["tokens"] += tokens
+                        agg["count"] += int(r.get("count", 0) or 0)
+                    if model and resolve_pricing(provider_id or None, model, pricing) is None:
+                        unpriced.append(
+                            {
+                                "provider_id": provider_id,
+                                "model": model,
+                                "tokens": tokens,
+                                "count": int(r.get("count", 0) or 0),
+                            }
+                        )
+                    if (
+                        provider_id
+                        and model
+                        and model not in runtime_models.setdefault(provider_id, [])
+                    ):
+                        runtime_models[provider_id].append(model)
+                unpriced.sort(key=lambda x: x["tokens"], reverse=True)
+            except Exception:
+                pass  # 用量查询失败不阻断定价表展示
+            from .cost import _best_match_key
+
+            provider_models = self._collect_provider_models()
+            # 为每个 provider 附「实际匹配到的内置默认」(经 _best_match_key 模糊匹配,
+            # 与 resolve_pricing / match_pricing 同口径),供前端定价卡提示当前生效基准，
+            # 并把命中单价作为编辑框 placeholder（用户输入即覆盖）。
+            # 依次尝试：主模型 → 候选模型 → 运行时实际模型（用量记录，与计费同源）
+            # → provider id 自身（部分 id 直接含模型名，如 minimax/MiniMax-M2.7）。
+            # 后两级解决配置 model 为路由名 / auto / 空但实际命中的模型能匹配内置默认、
+            # 卡片却误显示"无内置匹配"的问题。
+            for p in provider_models:
+                try:
+                    candidates = p.get("candidates") or []
+                    model = p.get("model") or ""
+                    pid = p.get("id") or ""
+                    tried = [model] + [c for c in candidates if c and c != model]
+                    for m in runtime_models.get(pid, []):
+                        if m and m not in tried:
+                            tried.append(m)
+                    if pid and pid not in tried:
+                        tried.append(pid)
+                    md: Any = None
+                    for m in tried:
+                        key = _best_match_key(m, DEFAULT_PRICING)
+                        if key:
+                            md = {"model": key, "entry": DEFAULT_PRICING[key]}
+                            break
+                    p["matched_default"] = md
+                except Exception:
+                    p["matched_default"] = None
+            user_pricing = pricing.get("user", {})
+            if not isinstance(user_pricing, dict):
+                user_pricing = {}
+            deleted_providers = _deleted_provider_residues(
+                provider_models,
+                usage_by_provider,
+                user_pricing,
+                pricing.get("schedules", {}),
+            )
+            # 已删除项也提示其历史模型能否命中内置价，避免把原本可定价的数据误标为
+            # “未定价”。显示仍以 Provider 配置名为主，不伪造已不存在的供应商 type。
+            for item in deleted_providers:
+                pid = item["provider_id"]
+                tried = list(runtime_models.get(pid, []))
+                if pid not in tried:
+                    tried.append(pid)
+                item["models"] = list(runtime_models.get(pid, []))
+                item["matched_default"] = None
+                for model in tried:
+                    key = _best_match_key(model, DEFAULT_PRICING)
+                    if key:
+                        item["matched_default"] = {
+                            "model": key,
+                            "entry": DEFAULT_PRICING[key],
+                        }
+                        break
+            from .config import get_currency_symbol
+            from .exchange_rates import get_rate_updated_at, get_rates
+
+            _pcfg = getattr(self, "cfg", None)
+            # 多源价格目录：源状态/用户选择/候选/自动匹配（失败不阻断基础字段）。
+            sources_status: dict[str, Any] = {}
+            selections: dict[str, Any] = {}
+            candidates: dict[str, Any] = {}
+            auto_selected: dict[str, Any] = {}
+            try:
+                from .config import get_price_selections, get_price_sources
+                from .price_catalog import select_auto_candidate
+
+                cat = await self._load_catalog()
+                configured_sources = get_price_sources(_pcfg)
+                enabled_sources = {
+                    sid for sid, config in configured_sources.items() if config.get("enabled")
+                }
+                sources_status = {sid: s.to_dict() for sid, s in cat.sources.items()}
+                for sid, config in configured_sources.items():
+                    status = sources_status.setdefault(
+                        sid,
+                        {
+                            "source": sid,
+                            "status": "pending",
+                            "models": 0,
+                            "skipped": 0,
+                            "error": "",
+                            "not_modified": False,
+                        },
+                    )
+                    status["enabled"] = bool(config.get("enabled"))
+                    if config.get("provider_id"):
+                        status["provider_id"] = str(config["provider_id"])
+                    if config.get("base_url"):
+                        status["base_url"] = str(config["base_url"])
+                selections = get_price_selections(_pcfg)
+                # 附生效价格摘要，前端已选价直接回显，无需另查 catalog
+                for _per_model in selections.values():
+                    if not isinstance(_per_model, dict):
+                        continue
+                    for _sel in _per_model.values():
+                        if isinstance(_sel, dict):
+                            _attach_selection_price(_sel, cat)
+                for p in provider_models:
+                    pid = p.get("id") or ""
+                    if not pid:
+                        continue
+                    models_to_check: list[str] = []
+                    mm = p.get("model") or ""
+                    if mm:
+                        models_to_check.append(mm)
+                    for c in p.get("candidates") or []:
+                        if c and c not in models_to_check:
+                            models_to_check.append(c)
+                    for rm in runtime_models.get(pid, []):
+                        if rm and rm not in models_to_check:
+                            models_to_check.append(rm)
+                    for m in models_to_check:
+                        psel = selections.get(pid, {})
+                        if isinstance(psel, dict) and psel.get(m, {}).get("confirmed"):
+                            continue  # 用户已确认，不再进候选/自动匹配
+                        cands = cat.find_candidates(m, sources=enabled_sources)
+                        if not cands:
+                            continue
+                        auto = select_auto_candidate(cands)
+                        if auto is not None:
+                            auto_selected.setdefault(pid, {})[m] = auto.price_key
+                        else:
+                            candidates.setdefault(pid, {})[m] = [
+                                self._candidate_brief(c) for c in cands[:8]
+                            ]
+            except Exception:
+                pass
+            return self._ok(
+                {
+                    "provider_models": provider_models,
+                    "deleted_providers": deleted_providers,
+                    "user_pricing": user_pricing,
+                    "pricing_schedules": pricing.get("schedules", {}),
+                    "pricing_timezone": pricing.get("timezone", "Asia/Shanghai"),
+                    "defaults": DEFAULT_PRICING,
+                    "pricing_clusters": build_provider_pricing_clusters(provider_models),
+                    "pricing_multipliers": pricing.get("multipliers", {}),
+                    "unpriced": unpriced,
+                    "currency_symbol": get_currency_symbol(_pcfg),
+                    "exchange_rates": get_rates(_pcfg),
+                    "exchange_rates_updated_at": get_rate_updated_at(_pcfg),
+                    "sources": sources_status,
+                    "selections": selections,
+                    "candidates": candidates,
+                    "auto_selected": auto_selected,
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    # ===== 多源价格目录（multi-source-pricing）=====
+
+    def _pricing_data_dir(self) -> str:
+        return getattr(self, "_data_dir", None) or str(self.get_data_dir())
+
+    def _provider_cfg_fn(self):
+        """构建 ``provider_id → 合并后的 provider 配置``回调（供 New API 源解析 api_base/key）。
+
+        委托 :func:`price_sources.merged_provider_config`：>=4.25.5 按
+        ``provider_source_id`` 用 ``provider_sources[]`` 条目回填 ``api_base`` / ``key``
+        （带 /v1 的 base 由 derive_newapi_root 统一剥离）；平铺旧结构原样返回。
+        """
+
+        def _get(pid: str) -> dict[str, Any] | None:
+            try:
+                return merged_provider_config(self.context.get_config(), pid)
+            except Exception:
+                pass
+            return None
+
+        return _get
+
+    @staticmethod
+    def _candidate_brief(c: Any) -> dict[str, Any]:
+        """候选序列化为紧凑 dict（不含 raw，控制响应体积）。"""
+        p = c.price
+        return {
+            "price_key": c.price_key,
+            "source": c.source,
+            "source_model_id": c.source_model_id,
+            "score": round(c.score, 4),
+            "reason": c.reason,
+            "mode": p.mode,
+            "prompt": p.prompt,
+            "completion": p.completion,
+            "cache_read": p.cache_read,
+            "cache_creation": p.cache_creation,
+            "price": p.price,
+            "context_tiers": len(p.context_tiers or []),
+            "service_tiers": len(p.service_tiers or []),
+            "expr": (p.expr or "")[:120] if p.mode == "tiered_expr" else "",
+        }
+
+    async def _load_catalog(self):
+        """加载价格目录（异步 + 按文件 stat 缓存）。
+
+        目录可达数 MB，同步解析会阻塞事件循环，且此前每个请求都全量重读。
+        这里按 ``(path, mtime_ns, size, inode)`` 缓存已解析实例：同步写经
+        ``PriceCatalog.save`` 的 ``os.replace`` 落盘（新 inode），stat 变化即失效。
+        缓存实例只读复用（``find_candidates`` 的内部候选缓存共享，无副作用）。
+        """
+        import asyncio
+        import os
+
+        from .price_catalog import _catalog_path, load_catalog
+
+        data_dir = self._pricing_data_dir()
+        path = _catalog_path(data_dir)
+        try:
+            st = os.stat(path)
+            key: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            key = None  # 文件不存在：load_catalog 返回空目录，开销可忽略
+        cached = getattr(self, "_catalog_cache", None)
+        if cached is not None and cached[0] == path and cached[1] == key:
+            return cached[2]
+        cat = await asyncio.to_thread(load_catalog, data_dir)
+        self._catalog_cache = (path, key, cat)
+        return cat
+
+    async def api_pricing_sync(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /pricing/sync``：拉取启用（或 body 指定）价格源并更新目录。"""
+        try:
+            from quart import request
+
+            from .price_sources import sync_all
+
+            try:
+                body = await request.json
+            except Exception:
+                body = None
+            sources = None
+            if isinstance(body, dict):
+                raw = body.get("sources")
+                if isinstance(raw, list):
+                    sources = [str(s) for s in raw]
+            cfg = getattr(self, "cfg", None) or {}
+            report = await sync_all(
+                cfg,
+                self._pricing_data_dir(),
+                sources=sources,
+                provider_cfg=self._provider_cfg_fn(),
+            )
+            self._invalidate_runtime_pricing("manual_price_sync")
+            return self._ok(report)
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_pricing_catalog(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /pricing/catalog``：源状态 + 价格条目（不含 raw，控制体积）。"""
+        try:
+            cat = await self._load_catalog()
+            prices: dict[str, Any] = {}
+            for key, p in cat.prices.items():
+                d = p.to_dict()
+                d.pop("raw", None)
+                prices[key] = d
+            return self._ok(
+                {
+                    "updated_at": cat.updated_at,
+                    "sources": {sid: s.to_dict() for sid, s in cat.sources.items()},
+                    "prices": prices,
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_pricing_detect(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /pricing/sources/detect``：匿名探测 provider 是否为 New API 源。"""
+        try:
+            import asyncio
+            import json
+
+            from quart import request
+
+            from .price_sources import derive_newapi_root, http_get, is_http_url, newapi_pricing_url
+
+            try:
+                body = await request.json
+            except Exception:
+                body = None
+            if not isinstance(body, dict):
+                return self._err("请求体必须是 JSON 对象")
+            pid = str(body.get("provider_id") or "").strip()
+            if not pid:
+                return self._err("缺少 provider_id")
+            provider = self._provider_cfg_fn()(pid)
+            root = derive_newapi_root(str((provider or {}).get("api_base") or ""))
+            base = {
+                "provider_id": pid,
+                "base_url": root,
+                # 同 URL 已有源时前端复用，避免一个实例建 N 个重复源
+                "existing_source": _find_newapi_source_by_url(
+                    deep_merge(CONFIG_DEFAULTS, getattr(self, "cfg", {}) or {}), root
+                ),
+            }
+            if not is_http_url(root):
+                return self._ok(
+                    {
+                        **base,
+                        "is_newapi": False,
+                        "models": 0,
+                        "needs_key": False,
+                        "error": "api_base 缺失或非法",
+                    }
+                )
+            url = newapi_pricing_url(root)
+            body_b, status, _h, err = await asyncio.to_thread(http_get, url, {}, 8.0)
+            if err or status != 200 or body_b is None:
+                return self._ok(
+                    {
+                        **base,
+                        "is_newapi": False,
+                        "models": 0,
+                        "needs_key": False,
+                        "error": err or f"HTTP {status}",
+                    }
+                )
+            try:
+                data = json.loads(body_b.decode("utf-8"))
+            except Exception:
+                data = None
+            ok = (
+                isinstance(data, dict)
+                and bool(data.get("success"))
+                and isinstance(data.get("data"), list)
+            )
+            models = len(data.get("data") or []) if ok else 0
+            return self._ok(
+                {
+                    **base,
+                    "is_newapi": bool(ok),
+                    "models": models,
+                    "needs_key": bool(ok and models == 0),
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_pricing_select(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /pricing/select``：用户确认某 (provider,model) 选用某 price_key。"""
+        try:
+            from quart import request
+
+            from .config import get_price_selections
+
+            try:
+                body = await request.json
+            except Exception:
+                body = None
+            if not isinstance(body, dict):
+                return self._err("请求体必须是 JSON 对象")
+            pid = str(body.get("provider_id") or "").strip()
+            model = str(body.get("model") or "").strip()
+            price_key = str(body.get("price_key") or "").strip()
+            if not pid or not model or not price_key:
+                return self._err("provider_id / model / price_key 均必填")
+            cat = await self._load_catalog()
+            price = cat.prices.get(price_key)
+            if price is None:
+                return self._err(f"价格条目不存在：{price_key}（请先同步价格源）")
+            cfg = deep_merge(CONFIG_DEFAULTS, getattr(self, "cfg", {}) or {})
+            sel = get_price_selections(cfg)
+            score, reason = 0.0, "manual"
+            for c in cat.find_candidates(model):
+                if c.price_key == price_key:
+                    score, reason = c.score, c.reason
+                    break
+            sel.setdefault(pid, {})[model] = {
+                "price_key": price_key,
+                "source": price.source,
+                "source_model_id": price.source_model_id,
+                "confirmed": True,
+                "auto": False,
+                "score": score,
+                "reason": reason,
+            }
+            cfg["price_selections"] = sel
+            save_plugin_config(self._pricing_data_dir(), cfg)
+            self.cfg = deep_merge(CONFIG_DEFAULTS, cfg)
+            self._invalidate_runtime_pricing("price_selection_changed")
+            _attach_selection_price(sel[pid][model], cat)
+            return self._ok({"selected": sel[pid][model]})
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_pricing_select_reset(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /pricing/select/reset``：清除选择。``{provider_id, model?}``。"""
+        try:
+            from quart import request
+
+            from .config import get_price_selections
+
+            try:
+                body = await request.json
+            except Exception:
+                body = None
+            if not isinstance(body, dict):
+                return self._err("请求体必须是 JSON 对象")
+            pid = str(body.get("provider_id") or "").strip()
+            model = str(body.get("model") or "").strip()
+            if not pid:
+                return self._err("缺少 provider_id")
+            cfg = deep_merge(CONFIG_DEFAULTS, getattr(self, "cfg", {}) or {})
+            sel = get_price_selections(cfg)
+            removed = 0
+            if pid in sel:
+                if model:
+                    if model in sel[pid]:
+                        del sel[pid][model]
+                        removed = 1
+                    if not sel[pid]:
+                        del sel[pid]
+                else:
+                    removed = len(sel[pid])
+                    del sel[pid]
+            cfg["price_selections"] = sel
+            save_plugin_config(self._pricing_data_dir(), cfg)
+            self.cfg = deep_merge(CONFIG_DEFAULTS, cfg)
+            self._invalidate_runtime_pricing("price_selection_reset")
+            return self._ok({"removed": removed})
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_pricing_expr_validate(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /pricing/expr/validate``：校验 tiered_expr 表达式（P2 引擎接入）。"""
+        try:
+            from quart import request
+
+            try:
+                body = await request.json
+            except Exception:
+                body = None
+            if not isinstance(body, dict):
+                return self._err("请求体必须是 JSON 对象")
+            expr = str(body.get("expr") or "").strip()
+            if not expr:
+                return self._err("缺少 expr")
+            try:
+                from .expr_eval import eval_tiered_expr, validate_tiered_expr
+            except Exception as e:
+                return self._err(f"表达式引擎导入失败：{type(e).__name__}: {e}")
+            err = validate_tiered_expr(expr)
+            if err:
+                return self._ok({"valid": False, "error": err, "samples": []})
+            # 试算预览：两组示例 token 输入下的 USD 成本与命中阶梯名
+            samples: list[dict[str, Any]] = []
+            for p, c in ((100_000, 5_000), (250_000, 10_000)):
+                try:
+                    raw, tier = eval_tiered_expr(expr, {"p": p, "c": c})
+                    samples.append({"p": p, "c": c, "usd": raw / 1_000_000, "tier": tier or ""})
+                except Exception:
+                    continue
+            return self._ok({"valid": True, "error": "", "samples": samples})
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_config(self, **kwargs: Any) -> dict[str, Any]:
+        """``GET /config``：当前插件配置（不含密钥，仅预算 / 单价 / 诊断等设置）。"""
+        try:
+            cfg = getattr(self, "cfg", None) or {}
+            return self._ok(dict(cfg) if isinstance(cfg, dict) else {})
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_action_cleanup(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /actions/cleanup``：手动清理过期补充记录，返回删除条数。
+
+        清理窗口取 ``schedule.retain_days``（<=0 表示不清理，返回 0）。
+        """
+        try:
+            from datetime import UTC, datetime, timedelta
+
+            sched = get_config(getattr(self, "cfg", None), "schedule", {}) or {}
+            days = int(sched.get("retain_days", 0) or 0) if isinstance(sched, dict) else 0
+            if days <= 0:
+                return self._ok({"deleted": 0, "message": "retain_days<=0，未清理"})
+            before = datetime.now(UTC) - timedelta(days=days)
+            n = await self.cleanup_old_supplements(before)
+            return self._ok({"deleted": n})
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_action_report(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /actions/report``：手动触发日报推送（推送给 ``alerts.daily_report_to``）。"""
+        try:
+            await self.daily_report()
+            return self._ok({"message": "日报已触发"})
+        except Exception as e:
+            return self._err(str(e))
+
+    # purge 最小调用间隔（秒），防误触重复调用。
+    _purge_last_ts: float | None = None
+
+    async def api_action_delete_provider_data(self, **kwargs: Any) -> dict[str, Any]:
+        """删除一个已下线 Provider 的用量、补充记录及自定义定价（不可恢复）。
+
+        请求体为 ``{"provider_id": "...", "confirm": "DELETE_PROVIDER_DATA"}``。
+        当前仍在 AstrBot 配置中的 Provider 会被拒绝，避免误删活跃数据。
+        """
+        try:
+            from quart import request
+
+            body = await request.json
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return self._err("请求体必须是 JSON 对象")
+        if body.get("confirm") != "DELETE_PROVIDER_DATA":
+            return self._err("缺少删除确认")
+        provider_id = str(body.get("provider_id") or "").strip()
+        if not provider_id:
+            return self._err("provider_id 不能为空")
+
+        # fail-closed：活跃性校验依赖 provider 枚举，枚举失败/结构异常时必须
+        # 拒绝删除（否则活跃 Provider 的数据会被不可恢复地清掉）。这里不走
+        # ``_collect_provider_models``（其内部吞异常、失败降级为空列表）。
+        try:
+            prov_cfg = self.context.get_config() or {}
+            prov_list = prov_cfg.get("provider") if isinstance(prov_cfg, dict) else None
+            if not isinstance(prov_list, list):
+                raise ValueError("无法读取 provider 配置列表")
+            configured_ids = {
+                str(p.get("id") or "").strip()
+                for p in prov_list
+                if isinstance(p, dict)
+            }
+        except Exception as e:
+            return self._err(f"无法确认 Provider 是否仍活跃，已拒绝删除（fail-closed）：{e}")
+        if provider_id in configured_ids:
+            return self._err("该 Provider 仍在当前配置中，不能作为残留数据删除")
+
+        try:
+            usage_deleted = await self.delete_usage_by_provider(provider_id)
+            supplements_deleted = await self.delete_supplements_by_provider(provider_id)
+
+            pricing_deleted = False
+            pricing_schedule_deleted = False
+            price_selection_deleted = False
+            current_cfg = getattr(self, "cfg", None)
+            if isinstance(current_cfg, dict):
+                current_pricing = current_cfg.get("pricing")
+                current_schedules = current_cfg.get("pricing_schedules")
+                current_selections = current_cfg.get("price_selections")
+                next_cfg = dict(current_cfg)
+                changed = False
+                if isinstance(current_pricing, dict) and provider_id in current_pricing:
+                    next_pricing = dict(current_pricing)
+                    del next_pricing[provider_id]
+                    next_cfg["pricing"] = next_pricing
+                    pricing_deleted = True
+                    changed = True
+                if isinstance(current_schedules, dict):
+                    next_schedules = {
+                        key: value
+                        for key, value in current_schedules.items()
+                        if str(key).split("|", 1)[0] != provider_id
+                    }
+                    if len(next_schedules) != len(current_schedules):
+                        next_cfg["pricing_schedules"] = next_schedules
+                        pricing_schedule_deleted = True
+                        changed = True
+                if isinstance(current_selections, dict) and provider_id in current_selections:
+                    next_selections = dict(current_selections)
+                    del next_selections[provider_id]
+                    next_cfg["price_selections"] = next_selections
+                    price_selection_deleted = True
+                    changed = True
+                if changed:
+                    data_dir = getattr(self, "_data_dir", None) or str(self.get_data_dir())
+                    save_plugin_config(data_dir, next_cfg)
+                    self.cfg = deep_merge(CONFIG_DEFAULTS, next_cfg)
+                    self._invalidate_runtime_pricing("provider_pricing_deleted")
+
+            payload = {
+                "provider_id": provider_id,
+                "usage_deleted": usage_deleted,
+                "supplements_deleted": supplements_deleted,
+                "pricing_deleted": pricing_deleted,
+            }
+            if pricing_schedule_deleted:
+                payload["pricing_schedule_deleted"] = True
+            if price_selection_deleted:
+                payload["price_selection_deleted"] = True
+            return self._ok(payload)
+        except Exception as e:
+            return self._err(f"删除 Provider 残留数据失败：{e}")
+
+    async def api_action_purge(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /actions/purge``：按模块清空数据（不可恢复）。
+
+        请求体::
+
+            {"modules": ["supplements", "cache_events", "usage_stats", "ai_diag"],
+             "confirm": "PURGE"}
+
+        需传 ``confirm: "PURGE"`` 确认；两次调用最小间隔 10 秒。
+        逐模块执行 ``purge_module``，返回每个模块的删除条数。
+        """
+        import time
+
+        try:
+            from quart import request
+
+            body = await request.json
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return self._err("请求体必须是 JSON 对象")
+        if body.get("confirm") != "PURGE":
+            return self._err('请在请求体中传入 "confirm": "PURGE" 确认清空操作')
+        modules = body.get("modules", [])
+        valid = {"supplements", "cache_events", "usage_stats", "ai_diag"}
+        if not isinstance(modules, list) or not modules:
+            return self._err("modules 必须是非空数组")
+        if any(not isinstance(m, str) or m not in valid for m in modules):
+            return self._err("modules 包含不支持的清空模块")
+        now_ts = time.monotonic()
+        last_ts = getattr(self, "_purge_last_ts", None)
+        if getattr(self, "_purge_in_progress", False) or (
+            last_ts is not None and now_ts - last_ts < 10
+        ):
+            return self._err("操作过于频繁，请 10 秒后重试")
+        self._purge_last_ts = now_ts
+        self._purge_in_progress = True
+        results: dict[str, int] = {}
+        try:
+            for m in dict.fromkeys(modules):
+                results[m] = await self.purge_module(m)
+            return self._ok({"results": results})
+        except Exception as e:
+            return self._err(str(e))
+        finally:
+            self._purge_in_progress = False
+
+    def _validate_save_payload(self, body: Any) -> tuple[dict[str, Any] | None, str]:
+        """校验 save_config 请求体，返回合并后的**全量**配置或错误信息。
+
+        以当前 ``self.cfg`` 为底座，按 body 提供的 key 逐项强转校验
+        (:func:`coerce_to_default_type`)；``budget_overrides`` 逐条过
+        :func:`normalize_budget_override`（非法整条丢弃）；``fallback_providers``
+        逐条过 :func:`normalize_fallback_provider`；``pricing`` 拒绝非法模式、结构与数值；
+        ``pricing_multipliers`` 接受 AstrBot ``provider_source_id`` 到 0–100 倍率的映射
+        （0 = 该分组计零成本）；
+        ``default_on_exceeded`` 限定 ``stop|fallback|warn``。未知 key 忽略。
+        """
+        if not isinstance(body, dict):
+            return None, "请求体必须是 JSON 对象"
+        cur = getattr(self, "cfg", None)
+        out: dict[str, Any] = dict(cur) if isinstance(cur, dict) else {}
+        for k, v in body.items():
+            if k == "budget_overrides":
+                if not isinstance(v, list):
+                    return None, "budget_overrides 必须是数组"
+                normalized: list[dict[str, Any]] = []
+                for it in v:
+                    n = normalize_budget_override(it)
+                    if n is not None:
+                        normalized.append(n)
+                out[k] = normalized
+            elif k == "fallback_providers":
+                if not isinstance(v, list):
+                    return None, "fallback_providers 必须是数组"
+                normalized_fb: list[dict[str, Any]] = []
+                for it in v:
+                    n = normalize_fallback_provider(it)
+                    if n is not None:
+                        normalized_fb.append(n)
+                out[k] = normalized_fb
+            elif k == "default_on_exceeded":
+                sv = str(v or "").strip().lower()
+                if sv not in ("stop", "fallback", "warn"):
+                    return None, "default_on_exceeded 必须是 stop/fallback/warn"
+                out[k] = sv
+            elif k == "pricing":
+                if not isinstance(v, dict):
+                    return None, "pricing 必须是对象（key=provider_id）"
+                normalized_p: dict[str, dict[str, Any]] = {}
+                for pid, entry in v.items():
+                    pid_s = str(pid).strip()
+                    if not pid_s:
+                        return None, "pricing 的 provider_id 不能为空"
+                    try:
+                        normalized_p[pid_s] = _normalize_api_pricing_entry(entry)
+                    except ValueError as e:
+                        return None, f"pricing[{pid_s}]：{e}"
+                out[k] = normalized_p
+            elif k == "pricing_schedules":
+                from .pricing_schedule import normalize_pricing_schedules
+
+                try:
+                    out[k] = normalize_pricing_schedules(
+                        v, _normalize_api_pricing_entry, strict=True
+                    )
+                except ValueError as e:
+                    return None, str(e)
+            elif k == "price_sources":
+                # 不能用 coerce_to_default_type（非空默认 dict 会丢弃 newapi:<pid> 动态键）
+                from .config import normalize_price_sources
+
+                if not isinstance(v, dict):
+                    return None, "price_sources 必须是对象"
+                out[k] = normalize_price_sources(v)
+            elif k == "pricing_multipliers":
+                if not isinstance(v, dict):
+                    return None, "pricing_multipliers 必须是对象（key=provider_source_id）"
+                import math
+
+                for cluster_id, value in v.items():
+                    try:
+                        factor = float(value)
+                    except (TypeError, ValueError, OverflowError):
+                        return None, f"pricing_multipliers[{cluster_id}] 必须在 0–100 之间"
+                    if (
+                        not str(cluster_id).strip()
+                        or isinstance(value, bool)
+                        or not math.isfinite(factor)
+                        or not 0 <= factor <= 100
+                    ):
+                        return None, f"pricing_multipliers[{cluster_id}] 必须在 0–100 之间"
+                out[k] = normalize_pricing_multipliers(v)
+            elif k == "exchange_rates":
+                # 接受任意 {货币代码: 汇率} dict，逐值转 float（可能含 API 同步的
+                # 160+ 货币，不能用非空默认 dict 的 coerce 逻辑裁剪）。
+                # 汇率必须为正有限数：0/负数/inf/nan 会污染所有换算结果。
+                import math
+
+                if not isinstance(v, dict):
+                    return None, "exchange_rates 必须是对象"
+                rates_out: dict[str, float] = {}
+                for rk, rv in v.items():
+                    try:
+                        f = float(rv)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(f) and f > 0:
+                        rates_out[str(rk).strip().upper()] = f
+                if rates_out:
+                    rates_out["USD"] = 1.0  # 基准
+                out[k] = rates_out
+            elif k == "budgets_cost_currency":
+                # {维度: 货币代码}，逐值转 str
+                if not isinstance(v, dict):
+                    return None, "budgets_cost_currency 必须是对象"
+                bcc_out: dict[str, str] = {}
+                for bk, bv in v.items():
+                    bs = str(bv or "").strip().upper()
+                    if bs:
+                        bcc_out[str(bk)] = bs
+                out[k] = bcc_out
+            elif k in CONFIG_DEFAULTS:
+                default = CONFIG_DEFAULTS[k]
+                if isinstance(default, dict) and default:
+                    if not isinstance(v, dict):
+                        return None, f"{k} 必须是对象"
+                    # Fixed-schema groups are patches. Preserve existing siblings,
+                    # otherwise changing a switch can reset recipients or retention.
+                    previous = out.get(k)
+                    previous = previous if isinstance(previous, dict) else {}
+                    v = deep_merge(default, previous, v)
+                out[k] = coerce_to_default_type(v, default)
+            # else: 未知 key 忽略
+        if not any(k in body for k in CONFIG_DEFAULTS):
+            return None, "未提供可识别的配置项"
+        # 时间格式校验（refresh_time / daily_report_time 必须为 HH:MM）
+        import re
+
+        _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+        rt = str(out.get("refresh_time", "00:00"))
+        if not _TIME_RE.match(rt):
+            return None, f"refresh_time 格式无效（需 HH:MM 24小时制）：{rt}"
+        alerts_cfg = out.get("alerts")
+        if isinstance(alerts_cfg, dict):
+            drt = str(alerts_cfg.get("daily_report_time", "09:00"))
+            if not _TIME_RE.match(drt):
+                return None, f"daily_report_time 格式无效（需 HH:MM 24小时制）：{drt}"
+            cd = alerts_cfg.get("cooldown_seconds", 300)
+            if isinstance(cd, (int, float)) and cd > 86400:
+                return None, "cooldown_seconds 不能超过 86400（24小时）"
+        return out, ""
+
+    async def api_action_save_config(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /actions/save_config``：保存配置（全量，热生效，无需重载）。
+
+        校验 → 写插件自有 ``config.json``（持久，不被 AstrBot 裁剪）→ 重建
+        ``self.cfg``（立即对后续读取生效）→ 开关同步 ``self.config`` + ``save_config``
+        （持久到 ``<plugin>_config.json``，self.config 仅含开关故无裁剪噪音）→
+        price_sync/schedule/alerts 变更则重注册 CronJob。
+        """
+        try:
+            from astrbot import logger
+            from quart import request
+
+            try:
+                body = await request.json
+            except Exception:
+                body = None
+            merged, err = self._validate_save_payload(body)
+            if err:
+                return self._err(err)
+            assert merged is not None
+            changed = [k for k in (body or {}) if k in CONFIG_DEFAULTS]
+            # 1. 写插件自有配置文件（持久）
+            data_dir = getattr(self, "_data_dir", None) or str(self.get_data_dir())
+            try:
+                save_plugin_config(data_dir, merged)
+            except Exception as e:
+                return self._err(f"写入配置文件失败：{e}")
+            # 2. 重建 self.cfg（热；merged 已含页面编辑值）
+            self.cfg = deep_merge(CONFIG_DEFAULTS, merged)
+            self._invalidate_runtime_pricing("config_saved")
+            # 3. 开关持久化到 <plugin>_config.json（self.config 仅含开关 → 无噪音）
+            try:
+                self.config.save_config(switches_from_config(merged))
+            except Exception as e:
+                logger.warning("[cost_control] 开关持久化失败（不影响热生效）: %s", e)
+            # price_sync/schedule/alerts 变更 → 重注册 cron（幂等）
+            if any(k in changed for k in ("price_sync", "schedule", "alerts")):
+                try:
+                    await self.register_cron()
+                except Exception as e:
+                    logger.warning("[cost_control] CronJob 重注册失败: %s", e)
+            return self._ok({"saved": changed, "config": self.cfg})
+        except Exception as e:
+            return self._err(str(e))
+
+    async def api_action_sync_rates(self, **kwargs: Any) -> dict[str, Any]:
+        """``POST /actions/sync_rates``：从免费 API 同步最新汇率并持久化到 config。
+
+        调用 :func:`exchange_rates.sync_rates`（``open.er-api.com``），成功则把
+        汇率表 + 同步时间写入 ``self.cfg`` 的 ``exchange_rates`` /
+        ``exchange_rates_updated_at``，并持久化到插件 config.json；失败返回错误。
+        """
+        try:
+            from .exchange_rates import sync_rates
+
+            rates, updated_at, err = await sync_rates()
+            if err:
+                return self._err(f"汇率同步失败：{err}")
+            # Persist first: a failed disk write must not be reported as a saved sync.
+            from .config import load_plugin_config
+
+            data_dir = getattr(self, "_data_dir", None) or str(self.get_data_dir())
+            persisted = load_plugin_config(data_dir)
+            persisted["exchange_rates"] = rates
+            persisted["exchange_rates_updated_at"] = updated_at
+            try:
+                save_plugin_config(data_dir, persisted)
+            except Exception as e:
+                return self._err(f"汇率持久化失败：{e}")
+            cfg = getattr(self, "cfg", None)
+            if not isinstance(cfg, dict):
+                cfg = {}
+            cfg = dict(cfg)
+            cfg["exchange_rates"] = rates
+            cfg["exchange_rates_updated_at"] = updated_at
+            self.cfg = deep_merge(CONFIG_DEFAULTS, cfg)
+            self._invalidate_runtime_pricing("exchange_rates_synced")
+            return self._ok(
+                {
+                    "exchange_rates": rates,
+                    "exchange_rates_updated_at": updated_at,
+                    "count": len(rates),
+                }
+            )
+        except Exception as e:
+            return self._err(str(e))

@@ -576,10 +576,15 @@ class WebHandler(BaseHTTPRequestHandler):
                     # engine: svc = MiMo TTS + so-vits-svc 模型；bv2 = 知更鸟 Bert-VITS2（网上公开权重）
                     engine = (payload.get("engine") or "").strip().lower()
                     if not engine:
-                        if model in ("纳西妲", "胡桃", "神里绫华", "可莉", "心海", "宵宫"):
-                            engine = "gl"
-                        elif text and model in ("知更鸟", "robin", "Robin"):
+                        # 2026-11-05：纳西妲等音色走 so-vits-svc（models_voice/）；
+                        # gl/bv2 需要 bertvits2/.venv，那个目录在 11-03 误删后没再装，
+                        # 所以只有它真存在时才选 gl/bv2，否则一律 svc。
+                        stack_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                        bv2_ok = os.path.exists(os.path.join(stack_root, "bertvits2", ".venv", "Scripts", "python.exe"))
+                        if model in ("知更鸟", "robin", "Robin") and bv2_ok:
                             engine = "bv2"
+                        elif model in ("纳西妲", "胡桃", "神里绫华", "可莉", "心海", "宵宫") and bv2_ok:
+                            engine = "gl"
                         else:
                             engine = "svc"
                     if engine not in ("svc", "bv2", "gl"):
