@@ -25,7 +25,7 @@
   "row_click_x_bias_px": 12,
   "row_click_y_bias_px": 6,
   "after_paste_wait": 0.9,
-  "verify_timeout_s": 12,
+  "verify_timeout_s": 30,
   "verify_timeout_image_s": 15,
   "verify_poll_s": 0.4,
   "after_paste_wait_text": 0.3,

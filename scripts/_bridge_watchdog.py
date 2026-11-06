@@ -143,20 +143,32 @@ def _spawn_elevated(name: str, cmd: list[str], cwd: Path) -> None:
     ShowWindow 报 ACCESS_DENIED），表现就是 bridge 里成片「send 超时（45s）」。
     提权后同一段代码 SetCursorPos 返回 1、光标真的动。
     """
-    arg_list = ",".join(_ps_quote(a) for a in cmd[1:])
-    ps = (
-        "Start-Process -FilePath {exe} -ArgumentList @({args}) "
-        "-WorkingDirectory {cwd} -WindowStyle Hidden -Verb RunAs"
-    ).format(exe=_ps_quote(cmd[0]), args=arg_list, cwd=_ps_quote(cwd))
+    # 2026-11-07：优先走各服务自己的「已知可用」提权启动脚本 —— 它们自己会自提权、
+    # 自带 stdout/stderr 重定向与端口等待。之前这里用 here-string 直接 Start-Process
+    # -Verb RunAs，既没有重定向（日志全丢），实测在 bridge 上还起不来。
+    helper = {
+        "bridge": ROOT / "scripts" / "_start_bridge_elevated.ps1",
+        "cover": ROOT / "scripts" / "start-cover-backend.ps1",
+    }.get(name)
+    if helper is not None and helper.is_file():
+        args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(helper)]
+        args += ["-Elevated"] if name == "cover" else ["-WaitSeconds", "40"]
+    else:
+        arg_list = ",".join(_ps_quote(a) for a in cmd[1:])
+        ps = (
+            "Start-Process -FilePath {exe} -ArgumentList @({args}) "
+            "-WorkingDirectory {cwd} -WindowStyle Hidden -Verb RunAs"
+        ).format(exe=_ps_quote(cmd[0]), args=arg_list, cwd=_ps_quote(cwd))
+        args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps]
     flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
     # 必须是 CREATE_NO_WINDOW，不能是 DETACHED_PROCESS：2026-11-07 实测，
     # 用 DETACHED_PROCESS 起 powershell 时 `Start-Process -Verb RunAs` 会**静默不做事**
     # （rc=0、无输出、无进程），watchdog 连着两次「已提权拉起」但 8766 一直没回来；
     # 换成 CREATE_NO_WINDOW 后同一段命令立刻生效（拿到子进程 pid，端口 8 秒内起来）。
     elev_log = open(LOGS / "watchdog-elevate.log", "a", encoding="utf-8", errors="replace")
-    elev_log.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} spawn {name}: {ps}\n")
+    elev_log.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} spawn {name}: {' '.join(args)}\n")
     elev_log.flush()
-    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+    subprocess.Popen(args,
                      cwd=str(cwd), stdout=elev_log, stderr=subprocess.STDOUT,
                      stdin=subprocess.DEVNULL, creationflags=flags, close_fds=True)
     log(f"已提权拉起 {name}: {' '.join(cmd[0:2])}")

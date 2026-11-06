@@ -7,7 +7,7 @@ param(
     [string]$WorkDir = ""
 )
 
-$ErrorActionPreference = 'Stop'
+Continue = 'Stop'
 
 function Test-High {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -24,21 +24,27 @@ if (-not (Test-High)) {
         $argList += ($Args -join '||')
     }
     Start-Process powershell -ArgumentList $argList -Verb RunAs | Out-Null
-    Write-Host "  → 已交给提权进程处理"
+    Write-Host "  -> elevated process started"
     return
 }
 
 if ($Args.Count -eq 1 -and $Args[0] -like '*||*') { $Args = $Args[0] -split '\|\|' }
 $dir = if ($WorkDir) { $WorkDir } else { (Get-Location).Path }
+$errLog = $Log + ".err.txt"
+# rotate previous run: Start-Process redirects are overwrite-only
+foreach ($f in @($Log, $errLog)) {
+    if (Test-Path $f) {
+        $prev = $f + ".1"
+        if (Test-Path $prev) { Remove-Item $prev -Force -ErrorAction SilentlyContinue }
+        Move-Item $f $prev -Force -ErrorAction SilentlyContinue
+    }
+}
 Push-Location $dir
-$errLog = "$Log.err.txt"
 $argLine = ($Args | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
 try {
-    $p = Start-Process -FilePath $Py -ArgumentList $argLine -WorkingDirectory $dir `
-        -RedirectStandardOutput $Log -RedirectStandardError $errLog `
-        -WindowStyle Hidden -PassThru -Wait
-    $code = $p.ExitCode
+    $proc = Start-Process -FilePath $Py -ArgumentList $argLine -WorkingDirectory $dir -RedirectStandardOutput $Log -RedirectStandardError $errLog -WindowStyle Hidden -PassThru -Wait
+    $code = $proc.ExitCode
 } finally {
     Pop-Location
 }
-Write-Host "exit=$code log=$Log err=$errLog"
+Write-Host ("exit=" + $code)
