@@ -147,9 +147,16 @@ def _spawn_elevated(name: str, cmd: list[str], cwd: Path) -> None:
         "Start-Process -FilePath {exe} -ArgumentList @({args}) "
         "-WorkingDirectory {cwd} -WindowStyle Hidden -Verb RunAs"
     ).format(exe=_ps_quote(cmd[0]), args=arg_list, cwd=_ps_quote(cwd))
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    # 必须是 CREATE_NO_WINDOW，不能是 DETACHED_PROCESS：2026-11-07 实测，
+    # 用 DETACHED_PROCESS 起 powershell 时 `Start-Process -Verb RunAs` 会**静默不做事**
+    # （rc=0、无输出、无进程），watchdog 连着两次「已提权拉起」但 8766 一直没回来；
+    # 换成 CREATE_NO_WINDOW 后同一段命令立刻生效（拿到子进程 pid，端口 8 秒内起来）。
+    elev_log = open(LOGS / "watchdog-elevate.log", "a", encoding="utf-8", errors="replace")
+    elev_log.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} spawn {name}: {ps}\n")
+    elev_log.flush()
     subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-                     cwd=str(cwd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     cwd=str(cwd), stdout=elev_log, stderr=subprocess.STDOUT,
                      stdin=subprocess.DEVNULL, creationflags=flags, close_fds=True)
     log(f"已提权拉起 {name}: {' '.join(cmd[0:2])}")
 
