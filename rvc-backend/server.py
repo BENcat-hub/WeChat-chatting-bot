@@ -170,28 +170,82 @@ def _cuda_ok() -> bool:
         return False
 
 
+_SVC_CACHE: dict[str, object] = {}
+
+
+def _get_svc(model_dir: Path):
+    """按模型目录常驻一个 Svc 实例（载入一次 6s，之后每次推理只要 1~3s）。"""
+    key = str(model_dir.resolve())
+    cached = _SVC_CACHE.get(key)
+    if cached is not None:
+        return cached
+    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    from so_vits_svc_fork.inference.core import Svc
+
+    dev = os.environ.get("BACKEND_SVC_DEVICE") or ("cuda" if _cuda_ok() else "cpu")
+    svc = Svc(
+        net_g_path=str(_pick_ckpt(model_dir)),
+        config_path=str(model_dir / "config.json"),
+        device=dev,
+    )
+    _SVC_CACHE[key] = svc
+    log(f"svc 模型已常驻: {model_dir.name} device={dev} sr={svc.target_sample}")
+    return svc
+
+
 def _svc_infer(src: Path, model_dir: Path, out: Path, transpose: int, f0_method: str) -> Path:
+    cfg = model_dir / "config.json"
+    if not cfg.is_file():
+        raise RuntimeError(f"{model_dir.name} 缺少 config.json（so-vits-svc 模型配置）")
+    # f0 提取器：默认 harvest。11-06 客观量过（40-80s 窗口，与原唱 vocals 逐帧比
+    # parselmouth 的 to_pitch）：进程内 harvest 版 |音分| 中位数 5.2（>100c 占 5%），
+    # svc.exe CLI 版同样的 harvest 却是 299（>100c 占 91%）—— CLI 路径在这台机器上
+    # 会把音高整体推高约 2.9 个半音（听感就是跑调），所以推理一律走进程内。
+    # 要试别的提取器：BACKEND_SVC_F0=crepe|dio|pm|harvest。
+    f0 = (f0_method or "harvest").lower()
+    env_f0 = os.environ.get("BACKEND_SVC_F0", "").strip().lower()
+    if env_f0 and env_f0 != "caller":
+        f0 = env_f0
+    elif f0 in ("parselmouth", "pm"):
+        log("f0 提取器: 请求 parselmouth → 使用 harvest（parselmouth 实测整体偏低 ≈238 音分）")
+        f0 = "harvest"
+    noise = float(os.environ.get("BACKEND_NOISE_SCALE", "0.30"))
+    db_thresh = float(os.environ.get("BACKEND_DB_THRESH", "-20"))
+    chunk = float(os.environ.get("BACKEND_CHUNK_SECONDS", "0.5"))
+    try:
+        import librosa
+        import numpy as np
+        import soundfile as sf
+
+        svc = _get_svc(model_dir)
+        audio, _sr = librosa.load(str(src), sr=svc.target_sample)
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+        log(f"svc 进程内推理: f0={f0} t={transpose} n={noise} db={db_thresh} ch={chunk} len={len(audio)/svc.target_sample:.1f}s")
+        res = svc.infer_silence(
+            audio,
+            speaker=0,
+            transpose=int(transpose),
+            auto_predict_f0=False,
+            noise_scale=noise,
+            f0_method=f0,
+            db_thresh=db_thresh,
+            pad_seconds=0.5,
+            chunk_seconds=chunk,
+            max_chunk_seconds=40,
+        )
+        sf.write(str(out), res, svc.target_sample)
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log(f"进程内 svc 失败，回退 svc.exe: {exc}")
     if not SVC_EXE.is_file():
         raise RuntimeError(
             f"缺少 {SVC_EXE}（so-vits-svc-fork 未安装）。"
             "在 rvc-backend 里执行: uv pip install so-vits-svc-fork"
         )
     ckpt = _pick_ckpt(model_dir)
-    cfg = model_dir / "config.json"
-    if not cfg.is_file():
-        raise RuntimeError(f"{model_dir.name} 缺少 config.json（so-vits-svc 模型配置）")
-    f0 = (f0_method or "parselmouth").lower()
-    if f0 == "harvest":
-        # 10-28 的 A/B：harvest 在 50-120 Hz 整段翻倍（低音区八度错误 44%），
-        # 且听感更「沙」；统一换 parselmouth，要旧手感用 BACKEND_SVC_F0=caller。
-        if os.environ.get("BACKEND_SVC_F0", "").strip().lower() != "caller":
-            log(f"f0 提取器: 请求 {f0} → 使用 parselmouth")
-            f0 = "parselmouth"
     cmd = [str(SVC_EXE), "infer", str(src), "-m", str(ckpt), "-c", str(cfg),
            "-fm", f0, "-t", str(int(transpose)),
-           "-n", os.environ.get("BACKEND_NOISE_SCALE", "0.30"),
-           "-ch", os.environ.get("BACKEND_CHUNK_SECONDS", "8"),
-           "-db", os.environ.get("BACKEND_DB_THRESH", "-20"),
+           "-n", str(noise), "-ch", str(int(chunk) or 1), "-db", str(db_thresh),
            "-o", str(out)]
     log("svc " + " ".join(cmd[3:]))
     proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True,
@@ -299,7 +353,7 @@ def convert(song_name_src: str,
             msst_normalize: bool = True,
             vocal_postprocess: bool = False,
             shift_accompaniment: bool = False,
-            f0_method: str = "parselmouth",
+            f0_method: str = "harvest",
             index_rate: float = 0.75,
             filter_radius: int = 3):
     """返回 (输出文件绝对路径, 是否命中缓存)。"""
@@ -392,7 +446,7 @@ def build_app():
         with gr.Row():
             shift = gr.Slider(-24, 24, value=0, step=1, label="key_shift")
             f0 = gr.Dropdown(["crepe", "fcpe", "rmvpe", "harvest", "dio", "pm"],
-                             value="parselmouth", label="f0_method")
+                             value="harvest", label="f0_method")
         with gr.Row():
             vv = gr.Number(value=0, label="vocal_vol")
             iv = gr.Number(value=0, label="inst_vol")
