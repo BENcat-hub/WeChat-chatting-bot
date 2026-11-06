@@ -31,10 +31,14 @@ if (-not (Test-High)) {
 if ($Args.Count -eq 1 -and $Args[0] -like '*||*') { $Args = $Args[0] -split '\|\|' }
 $dir = if ($WorkDir) { $WorkDir } else { (Get-Location).Path }
 Push-Location $dir
+$errLog = "$Log.err.txt"
+$argLine = ($Args | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
 try {
-    & $Py @Args *> $Log
-    $code = $LASTEXITCODE
+    $p = Start-Process -FilePath $Py -ArgumentList $argLine -WorkingDirectory $dir `
+        -RedirectStandardOutput $Log -RedirectStandardError $errLog `
+        -WindowStyle Hidden -PassThru -Wait
+    $code = $p.ExitCode
 } finally {
     Pop-Location
 }
-Write-Host "exit=$code log=$Log"
+Write-Host "exit=$code log=$Log err=$errLog"

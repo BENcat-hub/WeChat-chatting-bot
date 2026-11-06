@@ -51,6 +51,11 @@ try:  # 原生驱动（SendInput/BitBlt/剪贴板）。~30ms 一次，而 window
 except Exception:  # pragma: no cover - 没有 Pillow 等依赖时退回纯 MCP
     winio = None
 
+try:  # 消息投递（PostMessage）：光标不动地点击/打字/回车，input_backend=message 时用
+    import winmsg  # noqa: E402
+except Exception:  # pragma: no cover - 缺 Pillow 或非 Windows 时退回原生
+    winmsg = None
+
 # 人为在用键鼠时原生层抛出它；没有原生层时用一个永不抛出的类型占位，except 分支保持同形。
 HumanBusy = winio.HumanBusy if winio is not None else type("HumanBusy", (RuntimeError,), {})
 
@@ -302,6 +307,20 @@ def clear_input(client, cfg, rect, focused_clean=False):
         return {"skipped": True}
     x, y = input_box_point(cfg, rect)
     native = _native_on(cfg, "native_input")
+    if _msg_mode(cfg):
+        hwnd = _wx_root(cfg)
+        if hwnd:
+            presses = 3 if (focused_clean and cfg.get("input_fast_clear", True)) else 120
+            winmsg.post_click(hwnd, x, y)
+            time.sleep(0.10)
+            with winmsg.focus_attached(hwnd):
+                for _ in range(presses):
+                    winmsg.post_key(hwnd, winio.VK_BACK)
+            time.sleep(0.08)
+            return {"x": x, "y": y, "driver": "message",
+                    "fast": bool(focused_clean and cfg.get("input_fast_clear", True))}
+        if not cfg.get("msg_fallback_native", True):
+            raise RuntimeError("PostMessage clear failed: no wechat hwnd")
     if focused_clean and cfg.get("input_fast_clear", True):
         if native:
             winio.chord(winio.VK_BACK)
@@ -789,12 +808,40 @@ def _foreground_is_wechat(cfg):
     return bool(main) and int(hwnd) == int(main)
 
 
+def _msg_mode(cfg):
+    """input_backend=message：点/打字/回车都走 PostMessage，光标一次都不动。
+
+    2026-11-07 实测（`_restore-20261103/probe_msg_send*.py`，文件传输助手自检）：
+    `WM_LBUTTONDOWN/UP` 能定位输入框、`WM_CHAR` 能把中文送进 Qt 控件、`WM_KEYDOWN VK_RETURN`
+    能发送，整条链路 `cursor0 == cursor1`。前提是进程为 High 完整性（微信是 High，UIPI 会
+    挡掉 Low 进程的 PostMessage）。
+    """
+    value = str((cfg or {}).get("input_backend") or "").strip().lower()
+    return value in ("message", "msg", "postmessage")
+
+
+def _wx_root(cfg):
+    """当前微信主窗口句柄（消息模式下 PostMessage 的目标）。"""
+    if winmsg is None:
+        return 0
+    hwnd = winmsg.find_root((cfg or {}).get("window_title", "微信"),
+                            (cfg or {}).get("window_class_prefix"))
+    return int(hwnd or 0)
+
+
 def ui_click(client, cfg, point):
     """点一下屏幕坐标：原生 SendInput 优先（~20ms），windows-mcp 兜底（~580ms）。
 
     人为在用键鼠时原生层抛 HumanBusy，调用方按“桌面不归我们”处理，不跟人抢。
+    `input_backend=message` 时改投 `WM_LBUTTONDOWN/UP`，不移动光标。
     """
     x, y = int(point[0]), int(point[1])
+    if _msg_mode(cfg):
+        hwnd = _wx_root(cfg)
+        if hwnd and winmsg.post_click(hwnd, x, y):
+            return "message"
+        if not cfg.get("msg_fallback_native", True):
+            raise RuntimeError("PostMessage click failed (hwnd=%s at %s,%s)" % (hwnd, x, y))
     if _native_on(cfg, "native_input"):
         winio.click(x, y)
         return "native"
@@ -803,10 +850,24 @@ def ui_click(client, cfg, point):
 
 
 def ui_paste(client, cfg, point, text):
-    """在坐标处粘贴一段文字（原生：点 + 写剪贴板 + Ctrl+V，一次约 40ms）。"""
+    """在坐标处粘贴一段文字（原生：点 + 写剪贴板 + Ctrl+V，一次约 40ms）。
+
+    `input_backend=message` 时不碰剪贴板也不动光标：PostMessage 点一下，然后逐字 `WM_CHAR`。
+    """
     x, y = int(point[0]), int(point[1])
     focus_wait = float(cfg.get("search_focus_wait_s", 0.35))
     paste_wait = float(cfg.get("search_paste_wait_s", 0.7))
+    if _msg_mode(cfg):
+        hwnd = _wx_root(cfg)
+        if hwnd:
+            winmsg.post_click(hwnd, x, y)
+            time.sleep(min(focus_wait, 0.25))
+            with winmsg.focus_attached(hwnd):
+                winmsg.post_chars(hwnd, text)
+            time.sleep(min(paste_wait, 0.35))
+            return "message"
+        if not cfg.get("msg_fallback_native", True):
+            raise RuntimeError("PostMessage paste failed: no wechat hwnd")
     if _native_on(cfg, "native_input"):
         winio.paste_text(x, y, text, focus_wait=focus_wait, paste_wait=paste_wait)
         return "native"
@@ -4034,7 +4095,7 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
             _ocr_ok = ocr_pipe_probe(cfg)
         except Exception:  # noqa: BLE001
             _ocr_ok = False
-        plan["ocr"] = "ok" if _ocr_ok else "fallback"
+        plan["ocr_pipe"] = "ok" if _ocr_ok else "fallback"
         if not _ocr_ok:
             log.warning("[wxui] ⚠️ OCR 管道无应答，本次退回 Windows OCR（昵称可能识别不准）")
         # 2026-10-22 刷屏事故：回读判断如果失败，每条消息会被重发 3 次再进队列，
@@ -4188,7 +4249,15 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                     time.sleep(float(cfg.get("after_paste_wait_text", 0.3)))
                     log.info("[wxui] ⏎ 复核通过，按回车 target=%s attempt=%d elapsed=%.1fs",
                              target, attempt, time.time() - t_start)
-                    winio.chord(winio.VK_RETURN)
+                    if _msg_mode(cfg):
+                        _h = _wx_root(cfg)
+                        if _h:
+                            with winmsg.focus_attached(_h):
+                                winmsg.post_key(_h, winio.VK_RETURN)
+                        else:
+                            winio.chord(winio.VK_RETURN)
+                    else:
+                        winio.chord(winio.VK_RETURN)
                 else:
                     client.call("Clipboard", {"mode": "set", "text": text})
                     client.call("Shortcut", {"shortcut": "ctrl+v"})

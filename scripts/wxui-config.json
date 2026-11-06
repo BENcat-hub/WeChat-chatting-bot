@@ -1,4 +1,4 @@
-{
+﻿{
   "weflow_base_url": "http://127.0.0.1:5031",
   "token_file": "secrets/weflow-token.txt",
   "account_guard": true,
@@ -141,5 +141,7 @@
   "wechat_login_y_ratio": 0.79,
   "overlay_dismiss_x_ratio": 0.464,
   "overlay_dismiss_y_ratio": 0.084,
-  "_overlay_dismiss_note": "2026-10-29 隔离实验（4 个 trial）：微信 4.x **在没有搜索面板时按 Esc 会冻结 MMUI 渲染子窗**（悬停不再重绘、点击/滚轮全无响应，只能重启进程恢复）；面板开着时按 Esc 反而安全。旧版搜索路径在「点完结果（面板已自动关闭）」后补 Esc，正是用户说的『搜索导致微信卡死』的根因。现在清覆盖层一律用 dismiss_overlay()：点聊天头部空白处 (0.464w, 0.084h) —— 面板开着时点在外面会收起面板，没开时点在标题栏空白处无副作用。"
+  "_overlay_dismiss_note": "2026-10-29 隔离实验（4 个 trial）：微信 4.x **在没有搜索面板时按 Esc 会冻结 MMUI 渲染子窗**（悬停不再重绘、点击/滚轮全无响应，只能重启进程恢复）；面板开着时按 Esc 反而安全。旧版搜索路径在「点完结果（面板已自动关闭）」后补 Esc，正是用户说的『搜索导致微信卡死』的根因。现在清覆盖层一律用 dismiss_overlay()：点聊天头部空白处 (0.464w, 0.084h) —— 面板开着时点在外面会收起面板，没开时点在标题栏空白处无副作用。",
+  "input_backend": "message",
+  "msg_fallback_native": true
 }
