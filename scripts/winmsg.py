@@ -36,6 +36,7 @@ WM_KEYUP = 0x0101
 WM_CHAR = 0x0102
 WM_SETTEXT = 0x000C
 WM_PASTE = 0x0302
+WM_MOUSEWHEEL = 0x020A
 WM_GETTEXT = 0x000D
 WM_GETTEXTLENGTH = 0x000E
 MK_LBUTTON = 0x0001
@@ -184,6 +185,30 @@ def post_chars(hwnd, text, gap=0.004):
             ok += 1
         time.sleep(gap)
     return ok
+
+
+def post_msg(hwnd, msg, wparam=0, lparam=0):
+    """投递任意窗口消息（如 WM_PASTE=0x0302 —— 让 Qt 自己读剪贴板粘贴图片）。"""
+    ok = user32.PostMessageW(hwnd, msg, wparam, lparam)
+    if not ok:
+        log.warning("[winmsg] PostMessage 0x%04X 失败 err=%s", msg, ctypes.get_last_error())
+    return bool(ok)
+
+
+def post_wheel(hwnd, x, y, notches, settle=0.12):
+    """在屏幕坐标 (x, y) 处投滚轮消息（正数向上、负数向下），光标不动。
+
+    WM_MOUSEWHEEL 的 lParam 用**屏幕坐标**（和鼠标点击消息不同，后者用客户区坐标）；
+    wParam 高 16 位是 delta，一格 = 120。
+    """
+    delta = int(notches) * 120
+    wp = (delta << 16) & 0xFFFF0000
+    lp = ((int(y) & 0xFFFF) << 16) | (int(x) & 0xFFFF)
+    ok = user32.PostMessageW(hwnd, WM_MOUSEWHEEL, wp, lp)
+    if not ok:
+        log.warning("[winmsg] WM_MOUSEWHEEL 投递失败 err=%s", ctypes.get_last_error())
+    time.sleep(settle)
+    return bool(ok)
 
 
 def post_key(hwnd, vk, char=0):

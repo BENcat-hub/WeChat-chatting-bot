@@ -1322,6 +1322,14 @@ def _side_scroll(client, cfg, hover, notches, wait_s=None):
     要几十秒。SendInput 的 WHEEL 事件把同样的动作压到几十毫秒，翻页才可能进 2 秒预算。
     `notches` 正数向上、负数向下。
     """
+    if _msg_mode(cfg) and winmsg is not None:
+        # 消息模式：WM_MOUSEWHEEL 直接投给微信，光标不动、也不需要微信在前台
+        _h = _wx_root(cfg)
+        if _h:
+            winmsg.post_wheel(_h, int(hover[0]), int(hover[1]), int(notches))
+            time.sleep(float(cfg.get("sidebar_wheel_wait_s", 0.15) if wait_s is None else wait_s))
+            _note_scroll(int(notches), cfg)
+            return "message"
     # 滚轮事件只送到前台窗口：微信不在最上层时滚它等于滚别人的窗口，
     # 于是「翻页了但列表没动」。先确认窗口在最上层，抢不到就直接放弃滚动。
     _ready = ensure_wechat_ready(cfg)
@@ -4432,9 +4440,33 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                                 error="could not put image on the clipboard: %s" % err,
                                 retryable=False)
                     return plan
-                client.call("Shortcut", {"shortcut": "ctrl+v"})
-                time.sleep(cfg.get("after_paste_wait", 1.2))
-                client.call("Shortcut", {"shortcut": "enter"})
+                if _msg_mode(cfg) and attempt == 1:
+                    # 消息模式首试：点输入框 → WM_PASTE（先给输入框子窗口，再给主窗口）→ 回车。
+                    # 图片粘贴要 Qt 自己去读剪贴板，WM_CHAR 做不到；实测 WM_PASTE 不一定生效，
+                    # 所以只用于第 1 次，失败后下面的 native 分支会兜底（那一刻光标会动一下）。
+                    _h = _wx_root(cfg)
+                    _box = input_box_point(cfg, plan.get("window_rect"))
+                    if _h:
+                        winmsg.post_click(_h, _box[0], _box[1])
+                        time.sleep(0.2)
+                        _child = winmsg.hwnd_at(_box[0], _box[1]) or _h
+                        with winmsg.focus_attached(_h):
+                            winmsg.post_msg(_child, 0x0302)          # WM_PASTE
+                            time.sleep(0.12)
+                            if _child != _h:
+                                winmsg.post_msg(_h, 0x0302)
+                        time.sleep(cfg.get("after_paste_wait", 1.2))
+                        with winmsg.focus_attached(_h):
+                            winmsg.post_key(_h, winio.VK_RETURN)
+                        plan["image_paste"] = "message"
+                    else:
+                        client.call("Shortcut", {"shortcut": "ctrl+v"})
+                        time.sleep(cfg.get("after_paste_wait", 1.2))
+                        client.call("Shortcut", {"shortcut": "enter"})
+                else:
+                    client.call("Shortcut", {"shortcut": "ctrl+v"})
+                    time.sleep(cfg.get("after_paste_wait", 1.2))
+                    client.call("Shortcut", {"shortcut": "enter"})
             except Exception as e:  # desktop handed back to the human mid-send
                 attempt_log.append({"attempt": attempt, "stage": "input",
                                     "error": "desktop input refused: %s" % e})
