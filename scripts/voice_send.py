@@ -233,7 +233,21 @@ def _region_sig(box, tag):
         return small.tobytes()
 
 
-def click_mic(win_rect, tries=2):
+def _ui_click(cfg, x, y):
+    """点一下：input_backend=message 时先试 PostMessage（光标不动），失败再走原生点击。"""
+    try:
+        import winmsg
+    except Exception:  # noqa: BLE001
+        winmsg = None
+    if winmsg is not None and str((cfg or {}).get("input_backend") or "").lower() == "message":
+        hwnd = winmsg.find_root(cfg.get("window_title", "微信"), cfg.get("window_class_prefix"))
+        if hwnd and winmsg.post_click(hwnd, x, y):
+            return "message"
+    winio.click(x, y)
+    return "native"
+
+
+def click_mic(win_rect, tries=2, cfg=None):
     """点开微信输入栏的「语音」胶囊，并确认界面真的切过去了。"""
     l, t, R, B = win_rect
     W, H = R - l, B - t
@@ -242,7 +256,7 @@ def click_mic(win_rect, tries=2):
     box = (l + int(0.60 * W), t + int(0.86 * H), R - 8, B - 8)
     before = _region_sig(box, "before")
     for attempt in range(tries):
-        winio.click(*mic)
+        _ui_click(cfg, mic[0], mic[1])
         time.sleep(0.26)
         if _region_sig(box, f"after{attempt}") != before:
             return mic, attempt + 1
@@ -342,11 +356,11 @@ def send_voice(target, wav48):
     l, t, R, B = r.left, r.top, r.right, r.bottom
     W, H = R - l, B - t
     send = (l + int(0.946 * W), t + int(0.929 * H))
-    mic, mic_tries = click_mic((l, t, R, B))
+    mic, mic_tries = click_mic((l, t, R, B), cfg=cfg)
     time.sleep(0.05)
     dur = play_wav(wav48)
     time.sleep(0.35)
-    winio.click(*send)
+    _ui_click(cfg, send[0], send[1])
     time.sleep(0.9)
     shot = os.path.join(ROOT, "logs", "voice_send.png")
     winio.grab((l, t, R, B), shot)
