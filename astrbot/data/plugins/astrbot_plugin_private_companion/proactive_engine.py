@@ -10471,7 +10471,12 @@ class ProactiveEngineMixin:
         action: str,
         motive: str,
     ) -> bool:
-        if self._private_user_role(user) == "friend":
+        # 2026-11-06 关闭：用户明确要求聊天里不要加称呼（要叫也只叫「宝宝」），
+        # 「点名 + ……」这种开场既不像人说话，也会把对方的微信显示名当成消息正文
+        # 发出去（实测 09:41 给 1905794693 发了整条「不曾为世界整除……」）。
+        # 保留函数签名给旧调用点，行为一律为「不采用」。
+        return False
+        if self._private_user_role(user) == "friend":  # pragma: no cover - 下面是旧策略，仅留档
             return False
         if action != "message":
             return False

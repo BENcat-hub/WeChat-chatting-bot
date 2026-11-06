@@ -113,6 +113,11 @@ def _bridge_loop():
     with state.bridge_lock:
         state.bridge_instance = bridge
 
+    # 2026-11-06：WeFlow 的 SSE 会漏推送（实测天文学家 09:18 连发三条都没到，
+    # 微信侧已是已读状态）。只靠 SSE 就有「消息被读走、机器人完全不知道」的黑洞，
+    # 这里起一条轮询兜底线程，按会话 lastTimestamp 游标把漏掉的消息补投进同一入口。
+    bridge.start_poll_fallback()
+
     # 设计取舍：WeFlow 侧没就绪（没配 token / token 无效 / WeFlow 没开）时**不退出整个桥接**，
     # 而是每 30 秒重试一次。这样 AstrBot 的连接与"主动发送"通道保持可用，
     # 修好 token 或启动 WeFlow 后无需重启 bridge 就能自动进入 SSE 接收。

@@ -3851,21 +3851,38 @@ def ensure_account_matches(cfg):
     return True, info
 
 
-def readback_blind(cfg, talker, since_time, slack_s=180):
+def readback_blind(cfg, talker, since_time, slack_s=180, patience_s=None):
     """回读是不是「瞎的」：WeFlow 对这个人根本没有最近消息。
 
     重试的前提是「回读有可能变 True」。如果 WeFlow 里这个会话最新的消息比这次发送的
     起点还早 3 分钟，那它现在看不到这条消息（游标坏了 / 账号不对 / 同步停摆），
     再试多少次都是 False —— 此时继续重试就是纯粹的重复发送（2026-10-30 实测）。
+
+    2026-11-06：WeFlow 的索引有几十秒延迟，发送后立刻问会得到「最新消息还是上一次的」，
+    于是把「还没刷到」误判成「回读瞎了」，09:19~09:31 连续四次假警报并放弃重试
+    （实际那几条都发出去了）。这里改成有耐心地轮询：默认最多等 `readback_patience_s`
+    （配置项 `readback_patience_s`，默认 90s），期间一旦刷到新消息就判定回读正常。
     """
-    try:
-        msgs = api(cfg, "/api/v1/messages", talker=talker, limit=3).get("messages", [])
-    except Exception:  # noqa: BLE001
-        return False
-    if not msgs:
-        return True
-    newest = max(int(m.get("createTime") or 0) for m in msgs)
-    return newest < (since_time - slack_s)
+    patience = patience_s
+    if patience is None:
+        try:
+            patience = float(cfg.get("readback_patience_s", 90) or 90)
+        except (TypeError, ValueError):
+            patience = 90.0
+    deadline = time.time() + max(0.0, float(patience))
+    while True:
+        try:
+            msgs = api(cfg, "/api/v1/messages", talker=talker, limit=3).get("messages", [])
+        except Exception:  # noqa: BLE001
+            return False
+        if not msgs:
+            return True
+        newest = max(int(m.get("createTime") or 0) for m in msgs)
+        if newest >= (since_time - slack_s):
+            return False
+        if time.time() >= deadline:
+            return True
+        time.sleep(3.0)
 
 
 def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, client=None):

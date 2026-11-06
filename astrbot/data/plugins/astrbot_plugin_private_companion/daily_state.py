@@ -2427,7 +2427,6 @@ class DailyStateMixin(DailyStateTickMixin):
                     "tone": "迷糊",
                     "impulse": "虽然打算继续睡，但想轻轻说声早安",
                     "chain": [
-                        {"kind": "name_only_opener"},
                         {"kind": "if_no_reply", "after_minutes": 80, "reason": "check_in", "topic": "赖床醒来", "motive": "回笼觉结束，看看用户是先醒了还是依旧在睡", "tone": "耐心等待"},
                         {"kind": "if_still_no_reply", "after_minutes": 140, "reason": "morning_greeting", "topic": "催用户起床", "motive": "用户依旧没有回应你的消息，该催用户起床了", "tone": "调侃"},
                     ],
@@ -2447,7 +2446,6 @@ class DailyStateMixin(DailyStateTickMixin):
                     "tone": "迟钝",
                     "impulse": "想轻轻说声早安",
                     "chain": [
-                        {"kind": "name_only_opener"},
                         {"kind": "if_no_reply", "after_minutes": 90, "reason": "check_in", "topic": "早安余韵", "motive": "已经清醒过来，但刚刚和用户说的早安还没得到回应,猜测用户还在休息", "tone": "耐心等待"},
                         {"kind": "if_still_no_reply", "after_minutes": 150, "reason": "morning_greeting", "topic": "催用户起床", "motive": "用户依旧没有回应你的消息，该催用户起床了", "tone": "调侃"},
                     ],
@@ -2468,7 +2466,6 @@ class DailyStateMixin(DailyStateTickMixin):
                     "tone": "清爽",
                     "impulse": "想轻轻说早安",
                     "chain": [
-                        {"kind": "name_only_opener"},
                         {"kind": "if_no_reply", "after_minutes": 85, "reason": "check_in", "topic": "早安余韵", "motive": "刚刚和用户说了早安但没得到回应,猜测用户还在休息", "tone": "耐心等待"},
                         {"kind": "if_still_no_reply", "after_minutes": 145, "reason": "morning_greeting", "topic": "催用户起床", "motive": "用户依旧没有回应你的消息，该催用户起床了", "tone": "调侃"},
                     ],

@@ -2948,6 +2948,38 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             return stripped
         return cleaned
 
+    def _is_address_only_proactive_text(
+        self,
+        text: str,
+        user: dict[str, Any] | None,
+        name: str = "",
+    ) -> bool:
+        """整条消息是不是只剩「称呼 + 标点」。
+
+        2026-11-06 实测：早上那条早安被旧策略换成「点名 + ……」，正文就是对方的
+        微信显示名（发给 1905794693 的那条是「不曾为世界整除……」）。这种既没有
+        称呼规则上的正当性，也没有一句完整的话，直接当空文本处理让上层重来。
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            return True
+        candidates: list[str] = []
+        for item in self._proactive_recipient_allowed_names(user, name):
+            label = _single_line(item, 40)
+            if label:
+                candidates.append(label)
+        if isinstance(user, dict):
+            for key in ("nickname", "last_display_name", "nickname_prev", "remark", "display_name"):
+                label = _single_line(user.get(key), 40)
+                if label:
+                    candidates.append(label)
+        candidates.extend(["宝宝", "主人"])
+        leftover = raw
+        for token in sorted({t for t in candidates if t and len(t) >= 2}, key=len, reverse=True):
+            leftover = leftover.replace(token, "")
+        leftover = re.sub(r"[\s…·、，,。.!！?？~～:：;；\-—_]+", "", leftover)
+        return len(leftover) < 4
+
     def _default_proactive_prompt_document(
         self,
         variables: dict[str, Any] | None = None,
@@ -8058,6 +8090,13 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         cleaned = self._repair_proactive_subject_drift(cleaned, reason=reason, action=action, action_context=action_context)
         cleaned = self._strip_leading_address_prefix(cleaned, user, name)
         cleaned = self._normalize_chat_address(cleaned, user, name)
+        if self._is_address_only_proactive_text(cleaned, user, name):
+            logger.warning(
+                "主动消息只剩称呼没有正文，按空处理: reason=%s text=%s",
+                reason,
+                _single_line(cleaned, 40),
+            )
+            return "", "只剩称呼没有正文"
         if self._has_dangling_reference_opener(cleaned):
             grounded_text = self._ground_proactive_text(
                 cleaned,

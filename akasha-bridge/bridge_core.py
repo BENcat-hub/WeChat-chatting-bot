@@ -8,6 +8,7 @@
 4. 多层消息去重（rawid、内容、自回复）
 """
 
+import hashlib
 import json
 import html
 import logging
@@ -213,6 +214,12 @@ class WeFlowBridge:
         self._sse_event_keys = {}
         self._pending_image = {}  # talkerId → {"caption": None|str, "event": threading.Event()}
         self._pending_mention_images = {}  # session_id → {"data": data, "time": timestamp} 先图后文暂存
+        # 漏推兜底（2026-11-06）：SSE 漏事件时靠轮询补投，见 start_poll_fallback()
+        self._poll_lock = threading.Lock()
+        self._poll_cursors = {}
+        self._seen_msg_keys = set()
+        self._poll_thread = None
+        self._poll_stop = False
 
     def should_ignore(self, data):
         content = data.get("content", "")
@@ -827,6 +834,153 @@ class WeFlowBridge:
             log.error(f"SSE 异常: {e}")
         finally:
             self._sse_session = None
+
+    # ============ 漏推兜底（2026-11-06）============
+    # 背景：WeFlow 的 SSE 推送会漏事件。实测 11-06 09:18 天文学家连发三条
+    # （「宝宝」「早上好吗」「[表情]」），bridge 侧一条日志都没有，而微信里那三条
+    # 已经是已读状态（/api/v1/sessions 的 unreadCount 归零）——消息被读走了，
+    # 桥根本没收到。SSE 是单通道、没有补偿机制，所以这里加一条轮询兜底：
+    # 拿 /api/v1/sessions 的 lastTimestamp 当游标，发现会话比游标新，就回翻
+    # /api/v1/messages 取回 isSend=0 的消息，塞进 handle_push_payload 同一条入口。
+    # 去重靠 _msg_key（会话 + 时间戳 + 内容哈希）：SSE 推过的消息键已存在，
+    # 轮询不会重复投递。
+    POLL_INTERVAL_SECONDS = float(os.environ.get("WEFLOW_POLL_SECONDS", "20"))
+    POLL_FETCH_LIMIT = int(os.environ.get("WEFLOW_POLL_LIMIT", "30"))
+    POLL_MAX_PER_ROUND = int(os.environ.get("WEFLOW_POLL_MAX_PER_ROUND", "20"))
+
+    def _msg_key(self, data: dict):
+        """一条入站消息的去重键：会话 + 秒级时间戳 + 内容哈希。"""
+        sid = data.get("sessionId") or ""
+        content = (data.get("content") or "").strip()
+        ts = int(data.get("timestamp") or 0)
+        if not sid or not content or not ts:
+            return None
+        digest = hashlib.sha1(content.encode("utf-8", "ignore")).hexdigest()[:12]
+        return f"{sid}|{ts}|{digest}"
+
+    def _remember_msg_key(self, data: dict) -> bool:
+        """登记去重键；已登记过返回 False（调用方据此跳过）。"""
+        key = self._msg_key(data)
+        if not key:
+            return True
+        with self._poll_lock:
+            if key in self._seen_msg_keys:
+                return False
+            self._seen_msg_keys.add(key)
+            if len(self._seen_msg_keys) > 4000:
+                # 只留最近的一半，避免长跑后无限增长
+                self._seen_msg_keys = set(list(self._seen_msg_keys)[-2000:])
+        return True
+
+    def start_poll_fallback(self):
+        if getattr(self, "_poll_thread", None) and self._poll_thread.is_alive():
+            return
+        self._poll_stop = False
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, daemon=True, name="weflow-poll")
+        self._poll_thread.start()
+        log.info(f"🔁 漏推兜底已启动：每 {self.POLL_INTERVAL_SECONDS:.0f}s 校对一次会话游标")
+
+    def stop_poll_fallback(self):
+        self._poll_stop = True
+
+    def _poll_loop(self):
+        while not self._poll_stop and state.running:
+            try:
+                self._poll_missed_once()
+            except Exception as e:  # noqa: BLE001 —— 兜底线程绝不能因为一次异常退出
+                log.warning(f"漏推兜底异常: {e}")
+            waited = 0.0
+            while waited < self.POLL_INTERVAL_SECONDS:
+                if self._poll_stop or not state.running:
+                    return
+                time.sleep(0.5)
+                waited += 0.5
+
+    def _poll_missed_once(self):
+        """扫一遍会话游标，把漏推的入向消息补进缓冲。"""
+        if not config.ACCESS_TOKEN:
+            return
+        url = f"{config.WE_FLOW_BASE_URL}/api/v1/sessions"
+        resp = requests.get(url, params={"access_token": config.ACCESS_TOKEN, "limit": 200}, timeout=10)
+        if resp.status_code != 200:
+            log.warning(f"漏推兜底：会话列表 HTTP {resp.status_code}")
+            return
+        payload = resp.json()
+        sessions = payload.get("sessions", payload if isinstance(payload, list) else [])
+        if not isinstance(sessions, list):
+            return
+        filled = 0
+        for sess in sessions:
+            if filled >= self.POLL_MAX_PER_ROUND:
+                break
+            username = sess.get("username") or ""
+            last_ts = int(sess.get("lastTimestamp") or 0)
+            if not username or not last_ts:
+                continue
+            with self._poll_lock:
+                cursor = self._poll_cursors.get(username)
+                if cursor is None:
+                    # 首次见到这个会话：只回补「bridge 启动之后」的消息，
+                    # 更早的历史不去翻（否则一上来就把几天的旧消息灌进 AstrBot）。
+                    # 会话比启动时间新，就从头（启动时刻）开始补，漏推恰恰发生在这一刻。
+                    cursor = (self.start_timestamp - 1) if last_ts >= self.start_timestamp else last_ts
+                    self._poll_cursors[username] = cursor
+            if last_ts <= cursor:
+                continue
+            is_group = (sess.get("sessionType") == "group") or username.endswith("@chatroom")
+            display = sess.get("displayName") or username
+            try:
+                msgs = self._query_poll_messages(username)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"漏推兜底：取消息失败 talker={username}: {e}")
+                continue
+            newest = cursor
+            for m in msgs:
+                ts = int(m.get("createTime") or 0)
+                if ts <= cursor:
+                    continue
+                if int(m.get("isSend") or 0) == 1:
+                    newest = max(newest, ts)
+                    continue
+                content = (m.get("content") or "").strip()
+                if not content:
+                    newest = max(newest, ts)
+                    continue
+                data = {
+                    "event": "message",
+                    "sessionId": username,
+                    "sessionType": "group" if is_group else "private",
+                    "rawid": f"poll-{m.get('localId')}",
+                    "avatarUrl": "",
+                    "sourceName": display,
+                    "talkerId": username,
+                    "talkerName": display,
+                    "type": int(m.get("localType") or 1),
+                    "content": content,
+                    "timestamp": ts,
+                }
+                if not self._remember_msg_key(data):
+                    newest = max(newest, ts)
+                    continue
+                log.info(f"🩹 漏推补投: [{display}] {content[:40]!r}")
+                self.handle_push_payload(data)
+                newest = max(newest, ts)
+                filled += 1
+            with self._poll_lock:
+                self._poll_cursors[username] = max(newest, self._poll_cursors.get(username) or 0)
+
+    def _query_poll_messages(self, talker: str) -> list:
+        url = f"{config.WE_FLOW_BASE_URL}/api/v1/messages"
+        params = {"access_token": config.ACCESS_TOKEN, "talker": talker,
+                  "limit": self.POLL_FETCH_LIMIT}
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code != 200:
+            log.warning(f"漏推兜底：消息 API HTTP {resp.status_code} talker={talker}")
+            return []
+        data = resp.json()
+        messages = data if isinstance(data, list) else data.get("messages", data.get("data", []))
+        return messages if isinstance(messages, list) else []
 
     _MEDIA_TYPES = ("image", "sticker", "emoji")
 
