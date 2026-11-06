@@ -108,7 +108,9 @@ def melody_mask(reference: Path, n_frames: int | None = None,
     if db.size == 0:
         return np.zeros(n_frames or 0, dtype=np.float32)
     top = float(np.percentile(db, 95))
-    mask = np.clip((db - (top - 32.0)) / 12.0, 0.0, 1.0)
+    # 2026-11-06：-32dB/12dB 太狠，轻声长音（真在唱）被整段判成静音 →
+    # 人声被切掉一截、听感跑调且「中气不足」。放宽到 -45dB、斜坡 15dB。
+    mask = np.clip((db - (top - 45.0)) / 15.0, 0.0, 1.0)
     return uniform_filter1d(mask, size=max(1, int(0.12 / hop_s)), mode="nearest")
 
 
@@ -209,6 +211,20 @@ def restore_timbre(converted: Path, reference: Path, dst: Path,
     return _write(dst, _istft(mag, phase, len(y)), sr)
 
 
+def _smooth_attack_release(x: np.ndarray, hop_s: float,
+                           attack_s: float = 0.02, release_s: float = 0.28) -> np.ndarray:
+    """起音跟得快、收尾放得慢：字头不被削薄，字尾和换气不会被「切断」。"""
+    a = float(np.exp(-hop_s / max(1e-6, attack_s)))
+    r = float(np.exp(-hop_s / max(1e-6, release_s)))
+    out = np.empty_like(x)
+    prev = 0.0
+    for i, v in enumerate(x):
+        coef = a if v > prev else r
+        prev = coef * prev + (1.0 - coef) * v
+        out[i] = prev
+    return out
+
+
 def apply_vocal_gate(converted: Path, reference: Path, dst: Path,
                      lyric_gate: np.ndarray | None = None,
                      gap_gate: np.ndarray | None = None) -> Path:
@@ -220,13 +236,19 @@ def apply_vocal_gate(converted: Path, reference: Path, dst: Path,
     ref_level = float(np.percentile(db, 95))
     energy_gate = np.clip((db - (ref_level - 40.0)) / 10.0, GATE_FLOOR, 1.0)
     mm = melody_mask(reference, n, hop_s)
+    # 真长静音（间奏/前奏/尾奏，>0.9s）才压到 0；其余地方保底 0.30，
+    # 否则轻声、换气、字尾都会被切掉 —— 2026-11-06 用户的「切得太死/中气不足」。
+    long_gap = gap_mask(reference, n, max_gap_s=0.9, hop_s=hop_s)
     if lyric_gate is not None and len(lyric_gate) == n:
-        allowed = lyric_gate.astype(np.float32)
+        allowed = np.maximum(long_gap.astype(np.float32), lyric_gate.astype(np.float32))
         if gap_gate is not None and len(gap_gate) == n:
             allowed = np.maximum(allowed, gap_gate.astype(np.float32) * mm)
     else:
-        allowed = mm
-    gate = energy_gate * allowed
+        allowed = long_gap.astype(np.float32)
+    sung = 0.30 + 0.70 * mm
+    allowed = allowed * sung
+    allowed = _smooth_attack_release(allowed, hop_s)
+    gate = np.maximum(energy_gate, 0.5) * allowed
     y2 = y * _resample_gate(gate, len(y))
     return _write(dst, y2, sr)
 
