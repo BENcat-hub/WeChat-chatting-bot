@@ -305,12 +305,24 @@ def _mix(vocals: Path, inst: Path | None, out: Path,
             i = np.pad(i, ((0, n - len(i)), (0, 0)))
         if i.shape[1] != v.shape[1]:
             i = np.repeat(i[:, :1], v.shape[1], axis=1)
-        mix = v + i
+            mix = v + i
     else:
         mix = v
-    peak = float(np.max(np.abs(mix)) or 1.0)
-    if peak > 0.99:
-        mix = mix / peak * 0.99
+    # 2026-11-06：以前是「超 0.99 就直接除」（硬顶），清唱段会顶到 0 dBFS 听感发破；
+    # 改成软膝限幅到 -1 dBFS（tanh 压拐点以上，不切平）。
+    try:
+        from pitch_align import _limit as _soft_limit
+
+        if mix.ndim == 2:
+            chans = [_soft_limit(np.ascontiguousarray(mix[:, c], dtype=np.float32))
+                     for c in range(mix.shape[1])]
+            mix = np.stack(chans, axis=1)
+        else:
+            mix = _soft_limit(np.ascontiguousarray(mix, dtype=np.float32))
+    except Exception:
+        peak = float(np.max(np.abs(mix)) or 1.0)
+        if peak > 0.99:
+            mix = mix / peak * 0.99
     out.parent.mkdir(parents=True, exist_ok=True)
     # libsndfile 在 Windows 上打不开含中文的路径（Desktop\翻唱A-B试听\… 直接
     # `LibsndfileError: Error opening …: System error.`，2026-11-06 实测），
@@ -393,7 +405,20 @@ def convert(song_name_src: str,
 
         vdn = vocals
         converted = CACHE_DIR / f"svc-{tag}.wav"
-        _svc_infer(vdn, picked, converted, int(key_shift or 0), str(f0_method or "parselmouth"))
+        _svc_infer(vdn, picked, converted, int(key_shift or 0), str(f0_method or "harvest"))
+        # 2026-11-06：音准最后一道 —— 用 WORLD 把 SVC 输出的音高直接换成原唱旋律
+        # （音色 sp/ap 仍是 SVC 的）。只有真分离出人声轨时才做，单轨回退时原唱人声
+        # 里混着伴奏，硬套会把旋律带偏。关掉：BACKEND_PITCH_ALIGN=0
+        if inst is not None and os.environ.get("BACKEND_PITCH_ALIGN", "1") != "0":
+            try:
+                import pitch_align
+
+                aligned = CACHE_DIR / f"al-{tag}.wav"
+                rep = pitch_align.align(converted, vdn, aligned)
+                log(f"音高对齐: 原唱有声 {rep['voiced_pct_ref']}% / 输出有声 {rep['voiced_pct_out']}%")
+                converted = aligned
+            except Exception as exc:  # noqa: BLE001
+                log(f"音高对齐失败，用原始 SVC 输出: {exc}")
         processed = postproc.run_chain(vdn, converted, CACHE_DIR / f"pp-{tag}.wav", CACHE_DIR)
         if shift_accompaniment and int(key_shift or 0):
             # 伴奏同步变调代价高，这里只在明确要求时提示未实现细节
