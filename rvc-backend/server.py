@@ -37,7 +37,35 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-OUTPUT_DIR = ROOT / "outputs"
+
+
+def _is_ascii_path(path: str) -> bool:
+    try:
+        str(path).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _resolve_output_dir() -> Path:
+    """翻唱成品统一落到「桌面\\翻唱试听」。
+
+    2026-11-06 用户要求：所有翻唱测试的输出都放在桌面同一个文件夹里，
+    不要再散落在 rvc-backend/outputs。用环境变量 COVER_OUTPUT_DIR 可覆盖
+    （分享包/别的机器上桌面不存在时也不会崩，自动回落到 rvc-backend/outputs）。
+    """
+    override = os.environ.get("COVER_OUTPUT_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    desktop = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Desktop" / "翻唱A-B试听"
+    try:
+        desktop.mkdir(parents=True, exist_ok=True)
+        return desktop
+    except Exception:  # noqa: BLE001 —— 桌面不可写就别硬撑
+        return ROOT / "outputs"
+
+
+OUTPUT_DIR = _resolve_output_dir()
 CACHE_DIR = ROOT / "cache"
 MODELS_DIR = ROOT / "models"
 
@@ -190,7 +218,18 @@ def _mix(vocals: Path, inst: Path | None, out: Path,
     if peak > 0.99:
         mix = mix / peak * 0.99
     out.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(out), mix, sr)
+    # libsndfile 在 Windows 上打不开含中文的路径（Desktop\翻唱A-B试听\… 直接
+    # `LibsndfileError: Error opening …: System error.`，2026-11-06 实测），
+    # 所以先写到 ASCII 的 cache 目录，再用 Python 的文件 API 搬过去。
+    try:
+        sf.write(str(out), mix, sr)
+    except Exception:
+        if _is_ascii_path(str(out)):
+            raise
+        tmp = CACHE_DIR / f"mix-{_fingerprint(out.name, time.time())}.wav"
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        sf.write(str(tmp), mix, sr)
+        shutil.move(str(tmp), str(out))
     return out
 
 
@@ -282,8 +321,13 @@ def cache_info() -> dict:
 
 
 def clear_cache() -> str:
+    """只清理中间产物（cache/）。
+
+    成品现在落在桌面「翻唱试听」里，那是给人试听/留档的，不该被一次
+    「清缓存」按掉（2026-11-06 改输出目录时一起改的）。
+    """
     removed = 0
-    for d in (OUTPUT_DIR, CACHE_DIR):
+    for d in (CACHE_DIR,):
         if not d.is_dir():
             continue
         for f in d.rglob("*"):

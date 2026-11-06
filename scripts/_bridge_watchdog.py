@@ -176,7 +176,9 @@ SERVICES = [
     dict(name="nahida-tts", port=8795, cwd=ROOT,
          cmd=[str(RVC_PY), "-X", "utf8", str(ROOT / "scripts" / "nahida_tts_server.py"),
               "--port", "8795"], env=lambda: _env()),
-    dict(name="cover", port=3333, cwd=RVC,
+    # 2026-11-06：成品要落桌面「翻唱A-B试听」，只有 High 完整性进程写得进去
+    # （Medium 的 python 被沙箱拒）。所以走提权路径，和 bridge 一样。
+    dict(name="cover", port=3333, cwd=RVC, elevated=True,
          cmd=[str(RVC_PY), "-X", "utf8", "server.py", "--port", "3333"], env=lambda: _env()),
 ]
 

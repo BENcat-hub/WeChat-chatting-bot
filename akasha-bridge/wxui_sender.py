@@ -498,8 +498,15 @@ class WxuiSender(WeMessengerSender):
             # 连 JSON 都没输出：状态未知，交给重发队列（它会先回读校验再决定是否重发）
             data = {"retryable": True, "error_kind": "no-output",
                     "error": "wxui printed no JSON", "stdout_tail": (proc.stdout or "")[-300:]}
-            log.error("[wxui] ❌ %s 无 JSON 输出 → %s | stdout=%s", subcmd, target,
-                      (proc.stdout or "")[:300].replace("\n", " "))
+            log.error("[wxui] ❌ %s 无 JSON 输出 → %s | stdout=%s | stderr=%s | rc=%s",
+                      subcmd, target,
+                      (proc.stdout or "")[:300].replace("\n", " "),
+                      (proc.stderr or "")[-600:].replace("\n", " "),
+                      proc.returncode)
+            data = {"retryable": True, "error_kind": "no-output",
+                    "error": "wxui printed no JSON",
+                    "stdout_tail": (proc.stdout or "")[-300:],
+                    "stderr_tail": (proc.stderr or "")[-600:]}
             return None, data
 
         data["_stdout_tail"] = (proc.stdout or "")[:300].replace("\n", " ")

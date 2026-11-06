@@ -763,6 +763,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         model = str(payload.get("model") or "jimeng-4.6")
+        # 面板「自定义请求头」里可以按请求覆盖后端与模型（不用改服务端环境变量）：
+        #   X-Jimeng-Backend: volc | sf
+        #   X-Jimeng-Model:   jimeng-4.6 | jimeng-4.0 | Qwen/Qwen-Image | ...
+        hdr_backend = (self.headers.get("X-Jimeng-Backend") or "").strip().lower()
+        hdr_model = (self.headers.get("X-Jimeng-Model") or "").strip()
+        if hdr_model:
+            model = hdr_model
+        backend = hdr_backend if hdr_backend in ("volc", "sf") else BACKEND
         req_key = resolve_req_key(model)
         prompt = flatten_prompt(str(payload.get("prompt") or payload.get("text") or ""))
         count = int(payload.get("n") or 1)
@@ -785,7 +793,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": {"message": "prompt is required"}})
             return
 
-        if BACKEND == "sf":
+        if backend == "sf":
             # SiliconFlow 是同步接口（没有「提交 + 轮询」），但对外仍保持 OpenAI 形状，
             # 插件侧完全无感知。带参考图（edits / image 字段）时自动切到 Edit 模型。
             try:

@@ -950,6 +950,33 @@ def _ocr_server_conn(cfg, wait_s=None):
     return None
 
 
+def ocr_pipe_probe(cfg, timeout_s=2.5):
+    """命名管道真的有人应答吗？（不只是「连接成功」）
+
+    2026-11-06：OCR 服务僵尸化时进程还活着、管道名还占着，`_ocr_connect()` 仍能成功，
+    但没人 accept/reply，于是每次 OCR 都等到超时才退回 Windows OCR —— 侧栏 12px 的昵称
+    读不出来，发送前那道识别闸就形同虚设。这里发一个空路径请求（服务端 path="" 会
+    立刻返回 ok=False），拿到任何回复就算活着。
+    """
+    try:
+        conn = _ocr_connect(cfg)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        conn.send({"id": -1, "path": ""})
+        if not conn.poll(float(timeout_s)):
+            return False
+        conn.recv()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _ocr_rapid(path, cfg):
     """一次 RapidOCR 请求；失败返回 {"ok": False, "error": ...} 由调用方决定是否兜底。"""
     try:
@@ -3978,7 +4005,7 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
 
     attempts_max = max(1, int(cfg.get("send_attempts", 3)))
     retry_wait = float(cfg.get("retry_wait_s", 2.0))
-    verify_timeout = float(cfg.get("verify_timeout_s", 12))
+    verify_timeout = float(cfg.get("verify_timeout_s", 30))
     attempt_log, since, found = [], 0, None
 
     own_client = client is None
@@ -4001,6 +4028,15 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
         before = last_message(cfg, talker)
         since = (before or {}).get("localId") or 0
         t_start = time.time()
+        # 识别闸健康检查（2026-11-06）：管道没人应答时 OCR 会静默退到 Windows OCR，
+        # 侧栏昵称读不准 → 有发错人的风险。这里只报告、不阻塞发送。
+        try:
+            _ocr_ok = ocr_pipe_probe(cfg)
+        except Exception:  # noqa: BLE001
+            _ocr_ok = False
+        plan["ocr"] = "ok" if _ocr_ok else "fallback"
+        if not _ocr_ok:
+            log.warning("[wxui] ⚠️ OCR 管道无应答，本次退回 Windows OCR（昵称可能识别不准）")
         # 2026-10-22 刷屏事故：回读判断如果失败，每条消息会被重发 3 次再进队列，
         # 队列每 20s 再补一遍，同一条「翻唱完成」在群里连发 12 条。
         # 发之前先看 180s 内是不是已经有同样的文本 —— 有就不发。
@@ -4081,24 +4117,58 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                 if _native_on(cfg, "native_input") and cfg.get("defer_to_human", True) and winio.human_busy():
                     # 人正在用键鼠时不抢输入：此刻敲的每个键都算在用户头上，
                     # 会话也可能正被用户切来切去（2026-10-23 连发三份到别人的事故）。
-                    plan.update(error="deferred: user is using the computer", retryable=False,
-                                no_requeue=True)
-                    attempt_log.append({"attempt": attempt, "stage": "defer_to_human"})
-                    break
+                    # 2026-11-06：原来这里直接 no_requeue 丢弃，用户一动鼠标那条消息就静默
+                    # 消失（与上面进函数时那套 defer 自相矛盾）。改成「先等一会儿，等不到就
+                    # 延期进重发队列」——延期不是失败，绝不能丢。
+                    _need2 = float(cfg.get("defer_to_human_idle_s", 1.6))
+                    _maxw2 = float(cfg.get("defer_to_human_typing_max_wait_s", 45))
+                    _idle_ok2, _waited2 = winio.wait_for_human_idle(
+                        need_s=_need2, max_wait_s=_maxw2,
+                        poll_s=float(cfg.get("defer_to_human_poll_s", 0.4)),
+                        on_wait=lambda: log.info("[wxui] ⏳ 你在用键鼠（打字前），这条先等着 target=%s", target),
+                    )
+                    plan["human_wait_s"] = round(float(plan.get("human_wait_s") or 0) + _waited2, 1)
+                    if not _idle_ok2:
+                        plan.update(error="deferred: you kept using the mouse/keyboard for %.0fs "
+                                          "(will resend when idle)" % _waited2,
+                                    retryable=True, deferred=True, no_requeue=False)
+                        attempt_log.append({"attempt": attempt, "stage": "defer_to_human",
+                                            "waited": round(_waited2, 1)})
+                        log.info("[wxui] ⏸ 打字前等了 %.0fs 还在用键鼠，这条延期（不丢） target=%s",
+                                 _waited2, target)
+                        break
                 # 2026-10-29 傍晚事故：置顶的别的窗口盖住输入框时，点击会落到它上面，
                 # 粘贴的文本会打进那个窗口（用户会看到自己的输入框里冒出「用户B」）。
                 # 前台仍是微信也挡不住 no-activate 的置顶覆盖层，所以这里再问一次归属。
                 if _native_on(cfg, "native_input"):
                     _win = plan.get("window_rect") or restored_rect(find_wechat(cfg))
                     _ib = input_box_point(cfg, _win)
-                    _own, _pid = _point_belongs_to(find_wechat(cfg), _ib)
+                    _wx_h = find_wechat(cfg)
+                    _own, _pid = _point_belongs_to(_wx_h, _ib)
+                    if _own is False:
+                        # 2026-11-02 事故修复的接线（之前只回放了函数体、调用点丢了）：
+                        # 先把微信临时顶成置顶层几秒，让覆盖窗让开，再判一次归属；
+                        # 不行再走 _raise_above_cover 的「顶一下马上判」。
+                        _pinned = False
+                        if cfg.get("overlay_pin_topmost", True):
+                            try:
+                                _pinned = bool(_pin_topmost_temporarily(_wx_h, float(cfg.get("overlay_pin_seconds", 20))))
+                            except Exception as _exc:  # noqa: BLE001
+                                log.warning("[wxui] 临时置顶微信失败: %s", _exc)
+                            if _pinned:
+                                log.info("[wxui] 📌 输入框被置顶窗覆盖，已把微信临时置顶再判一次")
+                                time.sleep(0.3)
+                                _own, _pid = _point_belongs_to(_wx_h, _ib)
                     if _own is False and cfg.get("overlay_raise_above", True):
                         # 先试着把微信顶到最上层再判一次；能救回来就继续发，别整条失败。
-                        _raise_above_cover(cfg, find_wechat(cfg), _ib)
-                        _own, _pid = _point_belongs_to(find_wechat(cfg), _ib)
+                        _raise_above_cover(cfg, _wx_h, _ib)
+                        _own, _pid = _point_belongs_to(_wx_h, _ib)
                     if _own is False:
+                        # 覆盖窗抢不到前台 = 现在打不了字，但这不是「这条不该发」，
+                        # 交给重发队列等覆盖窗下去，而不是 no_requeue 丢掉。
                         raise RuntimeError("input box at %s is covered by another window "
-                                           "(pid=%s); refusing to type" % (list(_ib), _pid))
+                                           "(pid=%s); deferred until it goes away"
+                                           % (list(_ib), _pid))
                 if _native_on(cfg, "native_input"):
                     # 原生粘贴：写剪贴板 + Ctrl+V + Enter ≈ 20ms，而三次 windows-mcp 输入调用
                     # 要 ~1.7s（每条消息都付一遍，这是“发一条要好几秒”的主要来源）。

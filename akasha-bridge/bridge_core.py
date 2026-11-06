@@ -15,6 +15,7 @@ import logging
 import os
 import queue
 import re
+import subprocess
 import threading
 import time
 from collections import defaultdict
@@ -30,6 +31,23 @@ from ob_protocol import push_event, make_message_event, onebot_message_id
 from image_forward import build_image_payload, normalize_forward_mode, text_to_segments
 
 log = logging.getLogger("ob11-bridge")
+
+
+_VIDEO_CAPTION_MODEL = os.environ.get("VIDEO_CAPTION_MODEL", "Qwen/Qwen3-VL-32B-Instruct")
+_SECRETS_SF = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "secrets", "siliconflow_api_key.txt")
+
+
+def _siliconflow_key() -> str:
+    """硅基流动 key：env 优先，其次 secrets 文件（视频帧描述用）。"""
+    env = os.environ.get("SILICONFLOW_API_KEY", "").strip()
+    if env:
+        return env
+    try:
+        with open(_SECRETS_SF, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 def _forward_mode() -> str:
@@ -279,6 +297,22 @@ class WeFlowBridge:
                 data = dict(data)
                 data["content"] = resolved_record
                 content = resolved_record
+
+        if content == "[视频]" or int(data.get("type", 0) or data.get("msgType", 0) or 0) == 43:
+            # 视频（2026-11-06）：抽帧后按图片描述注入，否则 AstrBot 只看到「[视频]」
+            if is_group and state.group_reply_mode == "mention" and not self._is_mentioned(data):
+                log.info("⏭️ 群视频跳过（mention 模式无法检测 @）")
+                return
+            threading.Thread(target=self.process_video_message, args=(data,), daemon=True).start()
+            return
+
+        if content in ("[链接]", "[文章]", "[网页]") or "<url>" in content:
+            # 链接卡片（2026-11-06）：回查 appmsg XML，把标题/摘要/URL 交给模型
+            resolved = self._resolve_link_card(data)
+            if resolved:
+                data = dict(data)
+                data["content"] = resolved
+                content = resolved
 
         if content == "[图片]":
             # 图片消息（mention 模式下需 @ 才处理）
@@ -770,6 +804,38 @@ class WeFlowBridge:
         log.info(f"🧪 注入测试消息 → {nickname or session_id}: {text!r}")
         return bool(push_event(event))
 
+    _REVOKE_RAWSID_RE = re.compile(r"rawid[：:\s]*(\d+)")
+
+    def _revoke_is_self(self, data: dict) -> bool:
+        """这条「撤回」是不是本账号自己撤的？
+
+        2026-11-06：WeFlow 判 self-revoke 只看 sysmsg 里有没有「你撤回」，但本机登录的
+        账号撤回时 sysmsg 写的是「"鱼宝" 撤回了一条消息」→ 被当成「对方撤回」转给
+        AstrBot，陪伴插件就以为对方撤了。这里拿 rawid 回查那条原消息的 isSend：
+        1 = 我们自己发的 = 自己撤回。
+        """
+        content = data.get("content") or ""
+        m = self._REVOKE_RAWSID_RE.search(content)
+        sid = data.get("sessionId") or ""
+        if not m or not sid:
+            return False
+        raw = m.group(1)
+        try:
+            resp = requests.get(
+                f"{config.WE_FLOW_BASE_URL}/api/v1/messages",
+                params={"talker": sid, "limit": 50,
+                        "access_token": config.ACCESS_TOKEN},
+                timeout=8,
+            )
+            rows = (resp.json() or {}).get("messages") or []
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"撤回归属回查失败: {exc}")
+            return False
+        for row in rows:
+            if str(row.get("localId")) == raw:
+                return int(row.get("isSend") or 0) == 1
+        return False
+
     def handle_push_payload(self, data: dict) -> bool:
         """处理一条 WeFlow 推送（SSE 与自检入口共用同一条入口）。
 
@@ -788,6 +854,13 @@ class WeFlowBridge:
         if self.should_ignore(data):
             return False
         content = data.get("content", "") or ""
+        # 撤回归属（2026-11-06）：WeFlow 判 self-revoke 只看 sysmsg 里有没有「你撤回」，
+        # 而本机登录的账号撤回时 sysmsg 写的是「"鱼宝" 撤回了一条消息」——于是被当成
+        # 「对方撤回」转给 AstrBot，陪伴插件就以为对方撤了。这里按 rawid 回查原消息。
+        if "撤回了一条消息" in content or data.get("event") == "message.revoke":
+            if self._revoke_is_self(data):
+                log.info(f"🙈 本账号自己撤回的消息，不转给 AstrBot（{data.get('sourceName','')}）")
+                return False
         if data.get("sessionType", "") == "group" or "@chatroom" in data.get("sessionId", ""):
             log.info(f"📩 群消息 [{data.get('sourceName','')}]: {content[:60]}")
             if state.group_reply_mode == "mention":
@@ -1140,6 +1213,219 @@ class WeFlowBridge:
         except Exception as e:
             log.error(f"获取微信图片异常: {e}")
             return None
+
+    # ============ 视频 / 链接（2026-11-06）============
+    # 背景：以前只认「[图片]/[表情]」，对方发视频、发公众号/网页链接时 AstrBot 只看到
+    # 字面量「[视频]」「[链接]」，等于读不到内容。这里把两类都转成可读文本：
+    #   视频 → 下回本地 → ffmpeg 抽 3 帧 → 复用图片描述管线 → 注入「视频截图：…」
+    #   链接 → 回查 appmsg XML 的 title/descr/url → 注入「[链接] 标题 / 摘要 / URL」
+    _FFMPEG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "tools", "ffmpeg.exe")
+
+    def _inject_description(self, data: dict, text: str):
+        """把一段「媒体转述文本」塞进该会话的待推送缓冲区（与图片同一条路）。"""
+        session_id = data.get("sessionId", "")
+        source_name = data.get("sourceName", "") or "未知"
+        group_name = data.get("groupName", "")
+        talker_id = data.get("talkerId", "") or session_id
+        is_group = bool(group_name) or "@chatroom" in session_id
+        with self.buffer_lock:
+            if talker_id in self.pending_buffers:
+                entry = self.pending_buffers[talker_id]
+                entry["messages"].insert(0, text)
+                entry.setdefault("message_ts", []).insert(0, time.time())
+                self._arm_flush_locked(talker_id, entry, 2.0)
+                log.info("📝 媒体转述已注入待处理文本队列")
+                return
+            self.pending_buffers[talker_id] = {
+                "messages": [text],
+                "message_ts": [time.time()],
+                "timer": None,
+                "timer_version": 0,
+                "processing": False,
+                "contact": group_name if is_group and group_name else source_name,
+                "is_group": is_group,
+                "source_name": source_name,
+                "session_id_data": session_id,
+                "group_name": group_name if is_group else "",
+                "sender_in_group": "",
+            }
+            entry = self.pending_buffers[talker_id]
+            entry["timer_version"] = 1
+            timer = threading.Timer(2, lambda v=1, sid=talker_id: self.process_sender(sid, v))
+            timer.daemon = True
+            timer.start()
+            entry["timer"] = timer
+            log.info("📩 媒体转述无文本跟随，直接处理")
+
+    def _fetch_wechat_video(self, talker: str, attempts: int = 4, delay: float = 2.0):
+        """拿最新一条视频（media=true 时 WeFlow 会把视频导出并给 mediaUrl）。"""
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                messages = self._query_messages_with_media(talker, limit=10)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"🎬 视频回查失败: {exc}")
+                return None
+            vids = [m for m in messages
+                    if m.get("mediaType") == "video" and m.get("mediaUrl")]
+            if vids:
+                chosen = vids[0]
+                media_url = chosen["mediaUrl"]
+                sep = "&" if "?" in media_url else "?"
+                try:
+                    resp = requests.get(f"{media_url}{sep}access_token={config.ACCESS_TOKEN}",
+                                        timeout=120)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(f"🎬 视频下载失败: {exc}")
+                    return None
+                if resp.status_code == 200 and resp.content:
+                    save_dir = os.path.join(config.ASTRBOT_ATTACHMENTS, "wechat_videos")
+                    os.makedirs(save_dir, exist_ok=True)
+                    ext = os.path.splitext(media_url.split("?")[0])[1] or ".mp4"
+                    path = os.path.join(save_dir, f"wechat_v_{int(time.time())}{ext}")
+                    with open(path, "wb") as f:
+                        f.write(resp.content)
+                    log.info(f"✅ 微信视频已保存: {path} "
+                             f"(localId={chosen.get('localId')}, {len(resp.content)//1024}KB)")
+                    return path
+                log.warning(f"🎬 视频下载返回 HTTP {resp.status_code}")
+                return None
+            if attempt < attempts:
+                log.info(f"⏳ 视频还没有本地缓存（等 WeChat 下载，第 {attempt}/{attempts} 次）")
+                time.sleep(delay)
+        log.warning(f"🎬 消息列表无视频 mediaUrl (talker={talker})")
+        return None
+
+    def _video_frames(self, video_path: str, count: int = 3):
+        """ffmpeg 抽帧（1s/3s/6s），抽不到的跳过。"""
+        if not os.path.exists(self._FFMPEG):
+            log.warning(f"🎬 找不到 ffmpeg: {self._FFMPEG}")
+            return []
+        out_dir = os.path.join(config.ASTRBOT_ATTACHMENTS, "wechat_frames")
+        os.makedirs(out_dir, exist_ok=True)
+        frames = []
+        for i, at in enumerate([1.0, 3.0, 6.0][:max(1, count)]):
+            out = os.path.join(out_dir, f"vf_{int(time.time() * 1000)}_{i}.jpg")
+            cmd = [self._FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                   "-ss", "%.2f" % at, "-i", video_path,
+                   "-frames:v", "1", "-vf", "scale='min(720,iw)':-2", out]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=60,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception as exc:  # noqa: BLE001
+                log.debug(f"🎬 抽帧失败 @{at}s: {exc}")
+                continue
+            if os.path.exists(out) and os.path.getsize(out) > 1024:
+                frames.append(out)
+        log.info(f"🎬 视频抽帧 {len(frames)} 张")
+        return frames
+
+    def _caption_frame(self, frame_path: str) -> str:
+        """给视频帧写一句中文描述。
+
+        caption 后端（`image_caption_provider=openai` + `api.deepseek.com`）本身没有视觉能力，
+        拿它描述画面必然失败，所以视频帧优先走硅基流动的 VL 模型（key 在 secrets 里），
+        失败再退回原 caption 管线。
+        """
+        key = _siliconflow_key()
+        if key:
+            try:
+                import base64
+                with open(frame_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                resp = requests.post(
+                    "https://api.siliconflow.cn/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}",
+                             "Content-Type": "application/json"},
+                    json={
+                        "model": _VIDEO_CAPTION_MODEL,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text",
+                                 "text": "看这张视频截图，用一两句中文说明画面里在发生什么（谁、在哪里、做什么）。不要客套。"},
+                                {"type": "image_url",
+                                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                            ],
+                        }],
+                        "max_tokens": 300,
+                    },
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    text = ((data.get("choices") or [{}])[0]
+                            .get("message", {}).get("content") or "").strip()
+                    if text:
+                        return text
+                else:
+                    log.warning(f"🎬 VL 描述失败 HTTP {resp.status_code}: {resp.text[:120]}")
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"🎬 VL 描述异常: {exc}")
+        try:
+            return caption_image_via_ollama(frame_path) or "（描述失败）"
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"🎬 原 caption 管线也失败: {exc}")
+            return "（描述失败）"
+
+    def process_video_message(self, data: dict):
+        """视频 → 抽帧 → 逐帧描述 → 注入缓冲区。"""
+        session_id = data.get("sessionId", "")
+        source_name = data.get("sourceName", "") or "未知"
+        log.info(f"🎬 收到视频: {source_name}")
+        video_path = self._fetch_wechat_video(session_id)
+        if not video_path:
+            self._inject_description(data, "（对方发来一段视频，但视频文件没能取到，只能知道有这件事）")
+            return
+        frames = self._video_frames(video_path)
+        if not frames:
+            self._inject_description(data, "（对方发来一段视频，但抽帧失败，读不出画面）")
+            return
+        parts = []
+        for idx, frame in enumerate(frames, 1):
+            caption = self._caption_frame(frame)
+            parts.append(f"第{idx}帧：{caption}")
+        text = "（对方发来一段视频，以下是按时间顺序截取的画面描述）" + "；".join(parts)
+        log.info(f"🎬 视频转述: {text[:80]}...")
+        self._inject_description(data, text)
+
+    def _resolve_link_card(self, data: dict):
+        """[链接] → 标题 / 摘要 / URL。"""
+        talker = (data.get("sessionId") or "").strip()
+        if not talker:
+            return None
+        try:
+            messages = self._query_messages_with_media(talker, limit=15)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"🔗 链接回查失败: {exc}")
+            return None
+        cards = [m for m in messages
+                 if int(m.get("localType") or 0) == 49
+                 and "<url>" in (m.get("rawContent") or "")]
+        if not cards:
+            log.info(f"🔗 未找到链接卡片（talker={talker}）")
+            return None
+        card = cards[0]
+        xml = card.get("rawContent") or ""
+
+        def _pick(tag):
+            m = re.search(rf"<{tag}>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?</{tag}>", xml)
+            return (m.group(1).strip() if m else "")
+
+        title = _pick("title")
+        descr = _pick("descr")
+        url = _pick("url")
+        if not url:
+            return None
+        bits = ["（对方发来一个链接）"]
+        if title:
+            bits.append(f"标题：{title}")
+        if descr:
+            bits.append(f"摘要：{descr[:200]}")
+        bits.append(f"URL：{url}")
+        text = " ｜ ".join(bits)
+        log.info(f"🔗 链接已解析: {text[:80]}")
+        return text
 
     def process_image_message(self, data):
         """处理图片消息：从 WeFlow 取图 → ollama 描述 → 注入缓冲区"""

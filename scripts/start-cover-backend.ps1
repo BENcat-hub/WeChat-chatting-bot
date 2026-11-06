@@ -2,10 +2,27 @@
 # 用法：pwsh -File scripts\start-cover-backend.ps1 [-Port 3333]
 param(
     [int]$Port = 3333,
-    [switch]$Foreground
+    [switch]$Foreground,
+    # 2026-11-06：桌面「翻唱A-B试听」只有 High 完整性进程写得进去（Medium 被沙箱拒），
+    # 所以成品输出改由提权实例完成；-Elevated 表示「我已经是提权实例」。
+    [switch]$Elevated
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Test-High {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+if (-not $Elevated -and -not $Foreground -and -not (Test-High)) {
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+        '-File', $PSCommandPath, '-Port', $Port, '-Elevated')
+    Start-Process powershell -ArgumentList $argList -Verb RunAs | Out-Null
+    Write-Output "  → cover backend 需要 High 完整性才能写桌面成品，已交给提权进程处理"
+    exit 0
+}
 $repo = Split-Path -Parent $PSScriptRoot
 $backend = Join-Path $repo 'rvc-backend'
 $python = Join-Path $backend '.venv\Scripts\python.exe'
@@ -55,18 +72,25 @@ if ($Foreground) {
 
 # 重定向时 python 默认块缓冲，看不到实时进度
 $env:PYTHONUNBUFFERED = '1'
-$proc = Start-Process -FilePath $python `
-    -ArgumentList (@('-X', 'utf8') + $args) `
-    -WorkingDirectory $backend `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $log `
-    -RedirectStandardError ($log -replace '\.log$', '.err.log') `
-    -PassThru
-Write-Output "cover backend 已启动 pid=$($proc.Id) 端口=$Port 日志=$log"
+# 2026-11-06：`Start-Process -WindowStyle Hidden` 对 console 程序只是「把窗口藏起来」，
+# 有些场合（提权/父进程是服务）窗口仍会闪出来。改用 ProcessStartInfo + CreateNoWindow，
+# 让 python 进程从一开始就没有控制台（CREATE_NO_WINDOW），用户就看不到那个黑框了。
+$logErr = $log -replace '\.log$', '.err.log'
+$cmdLine = '/c ""{0}" -X utf8 {1} --port {2} --models "{3}" >> "{4}" 2>&1"' -f `
+    $python, (Join-Path $backend 'server.py'), $Port, $env:BACKEND_MODELS, $log
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $env:ComSpec
+$psi.Arguments = $cmdLine
+$psi.WorkingDirectory = $backend
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+$proc = [System.Diagnostics.Process]::Start($psi)
+Write-Output "cover backend 已启动 pid=$($proc.Id) 端口=$Port 日志=$log（无控制台窗口）"
 for ($i = 0; $i -lt 60; $i++) {
     Start-Sleep -Seconds 1
     $listen = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
     if ($listen) { Write-Output "端口 $Port 已就绪"; exit 0 }
 }
-Write-Output "60 秒内未监听 $Port，请查看 $log"
+Write-Output "60 秒内未监听 $Port，请查看 $log / $logErr"
 exit 1
