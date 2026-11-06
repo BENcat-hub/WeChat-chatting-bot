@@ -42,6 +42,7 @@ OCR_SERVER = ROOT / "scripts" / "ocr_server.py"
 OCR_PIPE = r"\\.\pipe\wxui-ocr"
 
 INTERVAL = int(os.environ.get("WATCHDOG_INTERVAL", "45"))
+SPAWN_GRACE = int(os.environ.get("WATCHDOG_SPAWN_GRACE", "150"))  # 冷启动宽限（秒）
 MAX_RESTART_PER_HOUR = 3
 # bridge 允许「端口在听但还没连上 AstrBot」的宽限（秒）；超过就当作半死重启。
 BRIDGE_LINK_GRACE = int(os.environ.get("WATCHDOG_LINK_GRACE", "150"))
@@ -216,6 +217,7 @@ def main() -> int:
         + ", ".join(f"{s['name']}:{s['port']}" for s in SERVICES))
 
     history: dict[str, list[float]] = {s["name"]: [] for s in SERVICES}
+    spawned_at: dict[str, float] = {}
     unlinked_since: dict[str, float] = {}
     while True:
         try:
@@ -244,9 +246,17 @@ def main() -> int:
                 if len(hist) >= cap:
                     log(f"{name}:{port} 一小时内已重启 {len(hist)} 次，先不再试")
                     continue
+                # 冷启动宽限：AstrBot 从 pythonw 起到 11229 真正监听要 50~70 秒，
+                # 而 INTERVAL 只有 45 秒 ⇒ 上一版会在启动途中再拉一个实例，第二个
+                # 撞 `Error: Cannot acquire lock file` 白退（2026-11-07 01:44 实测）。
+                last = spawned_at.get(name, 0.0)
+                if now - last < SPAWN_GRACE:
+                    log(f"{name}:{port} 刚拉过 {int(now - last)}s，还在冷启动，先等")
+                    continue
                 if not half_dead:
                     log(f"{name}:{port} 不在听 -> 重启")
                 history[name].append(now)
+                spawned_at[name] = now
                 unlinked_since.pop(name, None)
                 if half_dead:
                     for pid in pids_on_port(port):
