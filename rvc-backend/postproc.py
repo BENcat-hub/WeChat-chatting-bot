@@ -33,20 +33,26 @@ HOP_S = 0.02
 N_FFT = 1024
 HOP = 256
 
-DENOISE_STRENGTH = float(os.environ.get("BACKEND_DENOISE_STRENGTH", 1.6))
+DENOISE_STRENGTH = float(os.environ.get("BACKEND_DENOISE_STRENGTH", 0.0))
 GATE_FLOOR = float(os.environ.get("BACKEND_GATE_FLOOR", 0.12))
-TIMBRE_DYN = int(os.environ.get("BACKEND_TIMBRE_DYN", 1))
-TIMBRE_MAX_DB = float(os.environ.get("BACKEND_TIMBRE_MAX_DB", 6))
-DYN_MAX_DB = float(os.environ.get("BACKEND_DYN_MAX_DB", 8))
-DYN_SMOOTH = int(os.environ.get("BACKEND_DYN_SMOOTH", 3))
-DEESS_THR = float(os.environ.get("BACKEND_DEESS_THR", 1.8))
-DEESS_FLOOR = float(os.environ.get("BACKEND_DEESS_FLOOR", 0.65))
-HF_CUT = float(os.environ.get("BACKEND_HF_CUT", 0.85))
+TIMBRE_DYN = int(os.environ.get("BACKEND_TIMBRE_DYN", 0))
+TIMBRE_MAX_DB = float(os.environ.get("BACKEND_TIMBRE_MAX_DB", 3))
+DYN_MAX_DB = float(os.environ.get("BACKEND_DYN_MAX_DB", 6))
+# 逐帧 20ms 的增益修正是「颗粒感/忽大忽小」的直接来源（实测 20-80Hz 调制能量
+# 是静态增益的 3.4 倍），所以默认把平滑拉到 15 帧（300ms）、上限压到 6dB。
+DYN_SMOOTH = int(os.environ.get("BACKEND_DYN_SMOOTH", 15))
+DEESS_THR = float(os.environ.get("BACKEND_DEESS_THR", 2.6))
+DEESS_FLOOR = float(os.environ.get("BACKEND_DEESS_FLOOR", 0.85))
+HF_CUT = float(os.environ.get("BACKEND_HF_CUT", 1.0))
 NOISE_SCALE_PRESETS = {"wide": 0.26, "normal": 0.32}
 NOISE_SCALE = float(os.environ.get(
     "BACKEND_NOISE_SCALE", NOISE_SCALE_PRESETS.get(
         os.environ.get("BACKEND_PRESET", "wide"), 0.26)))
 F0_REPAIR = int(os.environ.get("BACKEND_F0_REPAIR", 1))
+# 2026-10-28 调参结论：辅音移植 0.6 会把原唱音色成片混回来（7-12k 相关性 0.75），
+# 改成 0.10 且只在「原唱无音高」的帧上移植，既保咬字瞬态又不带原唱的音高段。
+CONS_RATIO = float(os.environ.get("BACKEND_CONS_RATIO", 0.10))
+REF_VOICING_MIN, REF_VOICING_MAX = 53.0, 900.0
 
 
 # --------------------------------------------------------------------- 基础
@@ -144,30 +150,63 @@ def denoise_vocals(src: Path, dst: Path, strength: float | None = None) -> Path:
     return _write(dst, _istft(clean, phase, len(y)), sr)
 
 
-def restore_timbre(converted: Path, reference: Path, dst: Path) -> Path:
-    """把换声后偏掉的长期频谱（音色）往参考人声拉回来。"""
-    cv, sr = _read(converted)
-    rf, sr2 = _read(reference)
-    if sr != sr2 or cv.size == 0 or rf.size == 0:
-        return _write(dst, cv, sr)
-    cm, cp = _stft(cv)
-    rm, _ = _stft(rf)
-    c_db = 20 * np.log10(cm.mean(axis=1) + 1e-9)
-    r_db = 20 * np.log10(rm.mean(axis=1) + 1e-9)
-    diff = r_db - c_db
-    # 三分之一倍频程级别的平滑：只在有意义的带宽上补偿
-    diff = uniform_filter1d(diff, size=9, mode="nearest")
-    diff = np.clip(diff, -TIMBRE_MAX_DB, TIMBRE_MAX_DB)
+def _ref_uv_weight(reference: Path, n_frames: int, hop_s: float) -> np.ndarray:
+    """原唱每一帧「无音高」的权重（1=气声/辅音，0=唱出来的音高段）。
+
+    用 parselmouth 判浊音（53-900 Hz，voicing_threshold 0.6）。判不出来就返回全 0，
+    也就是「宁可不移植」，绝不把原唱音高段混进成品。
+    """
+    try:
+        import parselmouth
+        from parselmouth.praat import call as praat_call
+    except Exception:  # noqa: BLE001
+        return np.zeros(n_frames, dtype=np.float32)
+    try:
+        y, sr = _read(reference)
+        snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=sr)
+        pitch = praat_call("To Pitch", snd, hop_s, REF_VOICING_MIN, REF_VOICING_MAX)
+        f0 = np.nan_to_num(pitch.selected_array["f0"], nan=0.0)
+        voiced = (f0 > 0.0).astype(np.float32)
+        if voiced.size == 0:
+            return np.zeros(n_frames, dtype=np.float32)
+        idx = np.clip(np.linspace(0, voiced.size - 1, n_frames).astype(int), 0, voiced.size - 1)
+        return (1.0 - voiced[idx]).astype(np.float32)
+    except Exception:  # noqa: BLE001
+        return np.zeros(n_frames, dtype=np.float32)
+
+
+def restore_timbre(converted: Path, reference: Path, dst: Path,
+                   cons_ratio: float | None = None) -> Path:
+    """把原唱的音色倾向「轻量」挪过来：只补气声/辅音段，不动音高段。
+
+    10-28 的实测：整段 LTAS 移植（0.6 权重）会把原唱的 6-16 kHz 波形叠回来，
+    两个歌手的齿音互拍频 → 用户听到的「撕裂 / 颗粒」。这里权重降到 0.10，
+    并且乘上「原唱无音高帧」掩码，只覆盖真正是辅音的帧。
+    """
+    ratio = CONS_RATIO if cons_ratio is None else float(cons_ratio)
+    y, sr = _read(converted)
+    if y.size == 0 or ratio <= 0:
+        return _write(dst, y, sr)
+    ref, sr2 = _read(reference)
+    if sr != sr2 or ref.size == 0:
+        return _write(dst, y, sr)
+    c_db = frame_rms_db(y, sr)
+    r_db = frame_rms_db(ref, sr)
+    n = min(c_db.size, r_db.size)
+    uv_w = _ref_uv_weight(reference, n, HOP_S)
+    if float(uv_w.mean()) <= 0.0:
+        return _write(dst, y, sr)
+    mag, phase = _stft(y)
+    ref_mag, _ = _stft(ref)
+    c_l = 20 * np.log10(mag.mean(axis=1) + 1e-9)
+    r_l = 20 * np.log10(ref_mag.mean(axis=1) + 1e-9)
+    diff = uniform_filter1d(r_l - c_l, size=9, mode="nearest")
+    diff = np.clip(diff, -TIMBRE_MAX_DB, TIMBRE_MAX_DB) * ratio
     gain = 10 ** (diff / 20.0)
-    if TIMBRE_DYN:
-        # 动态部分：按帧能量把补偿量往静音帧收一点，防止底噪被抬起来
-        fe = cm.mean(axis=0)
-        w = np.clip((fe - np.percentile(fe, 20)) / (np.percentile(fe, 95) - np.percentile(fe, 20) + 1e-9),
-                    0.25, 1.0)
-        cm = cm * (gain[:, None] ** w[None, :])
-    else:
-        cm = cm * gain[:, None]
-    return _write(dst, _istft(cm, cp, len(cv)), sr)
+    frames = mag.shape[1]
+    w = np.interp(np.linspace(0, 1, frames), np.linspace(0, 1, uv_w.size), uv_w)
+    mag = mag * (gain[:, None] ** w[None, :])
+    return _write(dst, _istft(mag, phase, len(y)), sr)
 
 
 def apply_vocal_gate(converted: Path, reference: Path, dst: Path,
@@ -250,7 +289,14 @@ def run_chain(vocals: Path, converted: Path, out: Path, workdir: Path) -> Path:
     step1 = workdir / "pp-timbre.wav"
     step2 = workdir / "pp-gate.wav"
     step3 = workdir / "pp-dyn.wav"
-    restore_timbre(converted, vocals, step1)
+    src = converted
+    if DENOISE_STRENGTH > 0:
+        # 谱减只在显式要求时做（默认 0）：1.6 的强度会把气声削成音乐噪声，
+        # 听感就是「颗粒感重、不通透」。
+        den = workdir / "pp-denoise.wav"
+        denoise_vocals(converted, den, DENOISE_STRENGTH)
+        src = den
+    restore_timbre(src, vocals, step1)
     apply_vocal_gate(step1, vocals, step2)
     match_dynamics(step2, vocals, step3)
     return clean_vocal_output(step3, out)

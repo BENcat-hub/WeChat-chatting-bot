@@ -180,8 +180,19 @@ def _svc_infer(src: Path, model_dir: Path, out: Path, transpose: int, f0_method:
     cfg = model_dir / "config.json"
     if not cfg.is_file():
         raise RuntimeError(f"{model_dir.name} 缺少 config.json（so-vits-svc 模型配置）")
+    f0 = (f0_method or "parselmouth").lower()
+    if f0 == "harvest":
+        # 10-28 的 A/B：harvest 在 50-120 Hz 整段翻倍（低音区八度错误 44%），
+        # 且听感更「沙」；统一换 parselmouth，要旧手感用 BACKEND_SVC_F0=caller。
+        if os.environ.get("BACKEND_SVC_F0", "").strip().lower() != "caller":
+            log(f"f0 提取器: 请求 {f0} → 使用 parselmouth")
+            f0 = "parselmouth"
     cmd = [str(SVC_EXE), "infer", str(src), "-m", str(ckpt), "-c", str(cfg),
-           "-fm", (f0_method or "harvest").lower(), "-t", str(int(transpose)), "-o", str(out)]
+           "-fm", f0, "-t", str(int(transpose)),
+           "-n", os.environ.get("BACKEND_NOISE_SCALE", "0.30"),
+           "-ch", os.environ.get("BACKEND_CHUNK_SECONDS", "8"),
+           "-db", os.environ.get("BACKEND_DB_THRESH", "-20"),
+           "-o", str(out)]
     log("svc " + " ".join(cmd[3:]))
     proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=1800,
@@ -190,6 +201,35 @@ def _svc_infer(src: Path, model_dir: Path, out: Path, transpose: int, f0_method:
         tail = (proc.stderr or proc.stdout or "")[-800:]
         raise RuntimeError(f"svc infer 失败(rc={proc.returncode}): {tail}")
     return out
+
+
+def _export_mp3(wav: Path, bitrate: str = "320k") -> Path:
+    """成品转成 mp3（微信/手机都能直接听，体积也只有 wav 的 1/20）。
+
+    ffmpeg 用 tools/ffmpeg.exe；转不出来就把 wav 原样交回去，不让一条编码失败
+    把整次翻唱判死。
+    """
+    ff = ROOT / "tools" / "ffmpeg.exe"
+    if not ff.is_file():
+        try:
+            import imageio_ffmpeg
+            ff = Path(imageio_ffmpeg.get_ffmpeg_exe())
+        except Exception:  # noqa: BLE001
+            return wav
+    dst = wav.with_suffix(".mp3")
+    try:
+        proc = subprocess.run(
+            [str(ff), "-y", "-v", "error", "-i", str(wav), "-codec:a", "libmp3lame",
+             "-b:a", bitrate, "-ar", "44100", str(dst)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+        if proc.returncode == 0 and dst.is_file() and dst.stat().st_size > 0:
+            log(f"mp3 已导出 {dst.name} {dst.stat().st_size // 1024}KB")
+            return dst
+        log("mp3 导出失败: " + (proc.stderr or "")[-300:])
+    except Exception as exc:  # noqa: BLE001
+        log(f"mp3 导出异常: {exc}")
+    return wav
 
 
 def _mix(vocals: Path, inst: Path | None, out: Path,
@@ -259,7 +299,7 @@ def convert(song_name_src: str,
             msst_normalize: bool = True,
             vocal_postprocess: bool = False,
             shift_accompaniment: bool = False,
-            f0_method: str = "harvest",
+            f0_method: str = "parselmouth",
             index_rate: float = 0.75,
             filter_radius: int = 3):
     """返回 (输出文件绝对路径, 是否命中缓存)。"""
@@ -297,9 +337,9 @@ def convert(song_name_src: str,
         # 2026-11-04：按会话 56b24645 的最终版把后处理链接回来
         import postproc
 
-        vdn = postproc.denoise_vocals(vocals, CACHE_DIR / f"den-{tag}.wav")
+        vdn = vocals
         converted = CACHE_DIR / f"svc-{tag}.wav"
-        _svc_infer(vdn, picked, converted, int(key_shift or 0), str(f0_method or "harvest"))
+        _svc_infer(vdn, picked, converted, int(key_shift or 0), str(f0_method or "parselmouth"))
         processed = postproc.run_chain(vdn, converted, CACHE_DIR / f"pp-{tag}.wav", CACHE_DIR)
         if shift_accompaniment and int(key_shift or 0):
             # 伴奏同步变调代价高，这里只在明确要求时提示未实现细节
@@ -309,8 +349,9 @@ def convert(song_name_src: str,
         log("翻唱失败:\n" + traceback.format_exc())
         raise
 
-    log(f"完成 {final_out.name} 用时 {time.monotonic() - started:.1f}s")
-    return str(final_out), "false"
+    delivered = _export_mp3(final_out)
+    log(f"完成 {delivered.name} 用时 {time.monotonic() - started:.1f}s")
+    return str(delivered), "false"
 
 
 def cache_info() -> dict:
@@ -351,7 +392,7 @@ def build_app():
         with gr.Row():
             shift = gr.Slider(-24, 24, value=0, step=1, label="key_shift")
             f0 = gr.Dropdown(["crepe", "fcpe", "rmvpe", "harvest", "dio", "pm"],
-                             value="harvest", label="f0_method")
+                             value="parselmouth", label="f0_method")
         with gr.Row():
             vv = gr.Number(value=0, label="vocal_vol")
             iv = gr.Number(value=0, label="inst_vol")
