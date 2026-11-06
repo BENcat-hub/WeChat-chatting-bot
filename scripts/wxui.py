@@ -4441,24 +4441,21 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                                 retryable=False)
                     return plan
                 if _msg_mode(cfg) and attempt == 1:
-                    # 消息模式首试：点输入框 → WM_PASTE（先给输入框子窗口，再给主窗口）→ 回车。
-                    # 图片粘贴要 Qt 自己去读剪贴板，WM_CHAR 做不到；实测 WM_PASTE 不一定生效，
-                    # 所以只用于第 1 次，失败后下面的 native 分支会兜底（那一刻光标会动一下）。
+                    # 消息模式发图：Qt 不认 WM_PASTE（实测 2026-11-07：投了也没粘上），
+                    # 而 ctrl+v 只是按键、不动光标 —— 所以这里「消息点击聚焦 + 原生按键粘贴」，
+                    # 唯一代价是微信会被提到前台（不移动鼠标、不占用键鼠）。
                     _h = _wx_root(cfg)
                     _box = input_box_point(cfg, plan.get("window_rect"))
                     if _h:
                         winmsg.post_click(_h, _box[0], _box[1])
                         time.sleep(0.2)
-                        _child = winmsg.hwnd_at(_box[0], _box[1]) or _h
-                        with winmsg.focus_attached(_h):
-                            winmsg.post_msg(_child, 0x0302)          # WM_PASTE
-                            time.sleep(0.12)
-                            if _child != _h:
-                                winmsg.post_msg(_h, 0x0302)
+                        ctypes.windll.user32.SetForegroundWindow(_h)
+                        time.sleep(0.15)
+                        client.call("Shortcut", {"shortcut": "ctrl+v"})
                         time.sleep(cfg.get("after_paste_wait", 1.2))
                         with winmsg.focus_attached(_h):
                             winmsg.post_key(_h, winio.VK_RETURN)
-                        plan["image_paste"] = "message"
+                        plan["image_paste"] = "message-focus+native-keys"
                     else:
                         client.call("Shortcut", {"shortcut": "ctrl+v"})
                         time.sleep(cfg.get("after_paste_wait", 1.2))
