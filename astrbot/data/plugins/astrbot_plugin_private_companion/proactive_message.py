@@ -290,6 +290,18 @@ from .logging_util import get_module_logger
 logger = get_module_logger(__name__)
 
 
+def _clip_spoken(text: str, limit: int = 30) -> str:
+    """按句读边界截断语音文本（原来是硬切，产出过「…还挺好看的，你。」这种半句）。"""
+    s = _single_line(text, max(4, int(limit)))
+    if len(s) <= int(limit):
+        return s
+    head = s[: int(limit)]
+    cut = max(head.rfind(ch) for ch in "。！？!?…~，、；;")
+    if cut >= max(6, int(limit) // 2):
+        return head[: cut + 1]
+    return head
+
+
 def _persona_provider_id(owner: Any, canonical_key: str, legacy_attr: str, quick_role: str) -> str:
     """Resolve canonical persona provider settings while preserving test harnesses."""
     fallback = str(getattr(owner, legacy_attr, "") or "").strip()
@@ -10712,7 +10724,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                 if retry_text:
                     spoken = str(retry_text).strip()
             if "<tts>" not in spoken:
-                spoken = _single_line(spoken, runtime_persona_setting(self, "voice_action_max_chars", 30))
+                spoken = _clip_spoken(spoken, runtime_persona_setting(self, "voice_action_max_chars", 30))
                 spoken = re.sub(r"[“”\"'`]", "", spoken).strip()
             if requirement["strict"] and not self._voice_text_matches_requirement(spoken, requirement):
                 repair_prompt = self._build_voice_repair_prompt(
@@ -10732,7 +10744,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
                 if repaired:
                     spoken = str(repaired).strip()
                     if "<tts>" not in spoken:
-                        spoken = _single_line(spoken, runtime_persona_setting(self, "voice_action_max_chars", 30))
+                        spoken = _clip_spoken(spoken, runtime_persona_setting(self, "voice_action_max_chars", 30))
                         spoken = re.sub(r"[“”\"'`]", "", spoken).strip()
             if requirement["strict"] and not self._voice_text_matches_requirement(spoken, requirement):
                 logger.warning(
@@ -10779,7 +10791,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         if not spoken:
             spoken = random.choice(VOICE_FALLBACK_TEMPLATES)
         if "<tts>" not in spoken:
-            spoken = _single_line(spoken, runtime_persona_setting(self, "voice_action_max_chars", 30))
+            spoken = _clip_spoken(spoken, runtime_persona_setting(self, "voice_action_max_chars", 30))
             spoken = re.sub(r"[“”\"'`]", "", spoken).strip()
         if requirement["strict"] and not self._voice_text_matches_requirement(spoken, requirement):
             repair_prompt = self._build_voice_repair_prompt(
@@ -10799,7 +10811,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             if repaired:
                 spoken = str(repaired).strip()
                 if "<tts>" not in spoken:
-                    spoken = _single_line(spoken, runtime_persona_setting(self, "voice_action_max_chars", 30))
+                    spoken = _clip_spoken(spoken, runtime_persona_setting(self, "voice_action_max_chars", 30))
                     spoken = re.sub(r"[“”\"'`]", "", spoken).strip()
         return spoken
 
@@ -11103,11 +11115,17 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         if re.search(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", source, flags=re.IGNORECASE | re.DOTALL):
             outside = re.sub(r"<(?:pc_)?tts\b[^>]*>.*?</(?:pc_)?tts>", "", source, flags=re.IGNORECASE | re.DOTALL)
             outside = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", outside, flags=re.IGNORECASE).strip()
+            outside = re.sub(r"\[\[PCTTS:[^\]]*\]\]", "", outside).strip()
             if re.search(r"[\u4e00-\u9fff]", outside):
                 return _single_line(_strip_internal_message_blocks(
                     outside, tts_enabled=bool(runtime_persona_setting(self, "enable_tts_enhancement", False))
                 ), limit)
             source = re.sub(r"</?(?:pc_)?t{2,}s\b[^>]*>", "", source, flags=re.IGNORECASE).strip()
+        # 2026-11-07: 模型经常只写开标签、不写闭标签（"<pc_tts>今天…"）。
+        # 上面两条分支都要求「成对标签」，落单的开标签因此原样漏过去 —— 既进了可见正文，
+        # 也进了 TTS 输入（edge 把 "_" 念成「下划线」，用户看到的就是 "PC下划线TTS…"）。
+        source = re.sub(r"\[\[PCTTS:[^\]]*\]\]", "", source)
+        source = re.sub(r"</?(?:pc[_-]?)?t{2,}s\b[^>]*>", "", source, flags=re.IGNORECASE).strip()
         has_kana = bool(re.search(r"[\u3040-\u30ff]", source))
         has_cjk = bool(re.search(r"[\u4e00-\u9fff]", source))
         if (

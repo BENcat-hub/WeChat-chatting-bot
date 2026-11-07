@@ -307,12 +307,20 @@ class WeFlowBridge:
             return
 
         if content in ("[链接]", "[文章]", "[网页]") or "<url>" in content:
-            # 链接卡片（2026-11-06）：回查 appmsg XML，把标题/摘要/URL 交给模型
-            resolved = self._resolve_link_card(data)
-            if resolved:
+            # 链接（2026-11-07）：交给 astrbot_plugin_parser（万能解析器）自己解析。
+            # 我们只发原始 URL；parser 对 B站/抖音/小红书/YouTube/X 都有专门处理，
+            # 比 bridge 自己拼「标题/摘要」准得多。拿不到 URL 时才回落旧摘要。
+            url = self._link_url(data)
+            if url:
                 data = dict(data)
-                data["content"] = resolved
-                content = resolved
+                data["content"] = url
+                content = url
+            else:
+                resolved = self._resolve_link_card(data)
+                if resolved:
+                    data = dict(data)
+                    data["content"] = resolved
+                    content = resolved
 
         if content == "[图片]":
             # 图片消息（mention 模式下需 @ 才处理）
@@ -1388,6 +1396,34 @@ class WeFlowBridge:
         text = "（对方发来一段视频，以下是按时间顺序截取的画面描述）" + "；".join(parts)
         log.info(f"🎬 视频转述: {text[:80]}...")
         self._inject_description(data, text)
+
+    def _link_url(self, data: dict):
+        """只取链接卡片的 URL（给万能解析器用）。"""
+        talker = (data.get("sessionId") or "").strip()
+        if not talker:
+            return None
+        try:
+            messages = self._query_messages_with_media(talker, limit=15)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"🔗 链接回查失败: {exc}")
+            return None
+        cards = [
+            m
+            for m in messages
+            if int(m.get("localType") or 0) == 49 and "<url>" in (m.get("rawContent") or "")
+        ]
+        if not cards:
+            log.info(f"🔗 未找到链接卡片（talker={talker}）")
+            return None
+        url = cards[0].get("rawContent") or ""
+        m = re.search(r"<url>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?</url>", url)
+        if not m:
+            return None
+        value = (m.group(1) or "").strip()
+        if not value.lower().startswith(("http://", "https://")):
+            return None
+        log.info(f"🔗 链接交给解析器: {value[:90]}")
+        return value
 
     def _resolve_link_card(self, data: dict):
         """[链接] → 标题 / 摘要 / URL。"""
