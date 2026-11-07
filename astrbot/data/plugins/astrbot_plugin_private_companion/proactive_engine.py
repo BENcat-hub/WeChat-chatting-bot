@@ -122,6 +122,7 @@ from .proactive_routes import PROACTIVE_ROUTE_REGISTRY
 from .persona_config import runtime_persona_setting
 from .logging_util import get_module_logger
 
+MATERIALIZE_BACKOFF_S = float(os.environ.get("IMPULSE_MATERIALIZE_BACKOFF_S", "1200"))  # 同一念头两次物化的最小间隔（秒）
 logger = get_module_logger(__name__)
 
 
@@ -3658,6 +3659,14 @@ class ProactiveEngineMixin:
         ]
         if not active:
             return False
+        # 退避：刚物化过的念头先让一让，别在同一拍里反复重物化（否则 3 次就撞熔断）
+        active = [
+            item
+            for item in active
+            if _safe_float(item.get("materialize_backoff_until"), 0) <= check_now
+        ]
+        if not active:
+            return False
         ready = [item for item in active if self._impulse_ready_now(item, now=check_now)]
         selected: dict[str, Any] | None = None
         review_at = 0.0
@@ -3718,6 +3727,7 @@ class ProactiveEngineMixin:
             selected["state"] = "blocked"
             selected["last_status"] = "blocked"
             selected["last_note"] = "同一来源短时间重复物化已熔断"
+            selected["materialize_backoff_until"] = check_now + max(1800.0, MATERIALIZE_BACKOFF_S)
             selected["updated_ts"] = check_now
             logger.warning(
                 "主动念头重复物化熔断: user=%s origin=%s count=%s",
@@ -3827,6 +3837,7 @@ class ProactiveEngineMixin:
         materialized_count = _safe_int(selected.get("materialized_count"), 0, 0)
         selected["materialized_count"] = materialized_count + 1 if check_now - materialized_at <= 15 * 60 else 1
         selected["last_materialized_at"] = check_now
+        selected["materialize_backoff_until"] = check_now + max(60.0, MATERIALIZE_BACKOFF_S)
         return True
 
     def _record_proactive_candidate(
