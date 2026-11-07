@@ -202,7 +202,7 @@ SUPPORTED_SIZES = [
     (2560 * 1440, (2560, 1440)),
     (3024 * 1296, (3024, 1296)),
     (4096 * 4096, (4096, 4096)),
-    (4694 * 3520, (4694, 3520)),
+    (4693 * 3520, (4693, 3520)),
     (4992 * 3328, (4992, 3328)),
     (5404 * 3040, (5404, 3040)),
     (6198 * 2656, (6198, 2656)),
@@ -239,10 +239,18 @@ def load_sf_key() -> str:
 
 SF_SIZE_MIN = 256
 SF_SIZE_MAX = 2048
+# SiliconFlow（Qwen-Image）硬上限：width*height ≤ 2,073,600（实测 400
+# `width * height should not exceed 2073600`），边长同时 ≤ 2048。
+SF_SIZE_MAX_AREA = 2073600
 
 
 def sf_image_size(size_params: dict) -> str:
-    """火山参数（width/height 或面积）→ SiliconFlow 的 `image_size: "WxH"`。"""
+    """火山参数（width/height 或面积）→ SiliconFlow 的 `image_size: "WxH"`。
+
+    SiliconFlow（Qwen-Image）单边上限 2048：请求 4693×3520 这类 4K 尺寸时**按比例**缩到
+    长边 2048（4693×3520 → 2048×1536），并让调用方把 `size_clamped` 如实回给上游，
+    而不是静默出小图。要真正 4K 必须走火山（`X-Jimeng-Backend: volc` + AK/SK）。
+    """
     width = int(size_params.get("width") or 0)
     height = int(size_params.get("height") or 0)
     if not width or not height:
@@ -252,8 +260,22 @@ def sf_image_size(size_params: dict) -> str:
             side = int(round(side / 16)) * 16
             return f"{side}x{side}"
         return "1024x1024"
-    width = max(SF_SIZE_MIN, min(SF_SIZE_MAX, int(round(width / 16)) * 16))
-    height = max(SF_SIZE_MIN, min(SF_SIZE_MAX, int(round(height / 16)) * 16))
+    longest = max(width, height)
+    if longest > SF_SIZE_MAX:
+        scale = SF_SIZE_MAX / longest
+        width = int(width * scale)
+        height = int(height * scale)
+    if width * height > SF_SIZE_MAX_AREA:
+        scale = (SF_SIZE_MAX_AREA / (width * height)) ** 0.5
+        width = int(width * scale)
+        height = int(height * scale)
+    width = max(SF_SIZE_MIN, min(SF_SIZE_MAX, int(width // 16) * 16))
+    height = max(SF_SIZE_MIN, min(SF_SIZE_MAX, int(height // 16) * 16))
+    while width * height > SF_SIZE_MAX_AREA and (width > SF_SIZE_MIN or height > SF_SIZE_MIN):
+        if width >= height:
+            width -= 16
+        else:
+            height -= 16
     return f"{width}x{height}"
 
 
@@ -775,8 +797,19 @@ class Handler(BaseHTTPRequestHandler):
         prompt = flatten_prompt(str(payload.get("prompt") or payload.get("text") or ""))
         count = int(payload.get("n") or 1)
         size_params = parse_size(payload.get("size"), str(payload.get("aspect_ratio") or ""))
+        # 面板等待时间（external_image_api_timeout_seconds）通常比这里短：服务端必须**先**收工，
+        # 否则插件侧等到超时、这边还在轮询上游（历史故障：面板 180s / 服务端 300s）。
+        # 两个口子：请求头 X-Jimeng-Deadline-S 优先，其次环境变量 JIMENG_DEADLINE_S（默认 560s）。
+        try:
+            deadline_s = int(float(self.headers.get("X-Jimeng-Deadline-S")
+                                   or os.environ.get("JIMENG_DEADLINE_S") or 560))
+        except (TypeError, ValueError):
+            deadline_s = 560
+        deadline_s = max(30, min(1800, deadline_s))
         refs = self._collect_refs(payload)
         response_format = str(payload.get("response_format") or "url").lower()
+        sf_size = sf_image_size(size_params) if backend == "sf" else ""
+        size_clamped = bool(sf_size) and sf_size.replace("x", "×") != f"{size_params.get('width')}×{size_params.get('height')}"
 
         # `model`/`req_key` 这里是**客户端请求**的模型，不代表真正打上游用的 req_key：模型级
         # 回退生效时（4.6 被拒 → 4.0）每个请求仍会记一行 model=jimeng-4.6，只有后面的
@@ -787,17 +820,19 @@ class Handler(BaseHTTPRequestHandler):
                    "denied": req_key_denied_snapshot(),
                    "prompt": prompt[:400], "prompt_len": len(prompt), "n": count, "size_params": size_params,
                    "refs": len(refs), "response_format": response_format,
+                   "deadline_s": deadline_s, "sf_size": sf_size, "size_clamped": size_clamped,
                    "payload_keys": sorted(payload)})
 
         if not prompt:
             self._send(400, {"error": {"message": "prompt is required"}})
             return
 
+        t_start = time.time()
         if backend == "sf":
             # SiliconFlow 是同步接口（没有「提交 + 轮询」），但对外仍保持 OpenAI 形状，
             # 插件侧完全无感知。带参考图（edits / image 字段）时自动切到 Edit 模型。
             try:
-                result = sf_generate(clamp_prompt(prompt), refs, size_params, count)
+                result = sf_generate(clamp_prompt(prompt), refs, size_params, count, timeout=deadline_s)
                 data_items: list[dict] = []
                 for url in result["image_urls"][: max(1, count)]:
                     saved = save_image(url, "sf")
@@ -811,10 +846,15 @@ class Handler(BaseHTTPRequestHandler):
                     data_items.append(item)
                 log_event({"stage": "done", "backend": "sf", "task_id": result.get("task_id"),
                            "model": result["raw"].get("model"),
+                           "requested_size": size_params, "actual_size": sf_size,
+                           "size_clamped": size_clamped,
+                           "seconds": round(time.time() - t_start, 1),
                            "images": [it["url"] for it in data_items]})
                 self._send(200, {"created": int(time.time()), "data": data_items,
                                  "model": model, "backend": "sf",
                                  "req_key": result["raw"].get("model"),
+                                 "requested_size": size_params, "actual_size": sf_size,
+                                 "size_clamped": size_clamped,
                                  "task_id": result.get("task_id")})
             except Exception as exc:  # noqa: BLE001
                 detail = f"{type(exc).__name__}: {exc}"
@@ -876,7 +916,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 这样一次请求的「试了谁、成了谁」在日志里是闭合的。
                     log_event({"stage": "attempt", "req_key": key, "index": index,
                                "of": len(candidates), "model": model})
-                    result = generate(ak, sk, key, dict(params), refs)
+                    result = generate(ak, sk, key, dict(params), refs, timeout=deadline_s)
                     used_key = key
                     clear_req_key_denied(key, "generate ok")
                     if key != req_key:

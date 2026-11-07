@@ -292,6 +292,8 @@ _PLATFORM_DISPLAY_NAMES = {
 
 
 
+DEAD_IMPULSE_TTL_H = float(os.environ.get("IMPULSE_DEAD_TTL_H", "2"))
+
 class ProactiveEngineMixin:
     """主动行为候选、决策、计划事件与动作选择"""
 
@@ -614,8 +616,32 @@ class ProactiveEngineMixin:
                 continue
             if created > 0 and check_now - created > 48 * 3600:
                 continue
+            # 2026-11-07：被冻结/已发/已取消的念头只留 2 小时（IMPULSE_DEAD_TTL_H 可调）。
+            # 它们只用于「别复读同一件事」的去重窗口，不该长期占着池子把新想法挤掉。
+            if (
+                str(item.get("state") or "").lower() in {"blocked", "cancelled", "dropped", "sent"}
+                and created > 0
+                and check_now - created > DEAD_IMPULSE_TTL_H * 3600
+            ):
+                continue
             kept.append(item)
-        user["proactive_impulses"] = kept[-16:]
+        # 2026-11-07 修复：blocked 念头单独限量（最多 8 条、仍用于去重），
+        # 活跃念头单独给 16 个名额，避免尸体把新想法挤出池子。
+        alive = [
+            i
+            for i in kept
+            if str(i.get("state") or "queued").lower()
+            not in {"sent", "blocked", "cancelled", "dropped"}
+        ]
+        dead = [
+            i
+            for i in kept
+            if str(i.get("state") or "queued").lower()
+            in {"sent", "blocked", "cancelled", "dropped"}
+        ]
+        merged = dead[-8:] + alive[-16:]
+        merged.sort(key=lambda i: _safe_float(i.get("created_ts"), 0))
+        user["proactive_impulses"] = merged
         return user["proactive_impulses"]
 
     def _user_activity_question_targets_someone_else(self, text: str) -> bool:
@@ -3474,6 +3500,14 @@ class ProactiveEngineMixin:
             user["planned_proactive_delivery_state"] = "deferred"
             return False
         self._clear_pending_proactive_plan(user)
+        # 2026-11-07 修复：block_current 时把当前念头真正判死，别让它下一拍又被选中
+        # （旧行为只清 planned 计划，同一个念头会被连续物化 3 次撞上熔断，
+        #  表现为日志里成片的「主动念头重复物化熔断」、那条想法再也不会发出）。
+        if block_current and isinstance(impulse, dict):
+            impulse["state"] = "blocked"
+            impulse["last_status"] = "blocked"
+            impulse["last_note"] = _single_line(note, 160) or "本轮判定不适合发送"
+            impulse["updated_ts"] = check_now
         if not self._materialize_best_proactive_impulse(user, now=check_now):
             return False
         return bool(_single_line(user.get("planned_proactive_impulse_id"), 20) != current_id)

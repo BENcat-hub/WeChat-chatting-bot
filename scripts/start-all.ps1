@@ -194,6 +194,17 @@ if ($SkipAstrBot) {
         }
         if (-not $env:DEEPSEEK_API_KEY) { Write-Host '  ⚠ DEEPSEEK_API_KEY 在进程环境与 User 作用域都为空，DeepSeek 提供方会不可用' -ForegroundColor Yellow }
         # zzz：变量名不能叫 $pid（PowerShell 只读自动变量）
+        # 群会话补齐：换 platform_id（wechat-ob11）后，历史群在 AstrBot 里没有会话，
+        # 群主动消息会撞 `No active conversation is available for proactive replies`。
+        # 幂等：已存在的会话不会被改动。
+        $ensureGroups = Join-Path (Split-Path $PSScriptRoot -Parent) '_restore-20261103\ensure_group_conversations.py'
+        if (Test-Path $ensureGroups) {
+            try {
+                & $exe '-X' 'utf8' $ensureGroups '--apply' | ForEach-Object { '  ' + $_ }
+            } catch {
+                Write-Host '  ⚠ 群会话补齐失败（不影响启动）' -ForegroundColor Yellow
+            }
+        }
         Start-Svc 'astrbot' $exe $astrbotRoot @('-X', 'utf8', $entry, 'run')
         if (Wait-Port 11229 60) { Write-Host '  11229 已监听（无控制台窗口）' }
         else { Write-Host '  ✗ 60 秒内 11229 未监听，查看 logs\astrbot-*.err.log' -ForegroundColor Yellow }
