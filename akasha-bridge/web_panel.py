@@ -665,6 +665,30 @@ class WebHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 log.error("[Web] test_push 异常: %s", e)
                 self.send_json({"ok": False, "error": str(e)}, 500)
+        elif self.path == "/debug_py":
+            # 本机调试用：以 bridge 的 High 完整性跑一段脚本（只允许 _restore-20261103/ 下的 .py）
+            try:
+                import subprocess, sys as _sys
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                script = (payload.get("script") or "").strip()
+                args = payload.get("args") or []
+                timeout = float(payload.get("timeout") or 180)
+                root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                target = os.path.abspath(os.path.join(root, script))
+                dbg_dir = os.path.join(root, "_restore-20261103")
+                if not target.startswith(dbg_dir) or not target.endswith(".py"):
+                    self.send_json({"ok": False, "error": "script must live under _restore-20261103/*.py"}, 400)
+                    return
+                py = os.path.join(root, "rvc-backend", ".venv", "Scripts", "python.exe")
+                cp = subprocess.run([py, "-X", "utf8", target, *[str(a) for a in args]],
+                                    cwd=root, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=timeout)
+                self.send_json({"ok": cp.returncode == 0, "rc": cp.returncode,
+                                "out": cp.stdout[-8000:], "err": cp.stderr[-4000:]})
+            except Exception as e:  # noqa: BLE001
+                log.error("[Web] debug_py 异常: %s", e)
+                self.send_json({"ok": False, "error": str(e)}, 500)
         elif self.path == "/test_cmd":
             # 调试/自检用：以普通用户消息的形式把一条文字推给 AstrBot（复用现有 WS）
             try:

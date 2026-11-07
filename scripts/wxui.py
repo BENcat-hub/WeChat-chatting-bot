@@ -773,6 +773,69 @@ def _brief(text, limit=180):
 _SHOT_ERR = [""]
 
 
+def _crop_from_window(full_png, win_rect, region, out_png):
+    """按比例从「整窗截图」里裁出 region（屏幕坐标），绕开 DPI 坐标空间不一致。
+
+    wxui 自己的 window_rect 与 winmsg 的 PrintWindow 位图可能处在不同 DPI 空间
+    （per-monitor aware 下 GetWindowRect 给物理像素，而 capture 的位图尺寸未必等值），
+    直接传客户区坐标裁会裁到窗口外、得到一片空白。这里只信比例。
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        im = Image.open(full_png)
+        w, h = im.size
+        wx, wy = int(win_rect[2] - win_rect[0]), int(win_rect[3] - win_rect[1])
+        if w <= 0 or h <= 0 or wx <= 0 or wy <= 0:
+            return None
+        sx, sy = w / float(wx), h / float(wy)
+        box = (int((region[0] - win_rect[0]) * sx), int((region[1] - win_rect[1]) * sy),
+               int((region[2] - win_rect[0]) * sx), int((region[3] - win_rect[1]) * sy))
+        box = (max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3]))
+        if box[2] - box[0] < 2 or box[3] - box[1] < 2:
+            return None
+        im.crop(box).save(out_png)
+        return out_png
+    except Exception:
+        return None
+
+
+def _ensure_visible_no_focus(hwnd):
+    """最小化/隐藏时把窗口还原出来，但**不把焦点给它**（消息模式专用）。
+
+    返回 (ok, rect)。还原动作本身会让窗口短暂到最前，紧接着用 SetWindowPos 把
+    原来的前景窗口放回它上面，焦点和输入法都留在用户那边。
+    """
+    if not hwnd:
+        return False, None
+    rect = window_rect(hwnd)
+    if rect_usable(rect):
+        return True, rect
+    u32 = ctypes.windll.user32
+    try:
+        prev_fg = int(u32.GetForegroundWindow() or 0)
+    except Exception:
+        prev_fg = 0
+    try:
+        u32.ShowWindow(hwnd, 9)  # SW_RESTORE（会临时抢前台）
+    except Exception:
+        pass
+    time.sleep(0.6)
+    rect = window_rect(hwnd)
+    if not rect_usable(rect):
+        return False, rect
+    if prev_fg and prev_fg != hwnd:
+        try:
+            u32.SetWindowPos(hwnd, prev_fg, 0, 0, 0, 0,
+                             0x0001 | 0x0002 | 0x0010)  # NOSIZE|NOMOVE|NOACTIVATE
+            u32.SetForegroundWindow(prev_fg)
+        except Exception:
+            pass
+    return True, rect
+
+
 def shot(client, region, keep_dir, tries=2):
     """Screenshot `region`; return the saved PNG path, or None.
 
@@ -787,15 +850,25 @@ def shot(client, region, keep_dir, tries=2):
     if _msg_mode(cfg_now) and winmsg is not None:
         _h = _wx_root(cfg_now)
         if _h:
+            _ok_v, _r_v = _ensure_visible_no_focus(_h)
+            if not _ok_v:
+                _SHOT_ERR[0] = "window not visible (minimized/hidden) and restore failed: rect=%s" % (list(_r_v or []), )
+                return None
             try:
                 os.makedirs(keep_dir, exist_ok=True)
                 _path = os.path.join(keep_dir, "wxui-%d.png" % time.time())
                 # capture() 收的是客户区坐标（它自己再补标题栏偏移），而调用方给的是屏幕坐标
-                _cl = winmsg.to_client(_h, region[0], region[1])
-                _cr = winmsg.to_client(_h, region[2], region[3])
-                _res = winmsg.capture(_h, _path, (_cl[0], _cl[1], _cr[0], _cr[1]))
+                _win = window_rect(_h)
+                _full = _path + ".full.png"
+                _res = winmsg.capture(_h, _full, None)
                 if float(_res.get("std") or 0) >= 1.0:
-                    return _path
+                    _cropped = _crop_from_window(_full, _win, region, _path)
+                    if _cropped:
+                        try:
+                            os.remove(_full)
+                        except Exception:
+                            pass
+                        return _cropped
                 _SHOT_ERR[0] = "PrintWindow frame looks blank (std=%s)" % _res.get("std")
             except Exception as exc:                           # noqa: BLE001
                 _SHOT_ERR[0] = "PrintWindow capture failed: %s" % exc
@@ -826,9 +899,10 @@ def shot(client, region, keep_dir, tries=2):
                     time.sleep(0.12)
                     _got = None
                     try:
-                        _r2 = winmsg.capture(_h, _p3, (_cl[0], _cl[1], _cr[0], _cr[1]))
+                        _full2 = _p3 + ".full.png"
+                        _r2 = winmsg.capture(_h, _full2, None)
                         if float(_r2.get("std") or 0) >= 1.0:
-                            _got = _p3
+                            _got = _crop_from_window(_full2, window_rect(_h), region, _p3)
                     except Exception:                          # noqa: BLE001
                         _got = None
                     if _got is None:
@@ -841,7 +915,8 @@ def shot(client, region, keep_dir, tries=2):
                     if _got:
                         return _got
                 except Exception as exc:                       # noqa: BLE001
-                    _SHOT_ERR[0] = (_SHOT_ERR[0] + "; flash capture failed: %s" % exc).strip("; ")
+                    _SHOT_ERR[0] = (_SHOT_ERR[0] + "; flash capture failed: %s (%s)"
+                                    % (exc, _tb.format_exc().strip().splitlines()[-1])).strip("; ")
         else:
             _SHOT_ERR[0] = "message mode: no wechat hwnd for PrintWindow"
         # 消息模式拿不到图就到此为止：不要再往下走 MCP 的 Screenshot（那也需要微信可见），
@@ -992,8 +1067,15 @@ def ui_paste(client, cfg, point, text):
         if hwnd:
             winmsg.post_click(hwnd, x, y)
             time.sleep(min(focus_wait, 0.25))
-            with winmsg.focus_attached(hwnd):
+            # 2026-11-07 实测：这里**不要** AttachThreadInput + SetFocus —— 搜索框本来就
+            # 因为刚点过而拿到焦点，再 SetFocus 到顶层窗口反而把输入焦点从 Qt 的搜索框
+            # 抢走，WM_CHAR 全部落空（表现为「搜索面板没出来 / paste may not have landed」）。
+            # 直接往顶层窗口投字符即可（Qt 会把它们路由到当前焦点控件）。
+            try:
                 winmsg.post_chars(hwnd, text)
+            except Exception:
+                with winmsg.focus_attached(hwnd):
+                    winmsg.post_chars(hwnd, text)
             time.sleep(min(paste_wait, 0.35))
             return "message"
         if not cfg.get("msg_fallback_native", True):
@@ -1007,6 +1089,41 @@ def ui_paste(client, cfg, point, text):
     client.call("Shortcut", {"shortcut": "ctrl+v"})
     time.sleep(paste_wait)
     return "mcp"
+
+
+def _search_box_clear(cfg, hwnd=None, rect=None):
+    """把微信搜索框里的残留词清掉。
+
+    搜索框有字时，左侧列表显示的是**搜索结果**而不是会话列表 —— 之后任何「侧栏 OCR
+    找联系人」都会失败（2026-11-07 实测：残留「天文学家」导致找不到「文件传输助手」，
+    日志里 sidebar shows 变成「最常使用 / 天文学家 / ...」）。所以每次搜索失败/成功后
+    都要把它清干净。
+    """
+    try:
+        hwnd = int(hwnd or _wx_root(cfg) or 0)
+        if not hwnd:
+            return False
+        rect = rect or window_rect(hwnd)
+        if not rect_usable(rect):
+            return False
+        sb = _search_box_point(cfg, rect)
+        if _msg_mode(cfg) and winmsg is not None:
+            winmsg.post_click(hwnd, sb[0], sb[1])
+            time.sleep(0.15)
+            winmsg.post_key(hwnd, winio.VK_END if winio is not None else 0x23)
+            for _ in range(int(cfg.get("search_clear_backspaces", 60))):
+                winmsg.post_key(hwnd, 0x08)  # VK_BACK
+            return True
+        if winio is not None:
+            winio.click(sb[0], sb[1])
+            time.sleep(0.15)
+            winio.chord(winio.VK_CTRL, ord("A"))
+            time.sleep(0.05)
+            winio.key(0x2E)  # Delete
+            return True
+    except Exception:
+        return False
+    return False
 
 
 def ui_escape(client, cfg):
@@ -1876,8 +1993,22 @@ def ensure_wechat_ready(cfg, raise_it=True):
                 break
             time.sleep(float(cfg.get("ensure_foreground_wait_s", 0.12)))
 
+    if _msg_mode(cfg) and (info.get("iconic") or not info.get("visible")):
+        # 消息模式：窗口被最小化/收到托盘时，屏幕像素与 PrintWindow 都拿不到东西。
+        # 必须还原，但还原不能把焦点从用户手里抢走（_ensure_visible_no_focus 会把原来的
+        # 前景窗口按回它上面）。以前这里直接不还原，于是一路走到「side shows 口」=失败。
+        _okv, _rv = _ensure_visible_no_focus(hwnd)
+        info["restored_visible"] = bool(_okv)
+        try:
+            info["iconic"] = bool(user32.IsIconic(hwnd))
+            info["visible"] = bool(user32.IsWindowVisible(hwnd))
+        except Exception:                                      # noqa: BLE001
+            pass
+        if _rv:
+            info["rect"] = list(_rv)
+
     try:
-        info["rect"] = list(restored_rect(hwnd))
+        info["rect"] = info.get("rect") or list(restored_rect(hwnd))
     except Exception:                                          # noqa: BLE001
         info["rect"] = []
     on_top = None
@@ -3188,6 +3319,53 @@ def ensure_ui_live(cfg, rect, ttl_s=None, allow_recover=None):
     return {"ok": True, "probe": probe}
 
 
+def _find_search_popup(hwnd, min_w=200, min_h=110):
+    """微信 4.x 的搜索结果面板是**独立顶层窗口**（Qt51514QWindowToolSaveBits），不是主窗的一部分。
+
+    以前 `_search_result_pick` 只 OCR 主窗口的一块区域，因此永远看不到面板（截出来的是侧栏），
+    于是判成「粘贴没落进去」。这里按「同一进程 + 可见 + 足够大 + 不是主窗」把它找出来。
+    """
+    u = ctypes.windll.user32
+    try:
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        pid = pid.value
+    except Exception:
+        return 0, None
+    found = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def _cb(win, _lp):
+        try:
+            p2 = wintypes.DWORD()
+            u.GetWindowThreadProcessId(win, ctypes.byref(p2))
+            if p2.value != pid or win == hwnd:
+                return True
+            if not u.IsWindowVisible(win):
+                return True
+            cls = ctypes.create_unicode_buffer(128)
+            u.GetClassNameW(win, cls, 128)
+            if not cls.value.startswith("Qt51514QWindowToolSaveBits"):
+                return True
+            r = RECT()
+            u.GetWindowRect(win, ctypes.byref(r))
+            if (r.right - r.left) < min_w or (r.bottom - r.top) < min_h:
+                return True
+            found.append((win, (r.left, r.top, r.right, r.bottom)))
+        except Exception:
+            pass
+        return True
+
+    try:
+        u.EnumWindows(_cb, 0)
+    except Exception:
+        return 0, None
+    if not found:
+        return 0, None
+    found.sort(key=lambda x: -(x[1][2] - x[1][0]) * (x[1][3] - x[1][1]))
+    return found[0]
+
+
 def _search_result_pick(client, cfg, rect, target):
     """OCR 微信搜索面板，返回「确实叫这个名字」的结果行坐标和诊断。
 
@@ -3206,12 +3384,28 @@ def _search_result_pick(client, cfg, rect, target):
         return None, {"error": "wechat window is covered: %s" % (_ready.get("reason") or "unknown"),
                       "window": {k: _ready.get(k) for k in
                                  ("visible", "iconic", "foreground", "covered_before", "raised_ok")}}
-    region = [left + int(cfg.get("sidebar_capture_x_offset", 90)),
-              top + int(cfg.get("search_results_y_offset_px", 100)),
-              left + int(cfg.get("sidebar_capture_x2_offset", 560)),
-              bottom - int(cfg.get("sidebar_capture_bottom_margin", 30))]
-    png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp"))
-    dbg = {"png": png, "region": [int(v) for v in region]}
+    popup_hwnd, popup_rect = (0, None)
+    if _msg_mode(cfg) and winmsg is not None:
+        popup_hwnd, popup_rect = _find_search_popup(int(find_wechat(cfg) or 0))
+    if popup_rect:
+        region = [int(v) for v in popup_rect]
+        png = os.path.join(ROOT, "logs", "wmcp", "search-popup-%d.png" % time.time())
+        os.makedirs(os.path.dirname(png), exist_ok=True)
+        try:
+            _cres = winmsg.capture(popup_hwnd, png, None)
+            if float(_cres.get("std") or 0) < 1.0:
+                png, err = None, "popup frame blank"
+            else:
+                err = ""
+        except Exception as _exc:                              # noqa: BLE001
+            png, err = None, "popup capture failed: %s" % _exc
+    else:
+        region = [left + int(cfg.get("sidebar_capture_x_offset", 90)),
+                  top + int(cfg.get("search_results_y_offset_px", 100)),
+                  left + int(cfg.get("sidebar_capture_x2_offset", 560)),
+                  bottom - int(cfg.get("sidebar_capture_bottom_margin", 30))]
+        png, err = shot_ex(client, region, os.path.join(ROOT, "logs", "wmcp"))
+    dbg = {"png": png, "region": [int(v) for v in region], "popup_hwnd": popup_hwnd}
     if not png:
         dbg["error"] = "no image from Screenshot (%s)" % (_brief(err) or "region off screen?")
         return None, dbg
@@ -3439,6 +3633,10 @@ def open_chat_by_search(client, cfg, rect, target):
         # 面板还开着：点聊天头部空白处收起（不能用 Esc —— 面板万一已经自己关了，Esc 会把
         # MMUI 渲染弄卡死；2026-10-29 实测）。
         try:
+            dbg["clear_search"] = _search_box_clear(cfg, wx_h, rect)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             dbg["dismiss"] = dismiss_overlay(cfg, rect)
         except Exception:  # noqa: BLE001
             pass
@@ -3463,7 +3661,13 @@ def open_chat_by_search(client, cfg, rect, target):
             dbg["error"] = ("search result row at %s is covered by another window (pid=%s)"
                             % (list(point), _pid))
             return False, dbg
-        ui_click(client, cfg, point)
+        _pop = int((pdbg or {}).get("popup_hwnd") or 0)
+        if _pop and winmsg is not None:
+            # 结果行在搜索面板那个独立窗口里：消息投递必须打给面板，主窗收不到。
+            if not winmsg.post_click(_pop, point[0], point[1]):
+                ui_click(client, cfg, point)
+        else:
+            ui_click(client, cfg, point)
         time.sleep(open_wait)
         # 2026-10-29：点中结果行之后微信会**自己**收起搜索面板，这里绝对不能再补一个 Esc。
         # 旧代码的「点完补 Esc」正是用户说的「搜索导致微信卡死」的根因：面板已关时 Esc 落在
@@ -3559,11 +3763,18 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
                             % fst, retryable=True)
             return fail(plan, "could not bring WeChat to the foreground "
                               "(window is minimized or behind another window)")
+    if _msg_mode(cfg):
+        # 最小化/收托盘时先还原（不抢焦点），否则后面的截图与 OCR 全是空/花屏。
+        _ok_v, _r_v = _ensure_visible_no_focus(hwnd)
+        plan["restored_visible"] = bool(_ok_v)
     rect = restored_rect(hwnd)
     plan["window_rect"] = list(rect)
     if not rect_usable(rect):
         return fail(plan, "WeChat window is minimized/hidden (rect=%s); put it back "
                           "on screen and retry" % (list(rect),))
+    if _msg_mode(cfg):
+        # 搜索框里残留的词会让左侧列表变成「搜索结果」，侧栏 OCR 就永远找不到联系人。
+        plan["search_cleared"] = _search_box_clear(cfg, hwnd, rect)
     # 2026-10-29：半冻结时点击/滚轮全部无效（WM_NULL 仍然 9ms、IsHungAppWindow=False）。
     # 先做一次「悬停是否重绘」探活；判定死了就自愈一次（重启微信，有冷却），再继续。
     if do_ocr and _native_on(cfg, "native_input"):
