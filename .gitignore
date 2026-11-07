@@ -87,3 +87,6 @@ astrbot/data/cmd_config.json.bak*
 rvc-backend/gradio/
 akasha-bridge/wxui_recent_attempts.json
 akasha-bridge/wxui_recent_sends.json
+bertvits2/pretrained/
+bertvits2/bert/
+bertvits2/jieba.cache

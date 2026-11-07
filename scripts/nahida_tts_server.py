@@ -39,6 +39,9 @@ RVC = ROOT / "rvc-backend"
 FFMPEG = ROOT / "tools" / "ffmpeg.exe"
 SVC = RVC / ".venv" / "Scripts" / "svc.exe"
 MODELS = RVC / "models_voice"
+BERTV2 = ROOT / "bertvits2"
+if BERTV2.is_dir() and str(BERTV2) not in sys.path:
+    sys.path.insert(0, str(BERTV2))  # engine=bv2 时用（Bert-VITS2 单段式）
 
 DEFAULT_BASE = "https://token-plan-cn.xiaomimimo.com/v1"
 DEFAULT_MODEL = "mimo-v2.5-tts"
@@ -234,6 +237,15 @@ def synthesize(text: str, speaker: str, skip_svc: bool = False) -> bytes:
     with _lock:
         work = Path(tempfile.mkdtemp(prefix="nahida-", dir=str(RVC / "temp")))
         t0 = time.time()
+        if engine == "bv2":
+            # 单段式：Bert-VITS2 直接出 44.1k，不再过 svc
+            import bv2_say  # noqa: PLC0415
+            out = work / "bv2.wav"
+            info = bv2_say.gl_say(spoken, str(out), sid=speaker)
+            data = out.read_bytes()
+            log(f"ok engine=bv2 speaker={speaker} infer={info.get('infer_s')}s "
+                f"total={info.get('total_s')}s text={spoken[:40]!r} bytes={len(data)}")
+            return data
         if engine == "mimo":
             api_key = read_secret("mimo_api_key.txt") or os.environ.get("MIMO_API_KEY", "")
             api_base = read_secret("mimo_api_base.txt", DEFAULT_BASE)
@@ -275,9 +287,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path.split("?")[0] in ("/health", "/v1/health", "/"):
+            engine = os.environ.get("NAHIDA_ENGINE", "edge").strip().lower()
             pth, cfg, _ = find_voice_model(self.speaker)
-            self._json(200, {"ok": True, "speaker": self.speaker,
-                             "model": pth.name, "config": cfg.is_file()})
+            if engine == "bv2":
+                w = BERTV2 / "pretrained" / self.speaker / "G_114000.pth"
+                self._json(200, {"ok": True, "speaker": self.speaker, "engine": "bv2",
+                                 "model": w.name, "config": w.is_file()})
+            else:
+                self._json(200, {"ok": True, "speaker": self.speaker, "engine": engine,
+                                 "model": pth.name, "config": cfg.is_file()})
         elif self.path.split("?")[0].rstrip("/") == "/v1/models":
             self._json(200, {"object": "list", "data": [
                 {"id": f"nahida-{self.speaker}", "object": "model"}]})
@@ -315,7 +333,17 @@ class Handler(BaseHTTPRequestHandler):
 
 def preload(speaker: str) -> None:
     """启动即把模型读进显存，别让第一条微信消息等 25 秒。"""
+    engine = os.environ.get("NAHIDA_ENGINE", "edge").strip().lower()
     try:
+        if engine == "bv2":
+            import bv2_say  # noqa: PLC0415
+
+            t0 = time.time()
+            bv2_say._load()
+            # 预热一次，把 BERT 与 cudnn 的首次开销吃掉
+            bv2_say.synthesize("预热", sid=speaker)
+            log(f"preload done engine=bv2 speaker={speaker} in {time.time() - t0:.1f}s")
+            return
         get_svc(speaker)
         log(f"preload done speaker={speaker}")
     except Exception as exc:  # noqa: BLE001

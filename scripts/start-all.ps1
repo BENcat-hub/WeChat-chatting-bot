@@ -235,11 +235,16 @@ if (Test-Port 8790) {
     Write-Host '  ⚠ 缺少 jimeng_image_server.py / python 或 secrets 下的 volcengine_ak_sk.txt / siliconflow_api_key.txt，跳过（生图会失败）' -ForegroundColor Yellow
 }
 
-# ---------------------------------------------------------------- 3.6 纳西妲语音（mimo TTS → so-vits-svc）
-Write-Host "`n[+] 纳西妲语音（edge TTS → 常驻 svc 纳西妲音色，端口 8795）" -ForegroundColor Cyan
+# ---------------------------------------------------------------- 3.6 纳西妲语音（Bert-VITS2 单段式）
+Write-Host "`n[+] 纳西妲语音（Bert-VITS2 直出 44.1k，端口 8795；缺权重时回落 edge+svc）" -ForegroundColor Cyan
 $nahidaScript = Join-Path $PSScriptRoot 'nahida_tts_server.py'
 $voiceModel = Join-Path $root 'rvc-backend\models_voice\纳西妲\config.json'
+$bv2Weight = Join-Path $root 'bertvits2\pretrained\纳西妲\G_114000.pth'
 $rvcPy = Join-Path $root 'rvc-backend\.venv\Scripts\python.exe'
+if (-not $env:NAHIDA_ENGINE) {
+    $env:NAHIDA_ENGINE = if (Test-Path $bv2Weight) { 'bv2' } else { 'edge' }
+}
+Write-Host ("  引擎：" + $env:NAHIDA_ENGINE)
 if (Test-Port 8795) {
     Write-Host '  已在监听 8795'
 } elseif ((Test-Path $nahidaScript) -and (Test-Path $voiceModel) -and (Test-Path (Join-Path $root 'secrets\mimo_api_key.txt'))) {
