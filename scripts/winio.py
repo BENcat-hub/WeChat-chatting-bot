@@ -34,6 +34,7 @@ GMEM_MOVEABLE = 0x0002
 SRCCOPY = 0x00CC0020
 
 VK_CTRL, VK_V, VK_A, VK_ESCAPE, VK_RETURN, VK_BACK = 0x11, 0x56, 0x41, 0x1B, 0x0D, 0x08
+VK_END = 0x23  # End：清空输入框前先把光标推到末尾（PostMessage 路径用）
 VK_MENU = 0x12  # ALT：只用于「轻推」抢前台，不产生字符
 
 
@@ -747,3 +748,40 @@ def press_up(x=None, y=None):
     user32.SendInput(1, ctypes.byref(ev), ctypes.sizeof(INPUT))
     _touch()
     time.sleep(0.02)
+
+
+# ---- 2026-11-07 临时诊断：把每个原生输入原语的调用栈写到 logs/input-trace.log ----
+# 触发条件：存在 scripts/../logs/input-trace.on 这个文件（删掉即关闭，零开销）。
+def _install_trace():
+    import os as _os
+    import traceback as _tb
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    flag = _os.path.join(root, "logs", "input-trace.on")
+    if not _os.path.exists(flag):
+        return
+    target = _os.path.join(root, "logs", "input-trace.log")
+
+    def wrap(fn, name):
+        def inner(*a, **kw):
+            try:
+                stack = [f for f in _tb.extract_stack()[:-1] if "winio.py" not in f.filename]
+                where = " <- ".join("%s:%d" % (_os.path.basename(f.filename), f.lineno)
+                                    for f in stack[-5:])
+                with open(target, "a", encoding="utf-8") as fh:
+                    fh.write("%s %s%s <- %s\n" % (time.strftime("%H:%M:%S"), name, a[:2], where))
+            except Exception:
+                pass
+            return fn(*a, **kw)
+        return inner
+
+    for _name in ("click", "double_click", "move", "wheel", "chord", "key", "tap",
+                  "press_down", "press_up", "raise_window", "set_clipboard", "paste_text"):
+        _fn = globals().get(_name)
+        if callable(_fn):
+            globals()[_name] = wrap(_fn, _name)
+
+
+try:
+    _install_trace()
+except Exception:
+    pass

@@ -259,6 +259,13 @@ class focus_attached:
         return False
 
 
+def client_size(hwnd):
+    """窗口客户区宽高 —— capture(region=...) 用的就是这个坐标系。"""
+    rc = W.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(rc))
+    return int(rc.right - rc.left), int(rc.bottom - rc.top)
+
+
 def capture(hwnd, path, region=None):
     """PrintWindow(PW_RENDERFULLCONTENT) 截窗口 —— 被别的窗口盖住也能截。
 

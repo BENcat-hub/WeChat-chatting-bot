@@ -290,6 +290,44 @@ def input_box_point(cfg, rect):
     return int(x), int(y)
 
 
+def _input_box_still_has_text(cfg, hwnd, text, tag="boxcheck"):
+    """输入框里是否还留着这段字（True=还在 / False=空了 / None=判断不了）。
+
+    走 shot() 的「PrintWindow → 未遮挡时抓屏 → 闪拍」三级路径；PrintWindow 对
+    微信 4.x 的 Qt 渲染面经常直接返回 0，所以这里必须允许它退到屏幕像素。
+    """
+    if not hwnd or not text:
+        return None
+    try:
+        left, top, right, bottom = window_rect(hwnd)
+        w, h = right - left, bottom - top
+        if w <= 0 or h <= 0:
+            return None
+        region = (int(left + w * 0.10), int(top + h * 0.72),
+                  int(left + w * 0.94), int(bottom - 8))
+        keep = os.path.join(ROOT, "logs", "msgprobe")
+        png = shot(None, region, keep)
+        if not png:
+            return None
+        lines = ocr_lines(png)
+        needle = re.sub(r"\s+", "", text)[:8]
+        joined = re.sub(r"\s+", "", "".join(lines or []))
+        return bool(needle) and needle in joined
+    except Exception as e:  # noqa: BLE001
+        log.debug("[wxui] 输入框复查失败: %s", e)
+        return None
+
+
+def _click_send_button(hwnd, rect):
+    """点「发送」按钮（窗口右下角），只在回车被吞时当兜底用。"""
+    if not hwnd or not rect:
+        return False
+    left, top, right, bottom = rect
+    x = int(left + (right - left) * 0.939)
+    y = int(bottom - 115)
+    return bool(winmsg.post_click(hwnd, x, y))
+
+
 def clear_input(client, cfg, rect, focused_clean=False):
     """Empty the message box so an interrupted attempt can never be sent twice.
 
@@ -314,6 +352,11 @@ def clear_input(client, cfg, rect, focused_clean=False):
             winmsg.post_click(hwnd, x, y)
             time.sleep(0.10)
             with winmsg.focus_attached(hwnd):
+                # 2026-11-07（用户：「输入前记得清空输入框」）：光标可能停在最前面
+                # （粘贴到开头 / 上面一次尝试只写了半截），单纯退格删不掉「光标之后」的字。
+                # 先 VK_END 把光标推到末尾，再连续退格 —— 仍然是纯 PostMessage，不动鼠标。
+                winmsg.post_key(hwnd, winio.VK_END)
+                time.sleep(0.03)
                 for _ in range(presses):
                     winmsg.post_key(hwnd, winio.VK_BACK)
             time.sleep(0.08)
@@ -430,10 +473,15 @@ def wait_for_session(client, cfg, plan, hwnd=None):
     deadline = started + float(cfg.get("session_wait_s", 60))
     reason = "WeChat window not found"
     native = _native_on(cfg, "native_input")
+    msg = _msg_mode(cfg)
     while True:
         hwnd = find_wechat(cfg) or hwnd
         if hwnd:
-            if native:
+            if msg:
+                # 消息模式不碰 windows-mcp 的桌面控制位，也不看「人正在用键鼠」——
+                # PostMessage 不抢任何东西，让人继续用；抢不到的只是像素（见 shot()）。
+                ctl, wait = ("ready", 0.0)
+            elif native:
                 # 原生驱动下不看 windows-mcp 的 control latch：它的 user 状态被中断过的
                 # 自动化钉在 ~10s 不动（每次读都是 9.9/10.0），一旦信它就永远发不出去。
                 # 真正该让路的是「人现在正握着鼠标键盘」，这一条用 GetLastInputInfo 自己判，
@@ -451,6 +499,16 @@ def wait_for_session(client, cfg, plan, hwnd=None):
                                       % wait, retryable=True)
                 reason = "user is using the desktop (control=%s, ~%.0fs)" % (ctl, wait)
             else:
+                if msg:
+                    rect = restored_rect(hwnd, tries=1)
+                    if rect_usable(rect):
+                        plan["window_rect"] = list(rect)
+                        plan["control_state"] = "ready"
+                        plan["session_waited_s"] = round(time.time() - started, 1)
+                        return True
+                    reason = "WeChat window is minimized/hidden (rect=%s)" % (list(rect),)
+                    time.sleep(float(cfg.get("session_poll_s", 0.5)))
+                    continue
                 ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
                 rect = restored_rect(hwnd, tries=1)
                 ok, reason = screen_capturable(client, cfg, rect)
@@ -723,19 +781,86 @@ def shot(client, region, keep_dir, tries=2):
     """
     _SHOT_ERR[0] = ""
     cfg_now = config()
-    # 2026-11-02 事故：DSH 自己的窗口（Chrome_WidgetWin_1，标题为空）盖在微信上面时，
-    # 微信**仍然是前台窗口**，`_foreground_is_wechat` 判「可以抓」，于是 BitBlt 抓到的是 DSH
-    # 的像素 —— 侧栏认不出人、搜索面板判成「没打开」，bridge 每条消息都超时进重发队列
-    # （13:06–13:08 黎栀/陈奥琦全部「文字未验证送达」）。
-    # 现在每次抓屏前都问一遍 Windows「这块区域此刻真的属于微信吗」，被盖住就先把它顶上来。
-    try:
-        _ready = ensure_wechat_ready(cfg_now)
-        if not _ready.get("ok"):
-            log.warning("[wxui] 抓屏前检查：微信不可用（%s）——这张图可能不是微信",
-                        _ready.get("reason") or "unknown")
-    except Exception as exc:                                   # noqa: BLE001
-        log.info("[wxui] 抓屏前检查失败（忽略）：%s", _brief(exc))
-    if _native_on(cfg_now, "native_shots") and _foreground_is_wechat(cfg_now):
+    # 2026-11-07：消息模式下**不要**抓屏幕像素 —— BitBlt 只能拿到屏幕上的东西，所以
+    # 一抓就得先把微信顶到前台（`ensure_wechat_ready`），用户那边就是「焦点被抢、鼠标乱跳」。
+    # PrintWindow(PW_RENDERFULLCONTENT) 直接把窗口画出来，被盖住/在后台都行，焦点不动。
+    if _msg_mode(cfg_now) and winmsg is not None:
+        _h = _wx_root(cfg_now)
+        if _h:
+            try:
+                os.makedirs(keep_dir, exist_ok=True)
+                _path = os.path.join(keep_dir, "wxui-%d.png" % time.time())
+                # capture() 收的是客户区坐标（它自己再补标题栏偏移），而调用方给的是屏幕坐标
+                _cl = winmsg.to_client(_h, region[0], region[1])
+                _cr = winmsg.to_client(_h, region[2], region[3])
+                _res = winmsg.capture(_h, _path, (_cl[0], _cl[1], _cr[0], _cr[1]))
+                if float(_res.get("std") or 0) >= 1.0:
+                    return _path
+                _SHOT_ERR[0] = "PrintWindow frame looks blank (std=%s)" % _res.get("std")
+            except Exception as exc:                           # noqa: BLE001
+                _SHOT_ERR[0] = "PrintWindow capture failed: %s" % exc
+            # 2026-11-07 实测：微信 4.x 的 Qt 渲染面（MMUIRenderSubWindowHW）经常让
+            # PrintWindow 直接返回 0（四种 flag 全失败）。这时退到「屏幕像素」，但**只在
+            # 这块区域确实没被别人的窗口盖住时**才抓 —— 被盖住就交给调用方延期，绝不把微信顶上来。
+            try:
+                if not _region_covered_by_other(_h, region):
+                    os.makedirs(keep_dir, exist_ok=True)
+                    _p2 = os.path.join(keep_dir, "wxui-%d.png" % time.time())
+                    return winio.grab(region, _p2)
+                _SHOT_ERR[0] = (_SHOT_ERR[0] + "; screen fallback skipped: region covered by another window").strip("; ")
+            except Exception as exc:                           # noqa: BLE001
+                _SHOT_ERR[0] = (_SHOT_ERR[0] + "; screen fallback failed: %s" % exc).strip("; ")
+            # 2026-11-07：微信被别的窗口盖住时，PrintWindow 与屏幕抓图都拿不到像素。
+            # 「闪拍」：只把窗口的**层叠顺序**提到最上（SWP_NOACTIVATE，不动焦点、不动鼠标），
+            # 拍完再按回原来的前景窗口下面。用户可能看到约 0.15s 的窗口重排，但焦点不换。
+            if cfg_now.get("capture_flash", True):
+                try:
+                    os.makedirs(keep_dir, exist_ok=True)
+                    _p3 = os.path.join(keep_dir, "wxui-%d.png" % time.time())
+                    _u32 = ctypes.windll.user32
+                    _prev_fg = int(_u32.GetForegroundWindow() or 0)
+                    _SWP_NOSIZE, _SWP_NOMOVE, _SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+                    _flags = _SWP_NOSIZE | _SWP_NOMOVE | _SWP_NOACTIVATE
+                    _t0 = time.time()
+                    _u32.SetWindowPos(_h, 0, 0, 0, 0, 0, _flags)          # HWND_TOP
+                    time.sleep(0.12)
+                    _got = None
+                    try:
+                        _r2 = winmsg.capture(_h, _p3, (_cl[0], _cl[1], _cr[0], _cr[1]))
+                        if float(_r2.get("std") or 0) >= 1.0:
+                            _got = _p3
+                    except Exception:                          # noqa: BLE001
+                        _got = None
+                    if _got is None:
+                        _got = winio.grab(region, _p3)
+                    if _prev_fg and _prev_fg != _h:
+                        # 把自己按回原前景窗口的下面，视觉顺序复原（依旧不激活任何人）
+                        _u32.SetWindowPos(_h, _prev_fg, 0, 0, 0, 0, _flags)
+                    _SHOT_ERR[0] = (_SHOT_ERR[0] + "; captured in flash mode %dms"
+                                    % int((time.time() - _t0) * 1000)).strip("; ")
+                    if _got:
+                        return _got
+                except Exception as exc:                       # noqa: BLE001
+                    _SHOT_ERR[0] = (_SHOT_ERR[0] + "; flash capture failed: %s" % exc).strip("; ")
+        else:
+            _SHOT_ERR[0] = "message mode: no wechat hwnd for PrintWindow"
+        # 消息模式拿不到图就到此为止：不要再往下走 MCP 的 Screenshot（那也需要微信可见），
+        # 更不能顺手把窗口顶上来 —— 调用方会把它当作「暂时读不到」并延期重试。
+        return None
+    if not _msg_mode(cfg_now):
+        # 2026-11-02 事故：DSH 自己的窗口（Chrome_WidgetWin_1，标题为空）盖在微信上面时，
+        # 微信**仍然是前台窗口**，`_foreground_is_wechat` 判「可以抓」，于是 BitBlt 抓到的是 DSH
+        # 的像素 —— 侧栏认不出人、搜索面板判成「没打开」，bridge 每条消息都超时进重发队列
+        # （13:06–13:08 黎栀/陈奥琦全部「文字未验证送达」）。
+        # 现在每次抓屏前都问一遍 Windows「这块区域此刻真的属于微信吗」，被盖住就先把它顶上来。
+        try:
+            _ready = ensure_wechat_ready(cfg_now)
+            if not _ready.get("ok"):
+                log.warning("[wxui] 抓屏前检查：微信不可用（%s）——这张图可能不是微信",
+                            _ready.get("reason") or "unknown")
+        except Exception as exc:                               # noqa: BLE001
+            log.info("[wxui] 抓屏前检查失败（忽略）：%s", _brief(exc))
+    if not _msg_mode(cfg_now) and _native_on(cfg_now, "native_shots") and _foreground_is_wechat(cfg_now):
         # 原生 BitBlt 抓屏：局部区域 ~30ms，而 windows-mcp 的 Screenshot 走 JSON-RPC + base64
         # 要 ~240ms。抓不到就退回 MCP（例如区域越界、被最小化窗口挡住）。
         # 前提是微信确实在最前面：抓屏拿到的是**屏幕像素**，被别的窗口盖住就会把别人的 UI 读成
@@ -777,6 +902,11 @@ def shot_ex(client, region, keep_dir, tries=2):
 
 def _native_on(cfg, name, default=True):
     """配置开关 + 原生模块是否可用。"""
+    # 2026-11-07：消息模式（input_backend=message）下**所有原生输入路径一律关闭** ——
+    # 原生路径要么要求微信在前台、要么 SendInput / Ctrl+V，都会抢焦点或动光标。
+    # 在这一层统一关掉，比在每个调用点补 `not _msg_mode(cfg)` 可靠（漏一处就复发）。
+    if name == "native_input" and _msg_mode(cfg):
+        return False
     return bool(cfg.get(name, default)) and winio is not None
 
 
@@ -1566,6 +1696,26 @@ def _point_belongs_to(hwnd, point):
         return None, 0
 
 
+def _region_covered_by_other(hwnd, region, samples=7):
+    """这块屏幕区域此刻有没有被别的窗口盖住？（True = 被抓窗口以外的像素占着）
+
+    消息模式退回「屏幕像素抓图」之前用它把关：只要有一点不属于微信，抓出来的就是别人的 UI，
+    宁可让调用方延期重试，也不能把 DSH/浏览器读成微信然后点错人。
+    """
+    try:
+        l, t, r, b = [int(v) for v in region]
+        pts = [(l + (r - l) * fx, t + (b - t) * fy)
+               for fx, fy in ((0.02, 0.5), (0.5, 0.05), (0.5, 0.5), (0.98, 0.5),
+                              (0.5, 0.95), (0.25, 0.5), (0.75, 0.5))][:samples]
+        for px, py in pts:
+            own, _pid = _point_belongs_to(hwnd, (px, py))
+            if own is False:
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _raise_above_cover(cfg, hwnd, point):
     """把微信临时顶到最上层（越过置顶窗），让 point 重新属于微信。
 
@@ -1704,7 +1854,7 @@ def ensure_wechat_ready(cfg, raise_it=True):
     except Exception:                                          # noqa: BLE001
         info["foreground"] = False
 
-    if raise_it and winio is not None and (not info["visible"] or info["iconic"] or not info["foreground"]):
+    if raise_it and not _msg_mode(cfg) and winio is not None and (not info["visible"] or info["iconic"] or not info["foreground"]):
         for attempt in ("raise", "restore", "topmost"):
             try:
                 if attempt == "raise":
@@ -1741,6 +1891,12 @@ def ensure_wechat_ready(cfg, raise_it=True):
     # 最后报成误导性的 "could not locate target row by OCR"。
     # 现在以 WindowFromPoint 抽检为准；抽检不过就把「谁盖住了」写进 reason，不再发脏 OCR。
     info["ok"] = bool(info["rect"]) and bool(on_top and on_top.get("ok"))
+    # 消息模式：PostMessage 直接投给窗口，被别的窗口盖住也照样能点/能打字，所以
+    # 「最上层」不再是必要条件 —— 只要窗口存在且没被最小化就算 ready（焦点一律不动）。
+    if _msg_mode(cfg):
+        info["ok"] = bool(info["rect"]) and bool(info["visible"]) and not bool(info["iconic"])
+        if not info["ok"]:
+            info["reason"] = "wechat window is hidden or minimized"
     info["foreground_only"] = bool(info["foreground"])
     if not info["ok"]:
         info["reason"] = ("wechat window is covered by another window%s" % _covered_names(on_top)
@@ -2802,6 +2958,11 @@ def ui_render_alive(cfg, rect, wait_s=0.45):
     """
     if winio is None:
         return {"alive": None, "ratio": None, "error": "winio unavailable"}
+    # 消息模式下不测「重绘」：那需要真的把鼠标悬到会话行上并截两张图，既动鼠标又要把窗口
+    # 露在最上面。窗口还在就直接当活；渲染是否正常由 OCR/发送结果体现。
+    if _msg_mode(cfg):
+        _h = find_wechat(cfg)
+        return {"alive": bool(_h), "ratio": None, "error": None if _h else "wechat window missing"}
     # 2026-11-02：没有桌面输入权限时悬浮根本不会发生，两行都「不重绘」→ 会被误判成
     # 渲染进程冻结并触发「重启微信」这种破坏性恢复。这里先问一句，问不出来就别下结论。
     if hasattr(winio, "input_ok") and not winio.input_ok():
@@ -3199,13 +3360,15 @@ def open_chat_by_search(client, cfg, rect, target):
     try:
         hwnd = find_wechat(cfg)
         wx_h = int(hwnd or 0)
-        if not hwnd or not focus(hwnd):
+        if not hwnd or (not _msg_mode(cfg) and not focus(hwnd)):
             dbg["error"] = "WeChat main window not focusable"
             return False, dbg
         # 2026-10-29 傍晚事故：置顶的 DSH 窗盖住搜索框时，点击+粘贴会打进 DSH 的输入框。
         # 点下去之前先问 Windows「这个坐标现在属于谁」。
         _sb = _search_box_point(cfg, rect)
-        _own, _pid = _point_belongs_to(hwnd, _sb)
+        # 消息模式下点击是 PostMessage，落点由窗口自己判定，跟「谁盖在上面」无关，
+        # 也就不需要把它顶到前台（那一步会抢焦点）。只在原生点击时做归属检查。
+        _own, _pid = (None, None) if _msg_mode(cfg) else _point_belongs_to(hwnd, _sb)
         if _own is False:
             # 被置顶窗盖住时先试着把微信顶上去再点一次（2026-10-30 22:17：守卫直接
             # 放弃，结果语音气泡整条失败、回落成 wav 文件发给用户）。
@@ -3291,7 +3454,8 @@ def open_chat_by_search(client, cfg, rect, target):
             dbg["error"] = "wechat client stopped responding before clicking"
             return False, dbg
         # 同一道防误点闸：结果行坐标此刻必须仍属于微信（别把点击打进盖在上面的置顶窗口）。
-        _own, _pid = _point_belongs_to(wx_h, point)
+        # 消息模式投递的是 PostMessage，覆盖窗拦不住，所以直接跳过这段（也就不用顶窗口）。
+        _own, _pid = (None, None) if _msg_mode(cfg) else _point_belongs_to(wx_h, point)
         if _own is False and cfg.get("overlay_raise_above", True):
             _raise_above_cover(cfg, wx_h, point)
             _own, _pid = _point_belongs_to(wx_h, point)
@@ -3380,7 +3544,9 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
     # click lands on whatever is on top and the text is typed into the wrong app.
     # 用户不会把微信置顶 → 这里主动从最小化/托盘把它唤起（含 AttachThreadInput 与 ALT 轻推），
     # 唤不起来就放弃，绝不把点击打到别的窗口上。
-    if not focus(hwnd):
+    # 2026-11-07：消息模式下**完全不碰前台**。PostMessage 直接发给窗口，微信在后台/被盖住
+    # 都能收；而 focus()/raise_window() 一定会把微信拽到最前 —— 用户看到的就是「发个文字也抢焦点」。
+    if not _msg_mode(cfg) and not focus(hwnd):
         raised = bool(winio is not None and winio.raise_window(hwnd))
         plan["raised_by"] = "winio.raise_window" if raised else "failed"
         if not raised or not focus(hwnd):
@@ -4024,7 +4190,9 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
     # 输入闸门（2026-11-02）：本进程若连光标都推不动（UIPI / 非提权），后面每一次
     # click / paste 都是「调用成功但没效果」，最后只会以「45s 超时」「未验证送达」
     # 的形式报警，特别容易被误判成微信卡了。在这里一次说清楚。
-    if winio is not None and not winio.input_ok():
+    # 2026-11-07：这道闸靠 `input_ok()` 推光标 ±2px 来判断 —— 每次都动鼠标，正是用户
+    # 抱怨的「抢鼠标」。消息模式走 PostMessage，根本不需要桌面输入权限，直接跳过。
+    if winio is not None and not _msg_mode(cfg) and not winio.input_ok():
         _reason = ""
         try:
             _fn = getattr(winio, "input_block_reason", None)
@@ -4073,6 +4241,11 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
         return plan
 
     attempts_max = max(1, int(cfg.get("send_attempts", 3)))
+    if _msg_mode(cfg) and cfg.get("msg_single_attempt", True):
+        # 2026-11-07：消息模式下重发一次=对方多收一条。WeFlow 对「自己刚发的消息」
+        # 回读能慢到一两分钟（实测文件传输助手 408~418 每次都重复），所以这里只发一次：
+        # 没读到就交给重发队列（它每次先回读确认，宁可晚、不重复）。
+        attempts_max = 1
     retry_wait = float(cfg.get("retry_wait_s", 2.0))
     verify_timeout = float(cfg.get("verify_timeout_s", 30))
     attempt_log, since, found = [], 0, None
@@ -4125,7 +4298,7 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
             if attempt > 1:
                 # The previous attempt may have arrived after its read-back window: confirm
                 # before re-sending, otherwise the contact gets the same message twice.
-                already = verify(cfg, talker, text, time.time() + cfg.get("precheck_timeout_s", 3),
+                already = verify(cfg, talker, text, time.time() + cfg.get("precheck_timeout_s", 20),
                                  since, t_start - 3)
                 if already:
                     found = already
@@ -4160,7 +4333,7 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                 # 2026-10-21（用户实测：听到系统提示音、键鼠自己乱动）：键盘事件会打到**当前
                 # 前台窗口**。用户从不把微信置顶，所以打字前必须再确认一次前台就是微信，
                 # 不在前台就放弃本次尝试（宁可重发，也不能把内容敲进别人正在用的窗口）。
-                if _native_on(cfg, "native_input"):
+                if _native_on(cfg, "native_input") and not _msg_mode(cfg):
                     fg_hwnd, fg_title, _fg_cls = winio.foreground_info()
                     main_hwnd = find_wechat(cfg)
                     if not main_hwnd or fg_hwnd != main_hwnd:
@@ -4209,7 +4382,7 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                 # 2026-10-29 傍晚事故：置顶的别的窗口盖住输入框时，点击会落到它上面，
                 # 粘贴的文本会打进那个窗口（用户会看到自己的输入框里冒出「用户B」）。
                 # 前台仍是微信也挡不住 no-activate 的置顶覆盖层，所以这里再问一次归属。
-                if _native_on(cfg, "native_input"):
+                if _native_on(cfg, "native_input") and not _msg_mode(cfg):
                     _win = plan.get("window_rect") or restored_rect(find_wechat(cfg))
                     _ib = input_box_point(cfg, _win)
                     _wx_h = find_wechat(cfg)
@@ -4238,17 +4411,33 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                         raise RuntimeError("input box at %s is covered by another window "
                                            "(pid=%s); deferred until it goes away"
                                            % (list(_ib), _pid))
-                if _native_on(cfg, "native_input"):
-                    # 原生粘贴：写剪贴板 + Ctrl+V + Enter ≈ 20ms，而三次 windows-mcp 输入调用
-                    # 要 ~1.7s（每条消息都付一遍，这是“发一条要好几秒”的主要来源）。
-                    winio.set_clipboard(text)
-                    winio.chord(winio.VK_CTRL, winio.VK_V)
+                if _native_on(cfg, "native_input") or _msg_mode(cfg):
+                    if _msg_mode(cfg):
+                        # 消息模式：点输入框（PostMessage）→ 挂上焦点投 WM_CHAR → 回车。
+                        # 剪贴板一次都不用碰，鼠标也不动。
+                        _h2 = _wx_root(cfg)
+                        _ib2 = input_box_point(cfg, plan.get("window_rect") or window_rect(_h2))
+                        ui_click(client, cfg, _ib2)
+                        time.sleep(float(cfg.get("msg_click_settle_s", 0.08)))
+                        with winmsg.focus_attached(_h2):
+                            winmsg.post_chars(_h2, text)
+                    else:
+                        # 原生粘贴：写剪贴板 + Ctrl+V + Enter ≈ 20ms，而三次 windows-mcp 输入调用
+                        # 要 ~1.7s（每条消息都付一遍，这是“发一条要好几秒”的主要来源）。
+                        winio.set_clipboard(text)
+                        winio.chord(winio.VK_CTRL, winio.VK_V)
                     if cfg.get("identity_recheck_before_enter", True):
                         _id_ok, _id_why = _identity_recheck(cfg, target)
                         if not _id_ok:
                             # 粘贴之后会话被切走了：删掉刚粘进去的内容，绝不回车。
-                            winio.chord(winio.VK_CTRL, winio.VK_A)
-                            winio.chord(winio.VK_BACK)
+                            if _msg_mode(cfg):
+                                _h3 = _wx_root(cfg)
+                                with winmsg.focus_attached(_h3):
+                                    for _ in range(max(1, len(text) + 4)):
+                                        winmsg.post_key(_h3, winio.VK_BACK)
+                            else:
+                                winio.chord(winio.VK_CTRL, winio.VK_A)
+                                winio.chord(winio.VK_BACK)
                             plan.update(error="chat switched mid-send (%s); input cleared" % _id_why,
                                         retryable=False, no_requeue=True)
                             attempt_log.append({"attempt": attempt, "stage": "identity_recheck",
@@ -4260,8 +4449,20 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                     if _msg_mode(cfg):
                         _h = _wx_root(cfg)
                         if _h:
+                            had_text = _input_box_still_has_text(cfg, _h, text, tag="before-enter")
+                            plan["box_had_text"] = had_text
                             with winmsg.focus_attached(_h):
                                 winmsg.post_key(_h, winio.VK_RETURN)
+                            time.sleep(0.8)
+                            still = _input_box_still_has_text(cfg, _h, text)
+                            plan["box_after_enter"] = still
+                            if still:
+                                plan["send_fallback"] = "button"
+                                log.info("[wxui] ⏎ 回车没送出去（框里还有字），改点发送按钮")
+                                _click_send_button(_h, plan.get("window_rect"))
+                                time.sleep(0.6)
+                                plan["box_after_button"] = _input_box_still_has_text(
+                                    cfg, _h, text, tag="after-button")
                         else:
                             winio.chord(winio.VK_RETURN)
                     else:
@@ -4281,6 +4482,18 @@ def send(cfg, target, text, commit=False, do_ocr=True, assume_current=False, cli
                 time.sleep(retry_wait)
                 continue
             found = verify(cfg, talker, text, time.time() + verify_timeout, since, t_start - 3)
+            if (not found and _msg_mode(cfg) and cfg.get("trust_empty_box", True)
+                    and plan.get("box_had_text") is True
+                    and (plan.get("box_after_button", plan.get("box_after_enter"))) is False):
+                # 2026-11-07（实测 399/400、401/402 各重复一条）：WeFlow 的索引对
+                # 「自己刚发的消息」能慢到一分钟，期间 verify 一律 False —— 重试就成了
+                # 重复发送。这里用「输入框已经空了」当送达证据：回车生效微信才会清框。
+                _hm = _wx_root(cfg)
+                _still = _input_box_still_has_text(cfg, _hm, text, tag="after-enter") if _hm else None
+                if _still is False:
+                    found = {"assumed": True, "localId": None, "reason": "input box empty after enter"}
+                    log.info("[wxui] ✅ 输入框已空 → 判定送达（WeFlow 索引还没刷到，不重发）")
+                    plan["assumed_sent"] = True
             log.info("[wxui] 🔎 verify attempt=%d found=%s elapsed=%.1fs",
                      attempt, bool(found), time.time() - t_start)
             attempt_log.append({"attempt": attempt, "verified": bool(found),
@@ -4373,6 +4586,11 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
         return plan
 
     attempts_max = max(1, int(cfg.get("send_attempts", 3)))
+    if _msg_mode(cfg) and cfg.get("msg_single_attempt", True):
+        # 2026-11-07：消息模式下重发一次=对方多收一条。WeFlow 对「自己刚发的消息」
+        # 回读能慢到一两分钟（实测文件传输助手 408~418 每次都重复），所以这里只发一次：
+        # 没读到就交给重发队列（它每次先回读确认，宁可晚、不重复）。
+        attempts_max = 1
     retry_wait = float(cfg.get("retry_wait_s", 2.0))
     verify_timeout = float(cfg.get("verify_timeout_image_s", 15))
     attempt_log, since, found = [], 0, None
@@ -4400,7 +4618,7 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
         for attempt in range(1, attempts_max + 1):
             if attempt > 1 and since:
                 already = verify_image(cfg, talker,
-                                       time.time() + cfg.get("precheck_timeout_s", 3), since,
+                                       time.time() + cfg.get("precheck_timeout_s", 20), since,
                                        expect_name=expect_name, expect_md5=expect_md5,
                                        since_time=t_start - 3)
                 if already:
@@ -4790,3 +5008,36 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---- 2026-11-07 临时诊断：MCP 输入调用也记调用栈（存在 logs/input-trace.on 时启用） ----
+def _install_mcp_trace():
+    import os as _os
+    import traceback as _tb
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if not _os.path.exists(_os.path.join(root, "logs", "input-trace.on")):
+        return
+    target = _os.path.join(root, "logs", "mcp-trace.log")
+    orig = Client.call
+    interesting = ("Click", "Move", "Scroll", "Shortcut", "Type", "Key", "Drag", "Clipboard")
+
+    def call(self, method, params=None, *a, **kw):
+        if str(method) in interesting:
+            try:
+                stack = [f for f in _tb.extract_stack()[:-1] if "wxui.py" not in f.filename
+                         or f.function != "_install_mcp_trace"]
+                where = " <- ".join("%s:%d" % (_os.path.basename(f.filename), f.lineno)
+                                    for f in stack[-5:])
+                with open(target, "a", encoding="utf-8") as fh:
+                    fh.write("%s MCP %s %s <- %s\n" % (time.strftime("%H:%M:%S"), method, str(params)[:80], where))
+            except Exception:
+                pass
+        return orig(self, method, params, *a, **kw)
+
+    Client.call = call
+
+
+try:
+    _install_mcp_trace()
+except Exception:
+    pass
