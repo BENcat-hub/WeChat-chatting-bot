@@ -4,8 +4,8 @@ from .base import BaseParser
 from .bilibili import BilibiliParser
 from .douyin import DouyinParser
 from .instagram import InstagramParser
-from .iwara import IwaraParser
 from .kuaishou import KuaiShouParser
+from .metube import MetubeParser
 from .ncm import NCMParser
 from .nga import NGAParser
 from .qzone import QZoneParser
@@ -17,7 +17,6 @@ from .xhs import XHSParser
 from .xiaoheihe import XiaoheiheParser
 from .youtube import YouTubeParser
 from .zhihu import ZhihuParser
-from .pixiv import PixivParser
 
 __all__ = [
     "BaseParser",
@@ -37,7 +36,6 @@ __all__ = [
     "XHSParser",
     "YouTubeParser",
     "ZhihuParser",
-    "IwaraParser",
     "ShipinhaoParser",
-    "PixivParser",
+    "MetubeParser",
 ]

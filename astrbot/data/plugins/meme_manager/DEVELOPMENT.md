@@ -53,6 +53,10 @@ backend/
 
 当前只读取分组配置，不保留旧的平铺字段和别名。增加配置时，同时检查 schema、运行时读取、设置中心分组与配置接口测试。
 
+辅助选图后端用 `generation.emotion.llm.backend`（默认 chat），检索词配置用 `semantic.query`（默认 generated），收集判断用 `auto_collect.judgment_backend`（默认 vision）；共享服务参数在 `decision_service`。决策请求不自动重试，失败或不确定的收集结果强制人工复核；独立图片理解只存为语义草稿。资源权限与候选复验由调用方负责，历史只记录成功发送。
+
+设置弹窗复用原控件和唯一草稿，使用规则单独保存；`#config-group-<group.id>` 直达参数并兼容旧链接。模型目录仅读取草稿地址，不保存、不推理、不转发密钥；失败保留手填，迟到结果不得覆盖草稿。
+
 运行数据位于 `data/plugin_data/meme_manager/`。启动时不再探测或迁移旧的全局表情目录，也不维护固定的默认表情目录别名；资源路径由 `backend/packs/resolver.py` 按当前规则动态解析。已有目录不会因移除旧机制而被删除。
 
 主要文件：
@@ -69,10 +73,12 @@ backend/
 
 解析结果包含原文偏移、被消费的标记和资源限制诊断。分类校验使用当前请求选中的表情包；语义 ID 还须经过发送层的本轮候选校验。解析模块不调用模型、不读取图片，也不承担发送职责。
 
-流式装饰钩子在平台消费消息流前过滤文本；最终响应钩子确定选图，回复结束后发送图片。普通歧义片段可能缓冲到行尾；待确认的行内反引号片段暂存至闭合或回复结束，未闭合时按普通文本重新解析。待确认片段累计超过 16,384 字符时停止推测并记录 `inline_code_limit_exceeded`，常规模式保留该片段及后续原文，最终标签过滤模式继续清理标记。解析器不是完整 CommonMark 渲染器，不回溯修改已发送内容；单行超过 16,384 字符或推理嵌套超过 64 层时，当前行及后续内容原样通过并记录诊断。
+流式装饰钩子在平台消费消息流前过滤文本；最终响应钩子确定选图，平台正常消费完消息流并完成发送后补发图片。补发不依赖 `STREAMING_FINISH` 装饰阶段，兼容插件通过 `event.request_llm()` 发起的流式回复；失败、取消或未消费完的流不补发，后续结束钩子也不会重复发送已处理的选择。普通歧义片段可能缓冲到行尾；待确认的行内反引号片段暂存至闭合或回复结束，未闭合时按普通文本重新解析。待确认片段累计超过 16,384 字符时停止推测并记录 `inline_code_limit_exceeded`，常规模式保留该片段及后续原文，最终标签过滤模式继续清理标记。解析器不是完整 CommonMark 渲染器，不回溯修改已发送内容；单行超过 16,384 字符或推理嵌套超过 64 层时，当前行及后续内容原样通过并记录诊断。
 
 ## 插件联动接口
 
+- `backend/message_tool.py` 仅包装当前请求的 AstrBot 内置 `send_message_to_user`，在原工具校验后复用 `_prepare_outgoing_message()`。每次调用隔离选图与临时文件，保留媒体组件；跨会话解析目标人格和图包。
+- 自动概率与数量由整轮共享，按目标去重；成功后才记录发送，部分失败保留已发正文记录，取消时清理临时文件。`send_meme` 与自动补图互斥。
 - 为了兼容「其他插件自己请求 LLM 并发送消息」的场景，本插件提供了公开接口。
 - 其他插件在发送前可主动调用本插件接口，自动清理 `&&happy&&` 等标记并按本插件规则发送表情包。
 
@@ -84,16 +90,16 @@ from astrbot.core.message.message_event_result import MessageChain
 
 
 async def send_with_meme_manager(context, event, text: str):
-    # Get the registered plugin instance.
+    # 获取已注册的插件实例。
     md = context.get_registered_star("meme_manager")
     plugin = md.star_cls if md and md.star_cls else None
 
     if not plugin:
-        # Send normally when the plugin is unavailable.
+        # 插件不可用时正常发送。
         await event.send(MessageChain([Plain(text)]))
         return
 
-    # Parse and send the text and selected images.
+    # 解析并发送文本及所选图片。
     await plugin.compat_send_message(event, text)
 ```
 
@@ -109,12 +115,12 @@ async def send_in_two_steps(context, event, chain: MessageChain):
 
     prepared = await plugin.compat_prepare_message(event, chain)
 
-    # Send the prepared text and components.
+    # 发送准备好的文本与组件。
     cleaned_chain = prepared["cleaned_chain"]
     if cleaned_chain.chain:
         await event.send(cleaned_chain)
 
-    # Send prepared images through the public API.
+    # 通过公开 API 发送准备好的图片。
     await plugin.compat_send_prepared_message(
         event,
         prepared,
@@ -153,6 +159,10 @@ node tests/frontend/preview.mjs
 预览使用模拟接口，仅用于布局和交互检查，不能代替真实 AstrBot 联调。URL 可添加 `?theme=light` 或 `?theme=dark` 模拟宿主的初始主题，预览工具中的按钮可以实时切换深浅色；这些控件仅存在于模拟预览中。
 
 ## Python 验证
+
+代码注释、文档字符串和面向开发者的日志统一使用中文。文档字符串保留 Google 风格的 `Args:`、`Returns:`、`Raises:` 等结构标签；配置键、协议字段、工具参数名、日志占位符、检查器指令和第三方许可声明保留原文。
+
+开发和测试环境需要 Python 3.12 或更新版本，以及 AstrBot 4.28.2 或更新版本。
 
 在安装了 AstrBot 与插件依赖的环境中，从插件根目录运行：
 

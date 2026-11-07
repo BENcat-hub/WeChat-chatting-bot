@@ -1,13 +1,15 @@
 import asyncio
+import json
 import os
 import re
 import time
 from pathlib import Path
 
 from astrbot.api import logger
-from astrbot.api.all import *
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.util import session_waiter
 
+from ..astrbot_compat import SessionFilter
 from ..backend.packs.categories import resolve_safe_category_directory
 from ..backend.packs.images import (
     clear_all_emojis,
@@ -20,6 +22,29 @@ from ..backend.semantic.storage import invalidate_semantic_metadata
 from ..config import COMMUNITY_INDEX_URL
 
 
+class CategoryCreationCancelled(Exception):
+    """表示发送者取消了分类创建。"""
+
+
+class ConfirmationCancelled(Exception):
+    """表示发送者取消了待处理操作。"""
+
+
+class SenderScopedSessionFilter(SessionFilter):
+    """将交互命令限制在原始发送者与会话内。"""
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        """为等待中的发送者构造无歧义的键。
+
+        Args:
+            event: 以会话和发送者标识等待者的传入事件。
+
+        Returns:
+            序列化后的会话及发送者标识符。
+        """
+        return json.dumps([event.unified_msg_origin, str(event.get_sender_id())])
+
+
 class CommandMixin:
     """表情包管理命令组及所有管理命令"""
 
@@ -29,6 +54,9 @@ class CommandMixin:
         查看图库
         添加分类
         添加表情
+        收集表情
+        开始收集
+        结束收集
         恢复默认表情包
         清空指定类型
         清空全部
@@ -182,8 +210,62 @@ class CommandMixin:
         yield event.plain_result(f"✅ 已创建分类「{category}」：{description}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("收集表情")
+    async def collect_memes(self, event: AstrMessageEvent):
+        """通过配置的分类管线收集引用图片。
+
+        Args:
+            event: 包含引用或附带图片的管理员命令。
+
+        Yields:
+            提交确认或可据此处理的错误。
+        """
+        event.set_extra("meme_manager_manual_collection_command", True)
+        response = await self.manual_collect_manager.quick(event)
+        if response:
+            yield event.plain_result(response)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("开始收集")
+    async def start_collecting_memes(self, event: AstrMessageEvent):
+        """开始按发送者隔离的连续图片收集会话。
+
+        Args:
+            event: 标识聊天与收集者的管理员命令。
+
+        Yields:
+            目标表情包、复核行为及停止指引。
+        """
+        event.set_extra("meme_manager_manual_collection_command", True)
+        response = await self.manual_collect_manager.start(event)
+        if (
+            self.manual_collect_manager.key(event)
+            in self.manual_collect_manager.sessions
+        ):
+            self.upload_states.pop(f"{event.session_id}_{event.get_sender_id()}", None)
+        yield event.plain_result(response)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @meme_manager.command("结束收集")
+    async def stop_collecting_memes(self, event: AstrMessageEvent):
+        """停止接收图片，报告已完成及待处理结果。
+
+        Args:
+            event: 标识当前收集者的管理员命令。
+
+        Yields:
+            当前累计结果，不取消已排队任务。
+        """
+        event.set_extra("meme_manager_manual_collection_command", True)
+        yield event.plain_result(self.manual_collect_manager.stop(event))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @meme_manager.command("添加表情")
     async def upload_meme(self, event: AstrMessageEvent, category: str = None):
+        manual_manager = getattr(self, "manual_collect_manager", None)
+        if manual_manager and manual_manager.key(event) in manual_manager.sessions:
+            yield event.plain_result("当前正在连续收集，请先发送 /表情管理 结束收集。")
+            return
         category = str(category or "").strip()
         if not category:
             yield event.plain_result(

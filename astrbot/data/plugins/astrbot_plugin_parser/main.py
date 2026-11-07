@@ -147,7 +147,11 @@ class ParserPlugin(Star):
             and self_id not in mentioned_ids
         ):
             return
-        if mentioned_ids and self_id not in mentioned_ids:
+        if (
+            mentioned_ids
+            and self_id not in mentioned_ids
+            and "qq_official" not in mentioned_ids
+        ):
             return
 
         # 卡片解析：扫描整条消息链，兼容 @ + JSON 卡片等组合消息。
@@ -170,7 +174,9 @@ class ParserPlugin(Star):
                 elif isinstance(seg, Json):
                     reply_texts.append(extract_json_url(seg.data))
             if reply_texts:
-                text = "".join(reply_texts)
+                reply_text = "".join(t for t in reply_texts if t)
+                if reply_text:
+                    text = reply_text
 
         if not text:
             return
@@ -250,3 +256,30 @@ class ParserPlugin(Star):
         yield event.chain_result([Image.fromBytes(qrcode)])
         async for msg in parser.login.check_qr_state():
             yield event.plain_result(msg)
+
+    async def parse_url(self, url: str):
+        """供其他插件调用的公开解析 API：传入 URL 解析并返回 ParseResult 对象"""
+        for kw, pat in self.key_pattern_list:
+            if kw in url and (m := pat.search(url)):
+                return await self.parser_map[kw].parse(kw, m)
+        raise ValueError(f"未匹配到支持的解析器: {url}")
+
+    async def parse_and_send(self, event: AstrMessageEvent, url: str) -> bool:
+        """供其他插件调用的公开方法：解析指定 URL 并直接发送至 event 对应会话"""
+        result = await self.parse_url(url)
+        return await self.sender.send_parse_result(event, result)
+
+    @filter.llm_tool(name="parse_media_url")
+    async def llm_parse_media_url(self, event: AstrMessageEvent, url: str) -> str:
+        """
+        解析用户提供的视频、图集或音频链接并自动发送解析结果。
+
+        Args:
+            url(string): 待解析的视频或图文等媒体链接
+        """
+        try:
+            await self.parse_and_send(event, url)
+            return "链接解析成功并已发送"
+        except Exception as e:
+            logger.error(f"[LLM Tool] 解析链接失败: {url}, error: {e}")
+            return f"解析链接失败: {e}"

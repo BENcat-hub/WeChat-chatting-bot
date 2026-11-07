@@ -99,6 +99,36 @@ PACK_IMPORT_SESSION_TTL_SECONDS = 60 * 60
 MAX_PACK_ARCHIVE_BYTES = 1024 * 1024 * 1024
 MAX_PACK_UPLOAD_REQUEST_BYTES = MAX_PACK_ARCHIVE_BYTES + 1024 * 1024
 COMMUNITY_INSTALL_JOB_TTL_SECONDS = 30 * 60
+# 连通性测试只展示稳定文案，不暴露上游细节和凭据。
+DECISION_TEST_MESSAGES = {
+    "invalid_provider": "请选择有效的决策服务提供方。",
+    "missing_base_url": "请填写决策服务基础地址。",
+    "invalid_base_url": "决策服务基础地址需要填写完整的 HTTP 或 HTTPS 地址。",
+    "missing_account_id": "请填写 Cloudflare 账户 ID。",
+    "invalid_account_id": "Cloudflare 账户 ID 需为 32 位十六进制字符。",
+    "missing_token": "请填写决策服务密钥。",
+    "invalid_token": "决策服务密钥包含无效字符。",
+    "missing_model": "请填写决策模型 ID。",
+    "invalid_model": "决策模型 ID 包含无效字符。",
+    "unsupported_model": "决策模型 ID 仅支持 clef、clef-flash、clef-omni。",
+    "invalid_timeout": "决策服务超时时间无效。",
+    "invalid_max_concurrency": "决策服务并发上限无效。",
+    "unauthorized": "鉴权失败：请检查密钥是否有效并具备该模型权限。",
+    "forbidden": "服务拒绝了该请求：请检查密钥权限或账户状态。",
+    "insufficient_credits": "Cloudflare 账户余额不足，或尚未启用 Workers AI。",
+    "not_found": "未找到该服务或模型：请检查服务地址与模型 ID。",
+    "bad_request": "服务拒绝了测试请求：请确认模型 ID 与服务类型匹配。",
+    "invalid_request": "测试请求不符合该服务的接口约定。",
+    "rate_limited": "请求过于频繁，请稍后再试。",
+    "request_timeout": "服务处理超时，请稍后重试。",
+    "timeout": "连接超时：请检查网络或服务地址是否可访问。",
+    "network_error": "无法连接到服务：请检查地址、网络或代理设置。",
+    "server_error": "服务端错误，请稍后重试。",
+    "invalid_response": "服务返回了无法识别的结果：请确认服务类型与模型 ID。",
+    "response_too_large": "服务返回内容过大，已中止读取。",
+    "closed": "决策服务客户端已关闭，请刷新页面后重试。",
+}
+DECISION_TEST_FALLBACK = "决策服务测试失败，请检查配置与服务日志。"
 
 
 def _parse_int(value, default: int = -1) -> int:
@@ -473,6 +503,18 @@ class WebAPIMixin:
             "Read and update shared plugin configuration",
         )
         self._register_webui_api(
+            "settings/decision-models",
+            self._api_settings_decision_models,
+            ["POST"],
+            "Read the public decision model catalog without saving settings",
+        )
+        self._register_webui_api(
+            "settings/decision-test",
+            self._api_settings_decision_test,
+            ["POST"],
+            "使用当前草稿发起一次最小决策服务连通性测试",
+        )
+        self._register_webui_api(
             "settings/targets",
             self._api_settings_targets,
             ["GET"],
@@ -554,11 +596,19 @@ class WebAPIMixin:
         )
 
     def _register_webui_api(self, route, handler, methods, desc):
+        """注册 API 处理器，并根据状态记录请求日志。
+
+        Args:
+            route: 相对于插件前缀的 API 路径。
+            handler: 异步请求处理器。
+            methods: 处理器支持的 HTTP 方法。
+            desc: 传给 WebUI API 注册表的描述。
+        """
         route_path = f"/{PLUGIN_NAME}/{route.strip('/')}"
 
         async def logged_handler(*args, **kwargs):
             started_at = time.monotonic()
-            logger.info(f"{WEBUI_LOG_PREFIX} {request.method} {route_path} 开始")
+            logger.debug(f"{WEBUI_LOG_PREFIX} {request.method} {route_path} 开始")
             try:
                 response = await handler(*args, **kwargs)
                 if route in {
@@ -578,7 +628,13 @@ class WebAPIMixin:
                 raise
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
             status_code = self._get_webui_response_status(response)
-            logger.info(
+            log_response = logger.debug
+            if isinstance(status_code, int):
+                if status_code >= 500:
+                    log_response = logger.error
+                elif status_code >= 400:
+                    log_response = logger.warning
+            log_response(
                 f"{WEBUI_LOG_PREFIX} {request.method} {route_path} 完成 状态={status_code} 耗时={elapsed_ms}ms"
             )
             return response
@@ -909,13 +965,13 @@ class WebAPIMixin:
 
     @staticmethod
     def _resolve_webui_write_pack(data: dict | None = None):
-        """Resolve the requested pack or retain the default for legacy calls.
+        """解析请求的表情包，或为旧调用保留默认选包。
 
         Args:
-            data: Optional decoded request body.
+            data: 可选的已解码请求体。
 
         Returns:
-            A pack ID and an optional validation error response.
+            表情包 ID 及可选的校验错误响应。
         """
         payload = data if isinstance(data, dict) else {}
         pack_id = str(
@@ -1258,10 +1314,10 @@ class WebAPIMixin:
         )
 
     async def _api_transfer_pack_images(self):
-        """Preview or execute a transfer while holding both pack operation locks.
+        """持有两个表情包操作锁时预览或执行传输。
 
         Returns:
-            A category plan, per-image outcomes, or a validation/conflict response.
+            分类方案、每张图片的结果，或校验、冲突响应。
         """
         locked = []
         manager = getattr(self, "semantic_task_manager", None)
@@ -1308,7 +1364,7 @@ class WebAPIMixin:
         except RuntimeError as exc:
             return jsonify({"message": str(exc)}), 409
         except OSError:
-            logger.exception("Failed to prepare cross-pack image transfer")
+            logger.exception("准备跨包图片传输失败")
             return jsonify({"message": "分类配置无法保存，尚未执行图片移动"}), 500
         finally:
             for pack_id in reversed(locked):
@@ -1705,10 +1761,10 @@ class WebAPIMixin:
         return ""
 
     def _get_img_host_sync_task_status(self) -> dict:
-        """Expose worker progress and release pack locks only after the worker exits.
+        """提供工作进程进度，仅在进程退出后释放表情包锁。
 
         Returns:
-            Current or last completed synchronization status.
+            当前或最近一次已完成的同步状态。
         """
         if not self.img_sync:
             self._finish_img_host_local_operation()
@@ -1969,7 +2025,7 @@ class WebAPIMixin:
         return jsonify(self._get_img_host_sync_task_status())
 
     async def _api_img_host_sync_cancel(self):
-        """Cancel the active image transfer without blocking the event loop."""
+        """取消当前图片传输，不阻塞事件循环。"""
         payload = await request.get_json(silent=True)
         pack_id = self._resolve_requested_sync_pack_id(payload)
         if pack_id and pack_id != getattr(self, "_img_sync_pack_id", ""):
@@ -2034,13 +2090,13 @@ class WebAPIMixin:
 
     @staticmethod
     def _preview_revision(file_path: Path) -> str:
-        """Identify a file and the preview recipe without reading image bytes.
+        """不读取图片字节，确定文件身份与预览生成方案。
 
         Args:
-            file_path: Resolved image path.
+            file_path: 已解析的图片路径。
 
         Returns:
-            An opaque revision based on file identity, metadata and recipe version.
+            根据文件身份、元数据及生成方案版本得到的不透明修订号。
         """
         stat = file_path.stat()
         identity = (
@@ -2050,10 +2106,10 @@ class WebAPIMixin:
         return hashlib.sha256(identity.encode()).hexdigest()
 
     async def _api_preview_manifest(self):
-        """Return current file revisions and the shared preview concurrency setting.
+        """返回当前文件修订号及共享预览并发设置。
 
         Returns:
-            An uncached, pack-scoped preview manifest.
+            不缓存且限定表情包范围的预览清单。
         """
         context = self._resolve_webui_pack_view_context()
         if request.args.get("managed_pack_id") and context is None:
@@ -2629,10 +2685,10 @@ class WebAPIMixin:
             return jsonify({"message": "启动语义任务失败"}), 500
 
     async def _api_auto_collect_inbox(self):
-        """Return all pending images for the selected pack.
+        """返回所选表情包的全部待处理图片。
 
         Returns:
-            JSON review state or a validation error response.
+            JSON 复核状态或校验错误响应。
         """
         try:
             pack_id = await self._semantic_request_pack_id()
@@ -2641,10 +2697,10 @@ class WebAPIMixin:
             return jsonify({"message": str(exc)}), 400
 
     async def _api_auto_collect_image(self):
-        """Serve an authenticated, pack-scoped pending image.
+        """提供经过身份验证且限定表情包范围的待处理图片。
 
         Returns:
-            Image response or a validation error response.
+            图片响应或校验错误响应。
         """
         try:
             pack_id = await self._semantic_request_pack_id()
@@ -2672,10 +2728,10 @@ class WebAPIMixin:
             return jsonify({"message": str(exc)}), 404
 
     async def _api_auto_collect_image_data(self):
-        """Return an authenticated image data URL for embedded dashboards.
+        """为嵌入式仪表盘返回经过身份验证的图片数据 URL。
 
         Returns:
-            Original image bytes encoded as a data URL.
+            编码为数据 URL 的原始图片字节。
         """
         try:
             pack_id = await self._semantic_request_pack_id()
@@ -2711,10 +2767,10 @@ class WebAPIMixin:
             return jsonify({"message": str(exc)}), 404
 
     async def _api_auto_collect_accept(self):
-        """Accept only explicitly selected collected images.
+        """仅接收明确选中的已收集图片。
 
         Returns:
-            Import counts or a validation/conflict response.
+            导入数量或校验、冲突响应。
         """
         try:
             data = await request.get_json() or {}
@@ -2731,10 +2787,10 @@ class WebAPIMixin:
             return jsonify({"message": str(exc)}), 409
 
     async def _api_auto_collect_discard(self):
-        """Discard selected collected images with optional rejection memory.
+        """丢弃选中的已收集图片，可选择记住拒收结果。
 
         Returns:
-            Discard count or a validation response.
+            丢弃数量或校验响应。
         """
         try:
             data = await request.get_json() or {}
@@ -3159,13 +3215,13 @@ class WebAPIMixin:
             return jsonify({"message": "预检导入压缩包失败"}), 500
 
     async def _api_start_pack_import_session(self):
-        """Create a chunked import session for large pack archives.
+        """为大型表情包压缩文件创建分块导入会话。
 
-        The dashboard caps a single request body, so archives that exceed the
-        cap are uploaded in chunks and reassembled here before inspection.
+        仪表盘限制单次请求体大小，超过限制的压缩文件
+        会分块上传，在此重新组装后检查。
 
         Returns:
-            The created session identity or a validation error.
+            已创建的会话标识或校验错误。
         """
         try:
             self._cleanup_pack_import_sessions()
@@ -3205,19 +3261,19 @@ class WebAPIMixin:
         except ValueError as exc:
             return jsonify({"message": str(exc)}), 400
         except (OSError, RuntimeError, TypeError, KeyError) as exc:
-            logger.error("Creating pack import session failed: %s", exc, exc_info=True)
+            logger.error("创建表情包导入会话失败：%s", exc, exc_info=True)
             return jsonify({"message": "创建导入会话失败"}), 500
 
     async def _api_upload_pack_import_chunk(self, session_id, index, total_chunks):
-        """Append one archive chunk and inspect the archive once complete.
+        """追加一个压缩文件分块，完整接收后检查压缩文件。
 
         Args:
-            session_id: Import session created by the session endpoint.
-            index: Zero-based chunk index.
-            total_chunks: Total number of chunks in this upload.
+            session_id: 会话接口创建的导入会话。
+            index: 从零开始的分块索引。
+            total_chunks: 本次上传的分块总数。
 
         Returns:
-            Progress information, or the archive inspection result.
+            进度信息或压缩文件检查结果。
         """
         archive_path = None
         metadata_path = None
@@ -3238,8 +3294,8 @@ class WebAPIMixin:
                 if inspect.isawaitable(chunk):
                     chunk = await chunk
 
-            # Read the latest state after receiving the body. Do not yield
-            # between checking the sequence and recording the appended chunk.
+            # 收到请求体后读取最新状态，检查分块顺序与记录已追加分块
+            # 之间不能让出执行权。
             if not metadata_path.is_file():
                 raise ValueError("导入会话已失效，请重新选择压缩包")
             session_data = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -3291,7 +3347,7 @@ class WebAPIMixin:
             try:
                 inspection = await asyncio.shield(inspection_task)
             except asyncio.CancelledError:
-                # Keep the archive available until the inspection worker exits.
+                # 在检查工作任务退出前，保持压缩文件可用。
                 await asyncio.gather(inspection_task, return_exceptions=True)
                 raise
             metadata_path.write_text(
@@ -3323,7 +3379,7 @@ class WebAPIMixin:
         except RequestEntityTooLarge:
             return jsonify({"message": "分片超过允许大小，请重新选择压缩包"}), 413
         except (OSError, RuntimeError, KeyError) as exc:
-            logger.error("Chunked pack import failed: %s", exc, exc_info=True)
+            logger.error("分块导入表情包失败：%s", exc, exc_info=True)
             return jsonify({"message": "分片导入失败"}), 500
         finally:
             if discard_session:
@@ -3423,10 +3479,10 @@ class WebAPIMixin:
             return jsonify({"message": f"卸载表情包失败: {str(e)}"}), 500
 
     async def _api_create_local_pack(self):
-        """Create and register an empty local pack.
+        """创建并注册一个空的本地表情包。
 
         Returns:
-            The created pack identity or a validation error.
+            已创建的表情包标识或校验错误。
         """
         try:
             data = await request.get_json() or {}
@@ -3442,14 +3498,14 @@ class WebAPIMixin:
         except (ValueError, RuntimeError) as exc:
             return jsonify({"message": str(exc)}), 400
         except Exception as exc:
-            logger.error("Creating local pack failed: %s", exc, exc_info=True)
+            logger.error("创建本地表情包失败：%s", exc, exc_info=True)
             return jsonify({"message": "创建失败，请重试"}), 500
 
     async def _api_community_updates(self):
-        """Read fresh catalog installation and update status.
+        """读取目录中最新的安装与更新状态。
 
         Returns:
-            Per-pack availability and recovery backups.
+            各表情包的可用状态及恢复备份。
         """
         try:
             return jsonify(
@@ -3458,14 +3514,14 @@ class WebAPIMixin:
         except FileNotFoundError:
             return jsonify({"packs": {}}), 200
         except Exception as exc:
-            logger.error("Reading update status failed: %s", exc, exc_info=True)
+            logger.error("读取更新状态失败：%s", exc, exc_info=True)
             return jsonify({"message": "读取更新状态失败，请重试"}), 500
 
     async def _api_community_update(self):
-        """Preview synchronously or start a durable background update operation.
+        """同步预览，或启动持久保存状态的后台更新操作。
 
         Returns:
-            A preview or a job ID that can be polled after request completion.
+            预览结果，或可在请求结束后轮询的任务 ID。
         """
         try:
             data = await request.get_json() or {}
@@ -3517,15 +3573,15 @@ class WebAPIMixin:
         except (ValueError, FileNotFoundError, RuntimeError) as exc:
             return jsonify({"message": str(exc)}), 409
         except Exception as exc:
-            logger.error("Preparing update request failed: %s", exc, exc_info=True)
+            logger.error("准备更新请求失败：%s", exc, exc_info=True)
             return jsonify({"message": "更新预览失败，请刷新重试"}), 500
 
     async def _run_community_update_job(self, job_id: str, data: dict):
-        """Keep file-operation locks until a background job has finished.
+        """在后台任务结束前持续持有文件操作锁。
 
         Args:
-            job_id: Server-generated identifier for polling.
-            data: Validated action and update selections.
+            job_id: 服务器生成的轮询标识符。
+            data: 已校验的操作及更新选择。
         """
         job = self._community_update_jobs[job_id]
         try:
@@ -3554,14 +3610,14 @@ class WebAPIMixin:
         except InstallCancelledError:
             job.update(state="cancelled", message="已取消检查更新")
         except Exception as exc:
-            logger.error("Community update job failed: %s", exc, exc_info=True)
+            logger.error("社区更新任务失败：%s", exc, exc_info=True)
             job.update(state="failed", message=str(exc))
 
     async def _api_community_update_status(self):
-        """Return a running or completed update job.
+        """返回运行中或已完成的更新任务。
 
         Returns:
-            Current job status, or a not-found response after expiry/restart.
+            当前任务状态；过期或重启后返回未找到响应。
         """
         job = getattr(self, "_community_update_jobs", {}).get(
             str(request.args.get("job_id") or "")
@@ -3571,10 +3627,10 @@ class WebAPIMixin:
         return jsonify(job), 200
 
     async def _api_community_update_image_data(self):
-        """Return a bounded preview from an active update session.
+        """从有效的更新会话中返回大小受限的预览。
 
         Returns:
-            A preview data URL for one local or upstream image.
+            一张本地或上游图片的预览数据 URL。
         """
         token = str(request.args.get("session") or "")
         side = request.args.get("side")
@@ -3631,10 +3687,10 @@ class WebAPIMixin:
         return response
 
     async def _api_fetch_community_index(self):
-        """Fetch the catalog and remote versions outside the event loop.
+        """在事件循环外获取目录及远端版本。
 
         Returns:
-            The cached catalog response and HTTP status code.
+            已缓存的目录响应及 HTTP 状态码。
         """
         try:
             index_url = COMMUNITY_INDEX_URL
@@ -3983,27 +4039,172 @@ class WebAPIMixin:
             logger.error(f"安装官方首个表情包失败: {e}", exc_info=True)
             return jsonify({"message": f"安装官方首个表情包失败: {str(e)}"}), 500
 
-    async def _api_settings_config(self):
-        """Edit the same AstrBotConfig and reload through AstrBot's plugin manager.
+    async def _api_settings_decision_models(self):
+        """读取模型候选，不保存凭据或发起推理。
 
         Returns:
-            A redacted configuration snapshot or a validation/conflict response.
+            模型 ID 和名称，或脱敏后的错误。Cloudflare 返回本地固定目录。
+        """
+        from ..backend.decision import DecisionClient, DecisionError
+
+        data = await request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"message": "请求格式不正确。"}), 400
+        provider = data.get("provider", "systemone")
+        if not isinstance(provider, str):
+            return jsonify({"message": "请选择有效的决策服务提供方。"}), 400
+        provider = provider.strip().casefold()
+        if provider not in {"systemone", "cloudflare"}:
+            return jsonify({"message": "请选择有效的决策服务提供方。"}), 400
+        config = {"provider": provider, "timeout": 8}
+        if provider == "systemone":
+            base_url = data.get("base_url")
+            if (
+                not isinstance(base_url, str)
+                or not base_url.strip()
+                or len(base_url) > 4096
+            ):
+                return jsonify({"message": "请填写完整的决策服务基础地址。"}), 400
+            config["base_url"] = base_url
+        client = DecisionClient(config)
+        try:
+            models = await client.list_models()
+            return jsonify({"models": models}), 200
+        except DecisionError as error:
+            message = {
+                "invalid_base_url": "请检查决策服务基础地址。",
+                "timeout": "获取模型列表超时，可重试或直接填写模型 ID。",
+                "not_found": "该服务未提供模型列表，可直接填写模型 ID。",
+                "rate_limited": "获取列表过于频繁，请稍后重试或直接填写模型 ID。",
+            }.get(error.code, "暂时无法获取模型列表，可直接填写模型 ID。")
+            return jsonify(
+                {"message": message}
+            ), 400 if error.code == "invalid_base_url" else 502
+        finally:
+            await client.close()
+
+    async def _api_settings_decision_test(self):
+        """使用当前草稿发起一次最小连通性测试。
+
+        省略字段保留已保存的值，显式空字符串表示清除，草稿不会写入配置。
+
+        Returns:
+            测试状态、模型、耗时和用量，或不含上游细节的稳定失败原因。
+        """
+        from ..backend.decision import DecisionClient, DecisionError
+
+        data = await request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "message": "请求格式不正确。"}), 400
+        names = ("provider", "account_id", "base_url", "token", "model")
+        if any(name in data and not isinstance(data[name], str) for name in names):
+            return jsonify({"ok": False, "message": "配置字段需要填写文本。"}), 400
+        try:
+            _, values = describe_settings(self.config)
+        except Exception:
+            logger.exception("读取决策服务配置失败")
+            return jsonify({"ok": False, "message": "读取配置失败，请重试。"}), 500
+        saved = values.get("decision_service")
+        saved = saved if isinstance(saved, dict) else {}
+        draft = {name: data.get(name, saved.get(name)) for name in names}
+        draft["timeout"] = data.get("timeout", saved.get("timeout", 15))
+        draft["max_concurrency"] = 1
+        client = DecisionClient(draft)
+        # 限制测试等待时间，同时保留客户端对非法超时配置的判断。
+        client.timeout = min(client.timeout, 20.0)
+        started = time.monotonic()
+        try:
+            answers = await client.evaluate(
+                {"task": "connectivity_check"},
+                {
+                    "ping": {
+                        "type": "choice",
+                        "instructions": (
+                            "这是一次插件设置页发起的连通性测试。"
+                            "收到请求并能正常作答时请选择 pong。"
+                        ),
+                        "criteria": {
+                            "pong": "已收到测试请求并能正常作答。",
+                            "unavailable": "当前无法完成本次测试。",
+                        },
+                    }
+                },
+            )
+        except DecisionError as error:
+            return jsonify(
+                {
+                    "ok": False,
+                    "reason": error.code,
+                    "message": DECISION_TEST_MESSAGES.get(
+                        error.code, DECISION_TEST_FALLBACK
+                    ),
+                }
+            ), 200
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("决策服务连通性测试失败")
+            return jsonify({"ok": False, "message": DECISION_TEST_FALLBACK}), 200
+        finally:
+            await client.close()
+        latency_ms = int(round((time.monotonic() - started) * 1000))
+        model = answers.model or client.model
+        message = f"连接成功：{model}，用时 {latency_ms} ms"
+        if answers.credits is not None:
+            message += f"，消耗 {answers.credits:g} 积分"
+        elif isinstance(answers.usage, dict):
+            input_tokens = answers.usage.get("input_tokens")
+            if type(input_tokens) in {int, float}:
+                message += f"，输入 {input_tokens:g} tokens"
+        answer = answers.get("ping")
+        confidence = answer.get("confidence") if isinstance(answer, dict) else None
+        return jsonify(
+            {
+                "ok": True,
+                "message": f"{message}。",
+                "provider": client.provider,
+                "model": model,
+                "latency_ms": latency_ms,
+                "choice": answer.get("choice") if isinstance(answer, dict) else "",
+                "confidence": (
+                    confidence if type(confidence) in {int, float} else None
+                ),
+                "usage": answers.usage,
+                "credits": answers.credits,
+            }
+        ), 200
+
+    async def _api_settings_config(self):
+        """编辑同一份 AstrBotConfig，并通过 AstrBot 插件管理器重载。
+
+        Returns:
+            隐藏敏感信息后的配置快照或校验、冲突响应。
         """
         try:
+            from ..backend.decision import DecisionClient
+
             data = await request.get_json() if request.method == "POST" else None
             snapshot, values = describe_settings(self.config)
-            if request.method == "GET":
-                providers = {"chat": [], "embedding": []}
-                for kind, getter in (
-                    ("chat", self.context.get_all_providers),
-                    ("embedding", self.context.get_all_embedding_providers),
-                ):
+            providers = {"chat": [], "embedding": []}
+            provider_list_errors = []
+            for kind, getter in (
+                ("chat", self.context.get_all_providers),
+                ("embedding", self.context.get_all_embedding_providers),
+            ):
+                try:
                     for provider in getter():
                         meta = provider.meta()
                         providers[kind].append(
                             {"id": meta.id, "model": meta.model or ""}
                         )
-                snapshot["providers"] = providers
+                except Exception:
+                    provider_list_errors.append(kind)
+            snapshot["providers"] = providers
+            snapshot["provider_list_errors"] = provider_list_errors
+            snapshot["decision_service_status"] = DecisionClient(
+                values.get("decision_service", {})
+            ).status()
+            if request.method == "GET":
                 return jsonify(snapshot), 200
             if not isinstance(data, dict):
                 return jsonify({"message": "请求格式不正确。"}), 400
@@ -4058,6 +4259,11 @@ class WebAPIMixin:
                 self.config.update(values)
                 raise
             snapshot, _ = describe_settings(self.config)
+            snapshot["providers"] = providers
+            snapshot["provider_list_errors"] = provider_list_errors
+            snapshot["decision_service_status"] = DecisionClient(
+                updated.get("decision_service", {})
+            ).status()
         except ValueError as error:
             return jsonify({"message": str(error)}), 400
         except Exception:

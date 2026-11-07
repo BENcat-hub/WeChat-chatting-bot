@@ -1,4 +1,4 @@
-"""Regression coverage for multi-pack rules, retrieval and delivery."""
+"""多包规则、检索与投递的回归覆盖。"""
 
 import hashlib
 import json
@@ -141,6 +141,7 @@ def test_uninstall_preserves_remaining_multi_pack_bindings(runtime):
 @pytest.fixture
 def semantic_runtime(runtime, monkeypatch):
     sender = object.__new__(MemeSender)
+    sender.emotions_probability = 100
     sender.config = {}
     sender.semantic_top_k = 5
     sender.semantic_min_score = 0
@@ -291,9 +292,7 @@ async def test_primary_file_errors_do_not_abort_secondary_search(
     assert [item["_source_pack_id"] for item in result["candidates"]] == ["pack-b"]
 
 
-@pytest.mark.parametrize(
-    "stage", ["load_metadata", "index_is_ready"]
-)
+@pytest.mark.parametrize("stage", ["load_metadata", "index_is_ready"])
 def test_primary_file_errors_do_not_abort_secondary_readiness(
     semantic_runtime, monkeypatch, stage
 ):

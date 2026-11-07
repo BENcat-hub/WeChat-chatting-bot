@@ -156,13 +156,22 @@ class ParserItem(ConfigNode):
     use_proxy: bool
     cookies: str | None
     show_body_text: bool | None
+    use_original_image: bool | None
+    mixed_layout: bool | None
     show_work_content: bool | None
     text_max_length: int | None
     video_send_mode: str | None
     video_codec_list: list | None
     video_quality: str | None
+    video_codec: str | None
+    video_format: str | None
+    block_pcdn: bool | None
+    metube_url: str | None
+    wait_timeout: int | None
+    delete_after_fetch: bool | None
     nsfw: str | None
     max_page: int | None
+    image_send_mode: str | None
     send_blue_links: bool | None
     qzone_credential_source: str | None
     snowluma_http_url: str | None
@@ -181,6 +190,7 @@ class ParserConfig(ConfigNodeContainer):
     douyin: ParserItem
     instagram: ParserItem
     kuaishou: ParserItem
+    metube: ParserItem
     ncm: ParserItem
     nga: ParserItem
     tiktok: ParserItem
@@ -190,9 +200,7 @@ class ParserConfig(ConfigNodeContainer):
     zhihu: ParserItem
     xhs: ParserItem
     youtube: ParserItem
-    iwara: ParserItem
     shipinhao: ParserItem
-    pixiv: ParserItem
     qzone: ParserItem
 
     def __init__(self, nodes: list[dict[str, Any]]):
@@ -233,7 +241,6 @@ class PluginConfig(ConfigNode):
     parsers_template: list[dict[str, Any]]
 
     _plugin_name = "astrbot_plugin_parser"
-
     def __init__(self, config: AstrBotConfig, context: Context):
         super().__init__(config)
         self.context = context

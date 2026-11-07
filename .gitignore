@@ -79,3 +79,11 @@ secrets/siliconflow_api_key.txt
 .weflow-userdata/
 .wf-appdata/
 .tmp-install/
+
+# 2026-11-07 发布前清理：备份文件可能含明文密钥
+*.bak
+*.bak-*
+astrbot/data/cmd_config.json.bak*
+rvc-backend/gradio/
+akasha-bridge/wxui_recent_attempts.json
+akasha-bridge/wxui_recent_sends.json

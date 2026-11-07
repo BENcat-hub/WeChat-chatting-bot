@@ -103,6 +103,46 @@ def test_filter_all_tags_shared_config_roundtrip(shared_config, start_plugin):
     assert start_plugin(updated).filter_all_tags is True
 
 
+@pytest.mark.parametrize("probability", [0, 37, 100])
+def test_independent_probabilities_settings_roundtrip(
+    shared_config, start_plugin, probability
+):
+    # 旧配置文件缺少这两个新字段，仍保留自主调用能力。
+    shared_config["semantic"].pop("tool_probability_enabled", None)
+    shared_config["semantic"].pop("tool_call_probability", None)
+    shared_config.save_config()
+    old_sender = start_plugin(shared_config)
+    assert old_sender.tool_probability_enabled is False
+    assert old_sender.tool_call_probability == 100
+    snapshot, values = describe_settings(shared_config)
+    changes = {
+        "semantic.tool_probability_enabled": True,
+        "semantic.tool_call_probability": probability,
+        "generation.emotion.probability": 0,
+    }
+    updated = validate_settings_changes(
+        values, snapshot["fields"], changes, shared_config.schema
+    )
+    shared_config.save_config(updated)
+    reloaded = AstrBotConfig(shared_config.config_path, schema=shared_config.schema)
+    sender = start_plugin(reloaded)
+    assert sender.tool_probability_enabled is True
+    assert sender.tool_call_probability == probability
+    assert sender.emotions_probability == 0
+    fresh, _ = describe_settings(reloaded)
+    fields = {item["path"]: item for item in fresh["fields"]}
+    for path, expected in changes.items():
+        assert fields[path]["value"] == expected
+    for invalid in (-1, 101, True, 20.5):
+        with pytest.raises(ValueError):
+            validate_settings_changes(
+                updated,
+                fresh["fields"],
+                {"semantic.tool_call_probability": invalid},
+                shared_config.schema,
+            )
+
+
 def test_lsky_configuration_and_token_redaction(shared_config, start_plugin):
     shared_config["storage"]["provider"] = "lsky"
     shared_config["storage"]["providers"]["lsky"].update(
@@ -251,6 +291,8 @@ def test_partial_edit_cleans_old_fields_and_preserves_current_values(shared_conf
             "generation.message.streaming_compatibility": False,
             "community.github_accelerator_url": "",
             "auto_collect.scope": ["group:123", "user:456"],
+            "auto_collect.content_review_enabled": True,
+            "auto_collect.content_review_prompt": "Reject watermarks",
         },
         shared_config.schema,
     )
@@ -263,6 +305,8 @@ def test_partial_edit_cleans_old_fields_and_preserves_current_values(shared_conf
     assert updated["semantic"]["min_score"] == 0
     assert updated["generation"]["message"]["streaming_compatibility"] is False
     assert updated["community"]["github_accelerator_url"] == ""
+    assert updated["auto_collect"]["content_review_enabled"] is True
+    assert updated["auto_collect"]["content_review_prompt"] == "Reject watermarks"
     assert values["semantic"]["min_score"] == 0.25
 
 
@@ -529,11 +573,14 @@ def test_collection_embedding_setting_defaults_and_runtime_wiring(
 ):
     snapshot, values = describe_settings(shared_config)
     field = next(
-        item for item in snapshot["fields"]
+        item
+        for item in snapshot["fields"]
         if item["path"] == "semantic.auto_collect_embedding"
     )
     assert field["default"] is True
-    assert shared_config.schema["semantic"]["items"]["auto_collect_embedding"]["condition"] == {"enabled": True}
+    assert shared_config.schema["semantic"]["items"]["auto_collect_embedding"][
+        "condition"
+    ] == {"enabled": True}
     manager = Mock(return_value=SimpleNamespace())
     monkeypatch.setattr(plugin_main, "AutoCollectManager", manager)
     start_plugin(values)

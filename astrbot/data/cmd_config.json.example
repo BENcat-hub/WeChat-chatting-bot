@@ -89,12 +89,12 @@
                                  "provider":  "xiaomi-token-plan",
                                  "type":  "xiaomi_token_plan",
                                  "provider_type":  "chat_completion",
-                                 "key":  "tp-cnr1bggmc38f1pqlh77jxizw5brxj1hvllkhjvu886opmb35",
+                                 "key":  "YOUR_API_KEY_HERE",
                                  "api_base":  "https://token-plan-cn.xiaomimimo.com/v1",
                                  "timeout":  120,
                                  "proxy":  "",
                                  "custom_headers":  {
-                                                        "Authorization":  "Bearer tp-cnr1bggmc38f1pqlh77jxizw5brxj1hvllkhjvu886opmb35"
+                                                        "Authorization":  "Bearer YOUR_API_KEY_HERE"
                                                     },
                                  "anth_thinking_config":  {
                                                               "type":  "adaptive",

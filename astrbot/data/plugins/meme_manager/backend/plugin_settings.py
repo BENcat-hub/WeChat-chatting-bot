@@ -1,4 +1,4 @@
-"""Schema-driven editing of the configuration shared with AstrBot's dashboard."""
+"""按配置结构编辑与 AstrBot 仪表盘共享的配置。"""
 
 import copy
 import hashlib
@@ -8,18 +8,24 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .decision import (
+    CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_MODELS,
+    DecisionClient,
+)
+
 
 def describe_settings(config) -> tuple[dict, dict]:
-    """Read the shared file and describe its editable fields without exposing secrets.
+    """读取共享文件并描述可编辑字段，不暴露密钥。
 
     Args:
-        config: The AstrBotConfig instance supplied to the plugin by AstrBot.
+        config: AstrBot 传入插件的 AstrBotConfig 实例。
 
     Returns:
-        A public snapshot and the complete private configuration used for merging.
+        公开快照及用于合并的完整私有配置。
 
     Raises:
-        ValueError: The configuration file or schema is unavailable or malformed.
+        ValueError: 配置文件或结构不可用、格式错误。
     """
     config_path = getattr(config, "config_path", None)
     schema = getattr(config, "schema", None)
@@ -59,6 +65,7 @@ def describe_settings(config) -> tuple[dict, dict]:
                 "secret",
                 "password",
                 "token",
+                "account_id",
                 "access_key_id",
                 "secret_access_key",
             }
@@ -83,19 +90,19 @@ def describe_settings(config) -> tuple[dict, dict]:
 def validate_settings_changes(
     values: dict, fields: list[dict], changes: dict, schema: dict
 ) -> dict:
-    """Validate a partial edit and preserve the current schema's other settings.
+    """校验局部编辑，保留当前配置结构中的其他设置。
 
     Args:
-        values: The latest contents of the shared configuration file.
-        fields: Editable field descriptions derived from the plugin schema.
-        changes: A mapping of dotted field paths to explicitly changed values.
-        schema: The plugin schema, including empty informational groups.
+        values: 共享配置文件的最新内容。
+        fields: 由插件配置结构生成的可编辑字段描述。
+        changes: 点分字段路径到明确修改值的映射。
+        schema: 插件配置结构，包含空的信息分组。
 
     Returns:
-        A new complete configuration containing only declared schema fields.
+        仅含配置结构已声明字段的完整新配置。
 
     Raises:
-        ValueError: A path, type, option, range, URL or regular expression is invalid.
+        ValueError: 路径、类型、选项、范围、URL 或正则表达式无效。
     """
     if not isinstance(changes, dict) or not changes:
         raise ValueError("没有需要保存的配置更改。")
@@ -119,6 +126,16 @@ def validate_settings_changes(
         for key in keys[:-1]:
             node = node.setdefault(key, {})
         node[keys[-1]] = copy.deepcopy(value)
+    # 先确定最终提供方，地址校验不依赖草稿字段的提交顺序。
+    decision = updated.get("decision_service", {})
+    provider = (
+        str(
+            changes.get("decision_service.provider", decision.get("provider"))
+            or "systemone"
+        )
+        .strip()
+        .casefold()
+    )
     for path, value in changes.items():
         if path not in allowed:
             raise ValueError("包含未知配置项，请重新加载设置。")
@@ -162,10 +179,43 @@ def validate_settings_changes(
                 raise ValueError(f"「{label}」超出允许范围。")
         if kind in {"string", "text"} and len(value) > 65536:
             raise ValueError(f"「{label}」内容过长。")
-        if path.endswith((".url", ".public_url", ".github_accelerator_url")) and value:
-            parsed = urlsplit(value)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if (
+            path.endswith(
+                (".url", ".public_url", ".github_accelerator_url", ".base_url")
+            )
+            and (path != "decision_service.base_url" or provider != "cloudflare")
+            and value
+        ):
+            try:
+                parsed = urlsplit(value)
+                port = parsed.port
+                valid_url = (
+                    parsed.scheme in {"http", "https"}
+                    and parsed.hostname
+                    and (port is None or port > 0)
+                )
+                if path == "decision_service.base_url":
+                    valid_url = (
+                        valid_url
+                        and not parsed.username
+                        and not parsed.password
+                        and not parsed.query
+                        and not parsed.fragment
+                        and not any(char.isspace() for char in value)
+                    )
+            except ValueError:
+                valid_url = False
+            if not valid_url:
                 raise ValueError(f"「{label}」需要填写完整的 HTTP 或 HTTPS 地址。")
+        if path == "decision_service.token" and any(
+            ord(char) < 33 or ord(char) == 127 for char in value
+        ):
+            raise ValueError("决策服务密钥包含无效字符。")
+        if path == "decision_service.model" and (
+            len(value) > 128
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError("决策模型 ID 格式无效。")
         if path.endswith("content_cleanup_rule"):
             try:
                 re.compile(value)
@@ -176,4 +226,31 @@ def validate_settings_changes(
         for key in keys[:-1]:
             node = node[key]
         node[keys[-1]] = value
+    if provider == "cloudflare":
+        account_id = str(decision.get("account_id") or "").strip()
+        if account_id and not CLOUDFLARE_ACCOUNT_ID.fullmatch(account_id):
+            raise ValueError("Cloudflare 账户 ID 需为 32 位十六进制字符。")
+        model = str(decision.get("model") or "").strip()
+        if model and model not in CLOUDFLARE_MODELS:
+            raise ValueError("决策模型 ID 仅支持 clef、clef-flash、clef-omni。")
+    selection = updated.get("generation", {}).get("emotion", {}).get("llm", {})
+    collection = updated.get("auto_collect", {})
+    decision_used = (
+        selection.get("enabled") and selection.get("backend") == "decision"
+    ) or (
+        collection.get("enabled") and collection.get("judgment_backend") == "decision"
+    )
+    if decision_used:
+        status = DecisionClient(updated.get("decision_service", {})).status()
+        if not status["ready"]:
+            reason = {
+                "missing_base_url": "请填写决策服务基础地址。",
+                "missing_token": "请填写决策服务密钥。",
+                "missing_model": "请填写决策模型 ID。",
+                "missing_account_id": "请填写 Cloudflare 账户 ID。",
+                "invalid_account_id": "Cloudflare 账户 ID 需为 32 位十六进制字符。",
+                "unsupported_model": "决策模型 ID 仅支持 clef、clef-flash、clef-omni。",
+                "invalid_provider": "决策服务提供方仅支持 systemone 或 cloudflare。",
+            }.get(status["reason"], "请检查决策服务配置。")
+            raise ValueError(reason)
     return updated

@@ -126,6 +126,7 @@ async def test_marker_only_reply_delivers_all_images_without_blank_text(
     reply_context, streaming, mixed, chain_response
 ):
     sender, event, state, _ = reply_context
+    sender.emotions_probability = 100
     sender.enable_mixed_message = mixed
     response = LLMResponse(
         role="assistant", completion_text="&&happy&&\n&&sad&&\n&&angry&&"
@@ -185,7 +186,7 @@ async def test_webchat_stream_cleans_tags_without_decorating_hook(
     event.message_obj = SimpleNamespace(message_id="tag-cleanup")
     event.session = SimpleNamespace(session_id="test")
     event.get_platform_name = lambda: "webchat"
-    event.send = AsyncMock()
+    original_send = event.send = AsyncMock()
     monkeypatch.setattr(AstrMessageEvent, "send_streaming", AsyncMock())
     queue = AsyncMock(return_value=True)
     monkeypatch.setattr(webchat_queue_mgr, "put_back_queue", queue)
@@ -213,8 +214,9 @@ async def test_webchat_stream_cleans_tags_without_decorating_hook(
     assert payloads[-1]["type"] == "complete"
     assert payloads[-1]["data"] == expected
     assert response.completion_text == expected
-    event.send.assert_not_awaited()
-    assert state["found_emotions"] == ["happy"]
+    original_send.assert_not_awaited()
+    assert state["found_emotions"] is None
+    sender._send_meme_image.assert_awaited_once()
     state["result"] = MessageEventResult(
         chain=[Plain(response.completion_text)],
         result_content_type=ResultContentType.STREAMING_FINISH,
@@ -325,8 +327,9 @@ async def test_stream_final_response_selects_images_without_replacement_message(
     reply_context,
 ):
     sender, event, state, _ = reply_context
+    sender.emotions_probability = 100
     event.get_platform_name = lambda: "webchat"
-    event.send = AsyncMock()
+    original_send = event.send = AsyncMock()
     response = LLMResponse(role="assistant", completion_text="&&happy&&&&sad&&")
 
     async def source():
@@ -345,8 +348,9 @@ async def test_stream_final_response_selects_images_without_replacement_message(
     event.send_streaming = deliver
     await sender._mark_llm_request_origin_impl(event)
     await event.send_streaming(state["result"].async_stream)
-    assert state["found_emotions"] == ["happy", "sad"]
-    event.send.assert_not_awaited()
+    assert state["found_emotions"] is None
+    assert sender._send_meme_image.await_count == 2
+    original_send.assert_not_awaited()
     state["result"] = MessageEventResult(
         chain=response.result_chain.chain,
         result_content_type=ResultContentType.STREAMING_FINISH,
@@ -463,11 +467,59 @@ async def test_category_fallback_uses_request_pack_instead_of_global_mapping(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("filter_all", [False, True])
+@pytest.mark.parametrize("candidate_valid", [False, True])
+@pytest.mark.parametrize("body", ["", "正文\n\n"])
+@pytest.mark.parametrize("chunk_size", [1, 7, 1000])
+async def test_unterminated_semantic_reply_cleans_marker_and_validates_candidate(
+    reply_context, monkeypatch, filter_all, candidate_valid, body, chunk_size
+):
+    sender, event, state, root = reply_context
+    sender.filter_all_tags = filter_all
+    sender.emotions_probability = 100
+    sender._semantic_mode_active = lambda event: True
+    identifier = "meme:addb64526374"
+    validated = []
+
+    def validate(event, value, pack):
+        validated.append(value)
+        return root / "happy" / "meme.png" if candidate_valid else None
+
+    monkeypatch.setattr(event_handlers, "validate_selected_id", validate)
+    text = f"{body}&&{identifier}"
+
+    async def source():
+        for index in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[index : index + chunk_size])])
+
+    visible = "".join(
+        [
+            component.text
+            async for chunk in sender._filter_meme_stream(event, source())
+            for component in chunk.chain
+            if isinstance(component, Plain)
+        ]
+    )
+    assert visible == body
+    response = LLMResponse(role="assistant", completion_text=text)
+    await sender._resp_semantic_impl(event, response, text)
+    assert response.completion_text == body.strip()
+    assert validated == [identifier]
+    assert state["meme_manager_semantic_selected_ids"] == (
+        [identifier] if candidate_valid else []
+    )
+    assert bool(state.get("meme_manager_image_only_reply")) == (
+        candidate_valid and not body
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_semantic_image_only_reply_keeps_multiple_selections(
     reply_context, monkeypatch, streaming
 ):
     sender, event, state, root = reply_context
+    sender.emotions_probability = 100
     sender._semantic_mode_active = lambda event: True
     paths = {
         f"meme:{index:012x}": root / tag / "meme.png"
