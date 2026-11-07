@@ -43,7 +43,7 @@ if (-not (Test-High)) {
     Write-Host '  → 当前不是 High 完整性，自提权后重启 bridge' -ForegroundColor Yellow
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-WaitSeconds', $WaitSeconds)
     if ($Restart) { $argList += '-Restart' }
-    Start-Process powershell -ArgumentList $argList -Verb RunAs | Out-Null
+    Start-Process powershell -ArgumentList $argList -Verb RunAs -WindowStyle Hidden | Out-Null
     Write-Host '  → 已交给提权进程处理（本机 UAC 不弹框）' -ForegroundColor DarkGray
     exit 0
 }
