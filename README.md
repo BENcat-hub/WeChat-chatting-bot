@@ -136,6 +136,8 @@ curl.exe -X POST http://127.0.0.1:8766/send -H "Content-Type: application/json" 
 | `docs/VERIFICATION.md` | 验证清单与实测结果 |
 | `docs/WEFLOW-101-FINDINGS.md` | `-101` 事故的完整排查记录（含失败路线） |
 | `docs/WXUI-SEND-SPEED-FIX.md` | 发送耗时优化（常驻 worker + warm 快路径）实测数据 |
+| [`docs/BERT-VITS2-GUIDE.md`](docs/BERT-VITS2-GUIDE.md) | **Bert-VITS2 接入教程**：源码取样、依赖绕坑、推理链路、报错对照、实测耗时 |
+| [`docs/COVER-BACKEND-GUIDE.md`](docs/COVER-BACKEND-GUIDE.md) | **翻唱后端教程**：分离器选型、svc 进程内推理、后处理参数、音高对齐、验收指标 |
 
 ---
 
