@@ -35,3 +35,21 @@ prepare_speech_text() 的“子句空格 → 逗号”规则当时**没有生效
 - 想用 Bert-VITS2（0.12s、原神 16 角色）时设 NAHIDA_ENGINE=bv2，代价是偶发错读。
 - 上次部署时那套 ertvits2/bv2_v1_say.py（真正的原版推理脚本）在 11-03 误删里永久丢失，
   只剩我按 v1.1.1 重写的 v2_say.py，所以“完全一样”的朗读无法复刻。
+## 5. 追加实验：换官方 BERT（2026-11-09 17:30）
+
+我们原来的 ert/chinese-roberta-wwm-ext-large/pytorch_model.bin 来自 **ModelScope 的
+dienstag/... 镜像**（1,306,484,351 B）。改用 HF 官方 hfl/chinese-roberta-wwm-ext-large
+（同样 1,306,484,351 B，hf-mirror 下载）后同一句：
+
+| BERT | ASR 结果 |
+|---|---|
+| ModelScope 镜像 | 喂，**王桂梅**，记得喝口水呀，**我弟弟**还有话没说。 |
+| HF 官方 hfl | 乖，**别慌嘛**，记得喝口水呀，我这边还有话没说。 |
+
+「我这边」修好了，但「忙归忙」仍被念成「别慌嘛」。
+⇒ 音素（m ang g ui m ang）与符号表（1.1 与 1.1.1 的 symbols.py 哈希一致、长度 112 与
+nc_p.emb.weight (112,192) 对齐）都没问题，**是这份 2023-11 的粉丝权重本身的发音能力就到这**。
+原版 v2_v1_say.py 已随 11-03 误删永久丢失，参考实现 _ref_server.py（同仓库 v1.1.1）
+的流程我们已逐行对齐，没有第三份脚本可找。
+
+ModelScope 权重已备份到 ertvits2/bert/_modelscope_backup/，可随时换回。
