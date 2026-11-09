@@ -159,16 +159,29 @@ def _parse_chat_record_xml(xml: str) -> dict | None:
         re.search(r"<title>(.*?)</title>", text, re.S)
     title = (title_match.group(1).strip() if title_match else "").strip()
     items = []
-    for block_match in re.finditer(r"<dataitem\b[^>]*>(.*?)</dataitem>", text, re.S):
-        block = block_match.group(1)
+    for block_match in re.finditer(r"<dataitem\b([^>]*)>(.*?)</dataitem>", text, re.S):
+        attrs, block = block_match.group(1), block_match.group(2)
         desc = re.search(r"<datadesc>(.*?)</datadesc>", block, re.S)
         who = re.search(r"<sourcename>(.*?)</sourcename>", block, re.S)
-        if not desc:
+        speaker = (who.group(1).strip() if who else "")
+        if desc:
+            items.append((speaker, desc.group(1).strip()))
             continue
-        items.append((
-            (who.group(1).strip() if who else ""),
-            desc.group(1).strip(),
-        ))
+        # datatype=2/3 这类没有 datadesc，只有 cdn 字段（图片/视频）：
+        # 按 datafmt / datatype 给个占位，至少让人知道卡里有几张图。
+        fmt_m = re.search(r"<datafmt>(.*?)</datafmt>", block, re.S)
+        fmt = (fmt_m.group(1).strip().lower() if fmt_m else "")
+        dt_m = re.search(r'datatype="(\d+)"', attrs or "")
+        dtype = dt_m.group(1) if dt_m else ""
+        if fmt in ("jpg", "jpeg", "png", "gif", "webp", "hevc", "bmp"):
+            placeholder = "[图片]"
+        elif fmt in ("mp4", "mov", "avi"):
+            placeholder = "[视频]"
+        elif dtype == "4":
+            placeholder = "[视频]"
+        else:
+            placeholder = "[媒体]"
+        items.append((speaker, placeholder))
     if not items:
         # 微信 4.x 转发的卡片常常没有 <recorditem>/<datalist>，
         # 只有 <des> 里按行给出「说话人: 内容」（实测 2026-11-09 localId=432：
@@ -201,7 +214,14 @@ def _format_chat_record(record: dict, max_items: int = 25, max_chars: int = 1200
     count = record.get("count") or len(items)
     if not items:
         return f"[转发聊天记录]「{title}」共 {count} 条（卡片没展开，只能读到标题）"
-    lines = [f"[转发聊天记录]「{title}」共 {count} 条，前 {min(len(items), max_items)} 条："]
+    n_pic = sum(1 for _w, d in items if d == "[图片]")
+    n_vid = sum(1 for _w, d in items if d == "[视频]")
+    extra = ""
+    if n_pic:
+        extra += f"（含 {n_pic} 张图片，卡片里的图读不出画面）"
+    if n_vid:
+        extra += f"（含 {n_vid} 段视频）"
+    lines = [f"[转发聊天记录]「{title}」共 {count} 条，前 {min(len(items), max_items)} 条{extra}："]
     for who, desc in items[:max_items]:
         desc = re.sub(r"\s+", " ", html.unescape(str(desc or ""))).strip()
         if not desc:
