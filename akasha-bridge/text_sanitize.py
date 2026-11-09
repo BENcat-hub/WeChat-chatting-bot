@@ -30,6 +30,15 @@ _LEAD_NOISE_RE = re.compile(r"^[ \t,，、。；;:：\-]+")
 _EMPTY_BRACKETS_RE = re.compile(r"\[\]|【】|</?>|<[^<>]{0,2}>")
 _NEWLINES_RE = re.compile(r"(?:\r?\n){3,}")
 
+# 4) 私有区 / 零宽 / 变体选择符：微信字体里没有字形，会渲染成方框，看起来像多了一个空格。
+#    实测 2026-11-09 出站正文以 "\uf605" 结尾（模型把入站表情占位符带了出来）。
+#    注意：不能碰 U+1F605（😅）这类真正的 emoji —— 它们不在 BMP 私有区。
+_PUA_AND_INVISIBLE_RE = re.compile(
+    "[\ue000-\uf8ff]"      # BMP 私有区（微信表情/贴纸占位）
+    "|[\ufe00-\ufe0f]"     # 变体选择符
+    "|[\u200b-\u200f\u2060\ufeff]"  # 零宽与 BOM
+)
+
 
 def sanitize_outbound_text(text: str) -> str:
     """去掉内部标记，保留真正要给人看的话。"""
@@ -37,6 +46,8 @@ def sanitize_outbound_text(text: str) -> str:
     if not source:
         return ""
     if not (_INTERNAL_TAG_RE.search(source) or _SENTINEL_RE.search(source) or _LITERAL_RE.search(source)):
+        if _PUA_AND_INVISIBLE_RE.search(source):
+            return _PUA_AND_INVISIBLE_RE.sub("", source).strip()
         return source
     cleaned = _SENTINEL_RE.sub("", source)
     cleaned = _INTERNAL_TAG_RE.sub("", cleaned)
@@ -45,4 +56,6 @@ def sanitize_outbound_text(text: str) -> str:
     cleaned = _SPACE_RUN_RE.sub(" ", cleaned)
     cleaned = _LEAD_NOISE_RE.sub("", cleaned)
     cleaned = _NEWLINES_RE.sub("\n\n", cleaned)
+    cleaned = _PUA_AND_INVISIBLE_RE.sub("", cleaned)
+    cleaned = _SPACE_RUN_RE.sub(" ", cleaned)
     return cleaned.strip()

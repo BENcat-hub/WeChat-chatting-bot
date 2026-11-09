@@ -1021,6 +1021,10 @@ def _apply_wechat_chat_style(text: Any) -> str:
     normalized = re.sub(r"[ \t]+([，,。！？!?~～…])", r"\1", normalized)
     normalized = re.sub(r"[ \t]+\n", "\n", normalized)
     normalized = re.sub(r"\n[ \t]+", "\n", normalized)
+    # 私有区 / 零宽 / 变体选择符：微信字体没有字形，会画成方框（用户看到的就是“每句末多个空格”）。
+    # 2026-11-09 实测出站正文以 "\uf605" 结尾；注意 U+1F605（😅）在补充平面，不在这个区间。
+    normalized = re.sub("[\ue000-\uf8ff]|[\ufe00-\ufe0f]|[\u200b-\u200f\u2060\ufeff]", "", normalized)
+    normalized = re.sub(r"[ \t]{2,}", " ", normalized)
     return normalized.strip()
 
 
