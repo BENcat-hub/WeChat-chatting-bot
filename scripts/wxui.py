@@ -2821,6 +2821,103 @@ def warm_session_trusted(cfg, target, plan):
     return True
 
 
+# ---------------------------------------------------------------------------
+# 「现在开着的会话是不是目标」——免 OCR 的廉价判定（2026-11-09 用户要求）
+#
+# 微信 4.x 的窗口标题里不带会话名，UIA 树是空的，PrintWindow 又恒返回 0，
+# 所以没有可靠的「读一眼就知道当前会话」的 API。这里用状态缓存代替：
+#   上次确认成功后的 (会话名, 时刻, pid, 窗口矩形, 最近一次人肉输入的 tick)
+# 只有当这五项都没变时，才认为「还是那个会话」—— 用户一动键鼠就作废旧判定，
+# 避免他手动切了会话我们还照着旧结论发。
+# ---------------------------------------------------------------------------
+_STATE_NAME = "wxui-state.json"
+
+
+def _state_path():
+    return os.path.join(ROOT, "logs", _STATE_NAME)
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_ulong)]
+
+
+def _last_input_tick():
+    """最近一次人肉键鼠输入的 tick（毫秒）；拿不到返回 -1。"""
+    try:
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        li = _LASTINPUTINFO()
+        li.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        if not u32.GetLastInputInfo(ctypes.byref(li)):
+            return -1
+        return int(li.dwTime)
+    except Exception:                      # noqa: BLE001
+        return -1
+
+
+def _proc_id_of(hwnd):
+    try:
+        pid = ctypes.c_ulong()
+        ctypes.WinDLL("user32", use_last_error=True).GetWindowThreadProcessId(
+            ctypes.c_void_p(int(hwnd)), ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:                      # noqa: BLE001
+        return 0
+
+
+def _state_read():
+    try:
+        with open(_state_path(), encoding="utf-8") as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except Exception:                      # noqa: BLE001
+        return {}
+
+
+def _state_write(data):
+    try:
+        os.makedirs(os.path.dirname(_state_path()), exist_ok=True)
+        tmp = _state_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, _state_path())
+    except Exception:                      # noqa: BLE001
+        pass
+
+
+def _state_record(cfg, target, hwnd, rect, by="verify"):
+    """确认目标会话已打开后记账，供下一次「免 OCR」判定。"""
+    try:
+        _state_write({
+            "chat": str(target or ""),
+            "ts": time.time(),
+            "pid": _proc_id_of(hwnd) if hwnd else 0,
+            "rect": [int(v) for v in (rect or ())][:4],
+            "input_tick": _last_input_tick(),
+            "by": by,
+        })
+    except Exception:                      # noqa: BLE001
+        pass
+
+
+def _state_hit(cfg, target, hwnd, rect):
+    """当前窗口是否仍停在 target 这个会话上（不用截图、不用 OCR）。"""
+    st = _state_read()
+    if not st or str(st.get("chat") or "") != str(target or ""):
+        return None
+    ttl = float(cfg.get("chat_state_ttl_s", 900) or 900)
+    if time.time() - float(st.get("ts") or 0) > ttl:
+        return None
+    if _proc_id_of(hwnd) != int(st.get("pid") or 0):
+        return None
+    if [int(v) for v in (rect or ())][:4] != [int(v) for v in (st.get("rect") or [])][:4]:
+        return None
+    tick = _last_input_tick()
+    if tick < 0 or int(st.get("input_tick") or -1) != tick:
+        # 用户动过键鼠（或读不到）→ 会话可能被切走，老老实实走 OCR
+        return None
+    return st
+
+
 def _chat_ready_to_type(cfg, plan, target):
     """Make sure the target's chat (or the main window) really owns the keyboard.
 
@@ -2875,6 +2972,15 @@ def _chat_ready_to_type(cfg, plan, target):
                                   (header_detail.get("texts") or [])[:3],
                                   (plan.get("identity_check") or {}).get("selected_row")))
         plan["target_verified"] = verified_by or "detached_window"
+    if _msg_mode(cfg):
+        # 消息模式：PostMessage 直接投给窗口，不需要微信占前台。以前这里会 focus(chat)，
+        # 那就是「发个文字也抢焦点」的最后一处；现在直接放行。
+        plan["keyboard_target"] = {"title": "", "class": "postmessage"}
+        _warm_mark(target, plan.get("window_rect"),
+                   header_verified=bool(plan.get("warm_header_verified")))
+        _state_record(cfg, target, find_wechat(cfg), plan.get("window_rect") or (),
+                      by=str(plan.get("target_verified") or "verify"))
+        return True
     chat = find_window(cfg, target, fuzzy=True) or find_wechat(cfg)
     if chat and foreground() != chat and not focus(chat):
         return fail(plan, "chat window did not take focus; refusing to type blind")
@@ -3772,6 +3878,17 @@ def open_chat(client, cfg, target, plan, do_ocr=True, assume_current=False):
     if not rect_usable(rect):
         return fail(plan, "WeChat window is minimized/hidden (rect=%s); put it back "
                           "on screen and retry" % (list(rect),))
+    if _msg_mode(cfg) and not find_window(cfg, target, fuzzy=True):
+        _hit = _state_hit(cfg, target, hwnd, rect)
+        if _hit:
+            # 上一轮已确认是这个会话，期间没有人动键鼠、窗口也没挪 → 直接开打。
+            plan.update(claimed="chat already on target (state cache: no search, no OCR)",
+                        target_verified="state_cache")
+            plan["state_cache"] = {"chat": _hit.get("chat"), "age_s": round(time.time() - float(_hit.get("ts") or 0), 1),
+                                   "by": _hit.get("by")}
+            plan["row_point"] = []
+            plan["open_attempts"] = 0
+            return _chat_ready_to_type(cfg, plan, target)
     if _msg_mode(cfg):
         # 搜索框里残留的词会让左侧列表变成「搜索结果」，侧栏 OCR 就永远找不到联系人。
         plan["search_cleared"] = _search_box_clear(cfg, hwnd, rect)
@@ -4870,25 +4987,55 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                                 retryable=False)
                     return plan
                 if _msg_mode(cfg) and attempt == 1:
-                    # 消息模式发图：Qt 不认 WM_PASTE（实测 2026-11-07：投了也没粘上），
-                    # 而 ctrl+v 只是按键、不动光标 —— 所以这里「消息点击聚焦 + 原生按键粘贴」，
-                    # 唯一代价是微信会被提到前台（不移动鼠标、不占用键鼠）。
+                    # 消息模式发图：Qt 不认 WM_PASTE（2026-11-07 实测投了没粘上），
+                    # 而 MCP 的 Shortcut 依赖「微信在前台」，后台进程 SetForegroundWindow
+                    # 会被系统静默拒绝（2026-11-09 实测：图片永远发不出去，文字正常）。
+                    # 这里按用户允许的方式做：**只在发图时**把微信从后台调到前台
+                    # （winio.raise_window + AttachThreadInput 抢焦点，不动光标位置），
+                    # 用真按键 ctrl+v 粘贴，回车后立刻把前台还给原来那个窗口。
                     _h = _wx_root(cfg)
                     _box = input_box_point(cfg, plan.get("window_rect"))
-                    if _h:
-                        winmsg.post_click(_h, _box[0], _box[1])
-                        time.sleep(0.2)
-                        ctypes.windll.user32.SetForegroundWindow(_h)
-                        time.sleep(0.15)
-                        client.call("Shortcut", {"shortcut": "ctrl+v"})
-                        time.sleep(cfg.get("after_paste_wait", 1.2))
-                        with winmsg.focus_attached(_h):
-                            winmsg.post_key(_h, winio.VK_RETURN)
-                        plan["image_paste"] = "message-focus+native-keys"
-                    else:
-                        client.call("Shortcut", {"shortcut": "ctrl+v"})
-                        time.sleep(cfg.get("after_paste_wait", 1.2))
-                        client.call("Shortcut", {"shortcut": "enter"})
+                    _prev_fg = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+                    _raised = False
+                    try:
+                        if _h:
+                            winmsg.post_click(_h, _box[0], _box[1])
+                            time.sleep(0.15)
+                            # winio.raise_window 内部带 AttachThreadInput 与 ALT 轻推
+                            # raise_window 偶尔被系统拒绝（实测 2026-11-09：同一条代码
+                            # 一次成功一次失败）。抢到前台才敢用真按键粘贴，否则粘贴会落到
+                            # 别的窗口上；三次都不行就退回 MCP Shortcut（它自己会重试）。
+                            _raised = False
+                            for _try in range(3):
+                                if winio is not None and winio.raise_window(_h):
+                                    time.sleep(0.25)
+                                    if int(ctypes.windll.user32.GetForegroundWindow() or 0) == int(_h):
+                                        _raised = True
+                                        break
+                                time.sleep(0.2)
+                            plan["image_raise_tries"] = _try + 1
+                            if _raised:
+                                winio.chord(winio.VK_CTRL, winio.VK_V)
+                            else:
+                                log.warning("[wxui] 发图：三次都没抢到前台，退回 MCP Shortcut 粘贴")
+                                client.call("Shortcut", {"shortcut": "ctrl+v"})
+                            time.sleep(cfg.get("after_paste_wait", 1.2))
+                            with winmsg.focus_attached(_h):
+                                winmsg.post_key(_h, winio.VK_RETURN)
+                            plan["image_paste"] = "raise+native-keys"
+                            plan["raised_for_image"] = _raised
+                        else:
+                            client.call("Shortcut", {"shortcut": "ctrl+v"})
+                            time.sleep(cfg.get("after_paste_wait", 1.2))
+                            client.call("Shortcut", {"shortcut": "enter"})
+                    finally:
+                        # 把前台还回去（用户明确要求：不准把微信留在最前）
+                        if _raised and _prev_fg and _prev_fg != _h:
+                            try:
+                                ctypes.windll.user32.SetForegroundWindow(int(_prev_fg))
+                                plan["fg_restored"] = int(_prev_fg)
+                            except Exception:      # noqa: BLE001
+                                pass
                 else:
                     client.call("Shortcut", {"shortcut": "ctrl+v"})
                     time.sleep(cfg.get("after_paste_wait", 1.2))

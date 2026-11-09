@@ -2,7 +2,7 @@
   "weflow_base_url": "http://127.0.0.1:5031",
   "token_file": "secrets/weflow-token.txt",
   "account_guard": true,
-  "overlay_raise_above": true,
+  "overlay_raise_above": false,
   "_overlay_raise_above_note": "点搜索框/结果行/输入框前先用 WindowFromPoint 判归属；被别的窗口盖住时先 HWND_TOPMOST→HWND_NOTOPMOST 把微信顶上去再点一次（2026-10-30 22:17：DSH 置顶窗盖住搜索框，守卫直接放弃导致语音气泡失败、回落成 wav 文件）；仍被盖住才拒发。",
   "xwechat_files_root": "C:\\Users\\Administrator.DESKTOP-LD9CS9H\\Documents\\xwechat_files",
   "_account_guard_note": "发送前比对「微信此刻在写的账号」(xwechat_files/<wxid>/db_storage/session/session.db 的 mtime) 与 WeFlow-config.json 的 myWxid；不一致直接拒发。2026-10-30 07:49 事故：微信被登到 wxid_h05bg877ppkj22_e398，WeFlow 仍读 wxid_iwfcw218p6pq22_7650，回读永远 False → 同一批消息重试 3 次 × 队列重放，对方收到「我这还没醒透」3 份、「先躺着缓会儿」4 份。",
@@ -26,7 +26,7 @@
   "row_click_y_bias_px": 6,
   "after_paste_wait": 0.9,
   "verify_timeout_s": 75,
-  "verify_timeout_image_s": 15,
+  "verify_timeout_image_s": 90,
   "verify_poll_s": 0.4,
   "after_paste_wait_text": 0.3,
   "input_fast_clear": false,
@@ -143,5 +143,10 @@
   "overlay_dismiss_y_ratio": 0.084,
   "_overlay_dismiss_note": "2026-10-29 隔离实验（4 个 trial）：微信 4.x **在没有搜索面板时按 Esc 会冻结 MMUI 渲染子窗**（悬停不再重绘、点击/滚轮全无响应，只能重启进程恢复）；面板开着时按 Esc 反而安全。旧版搜索路径在「点完结果（面板已自动关闭）」后补 Esc，正是用户说的『搜索导致微信卡死』的根因。现在清覆盖层一律用 dismiss_overlay()：点聊天头部空白处 (0.464w, 0.084h) —— 面板开着时点在外面会收起面板，没开时点在标题栏空白处无副作用。",
   "input_backend": "message",
-  "msg_fallback_native": true
+  "msg_fallback_native": true,
+  "overlay_pin_topmost": false,
+  "capture_flash": false,
+  "chat_state_ttl_s": 900,
+  "_no_topmost_note": "2026-11-09 用户：不准置顶微信窗口，只在需要时从后台调到前台。消息模式全走 PostMessage，不再 HWND_TOPMOST / 闪拍顶窗；被挡住就延期重试。",
+  "_image_verify_note": "2026-11-09：WeFlow 对自己刚发的图片落库慢（实测 15s 超时后 427 已在库里），图片回读窗口放宽到 90s；消息模式只发一次，慢回读交给重发队列先查后发。"
 }
