@@ -148,5 +148,8 @@
   "capture_flash": false,
   "chat_state_ttl_s": 900,
   "_no_topmost_note": "2026-11-09 用户：不准置顶微信窗口，只在需要时从后台调到前台。消息模式全走 PostMessage，不再 HWND_TOPMOST / 闪拍顶窗；被挡住就延期重试。",
-  "_image_verify_note": "2026-11-09：WeFlow 对自己刚发的图片落库慢（实测 15s 超时后 427 已在库里），图片回读窗口放宽到 90s；消息模式只发一次，慢回读交给重发队列先查后发。"
+  "_image_verify_note": "2026-11-09：WeFlow 对自己刚发的图片落库慢（实测 15s 超时后 427 已在库里），图片回读窗口放宽到 90s；消息模式只发一次，慢回读交给重发队列先查后发。",
+  "image_wm_paste": false,
+  "after_paste_wait_image": 0.8,
+  "_image_paste_note": "image_wm_paste: True 时先试 WM_PASTE（不抢前台），但 2026-11-09 实测粘不上位图，默认 False；发图只能短暂把微信调到前台（enter 后立即还原），after_paste_wait_image 是粘贴后的等待（秒）。"
 }

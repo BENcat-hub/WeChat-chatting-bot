@@ -328,6 +328,34 @@ def _click_send_button(hwnd, rect):
     return bool(winmsg.post_click(hwnd, x, y))
 
 
+def _wm_paste_image(rect, cfg=None):
+    """把剪贴板里的图直接 WM_PASTE 给聊天输入框（不抢前台）。
+
+    只有消息模式用；返回 True 表示「投出去了」，不代表已经发送成功 ——
+    发送与回读仍由调用方负责。投递目标优先 hwnd_at 拿到的子窗口：
+    Qt 的输入框是子控件，WM_PASTE 投给顶层窗口不会转下去（11-07 实测）。
+    """
+    if winmsg is None or not rect:
+        return False
+    try:
+        box = input_box_point(cfg or {}, rect)
+        root, target = winmsg.hwnd_at(box[0], box[1])
+        if not root:
+            return False
+        for hwnd in {target, root}:
+            if hwnd:
+                winmsg.post_msg(int(hwnd), winmsg.WM_PASTE, 0, 0)
+                time.sleep(0.1)
+        time.sleep(0.2)
+        with winmsg.focus_attached(root):
+            winmsg.post_key(root, winio.VK_RETURN)
+        log.info("[wxui] 发图：已用 WM_PASTE 投给输入框（root=%s target=%s），不抢前台", root, target)
+        return True
+    except Exception as exc:      # noqa: BLE001
+        log.warning("[wxui] 发图：WM_PASTE 不可用（%s），改用抢前台方案", exc)
+        return False
+
+
 def clear_input(client, cfg, rect, focused_clean=False):
     """Empty the message box so an interrupted attempt can never be sent twice.
 
@@ -4986,7 +5014,15 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                                 error="could not put image on the clipboard: %s" % err,
                                 retryable=False)
                     return plan
-                if _msg_mode(cfg) and attempt == 1:
+                if _msg_mode(cfg) and attempt == 1 and cfg.get("image_wm_paste", True) \
+                        and _wm_paste_image(plan.get("window_rect"), cfg):
+                    # 首选：WM_PASTE 直接投给输入框所在子窗口（不抢前台、不动光标）。
+                    # 之前 11-07 试过失败，是因为把消息投给了主窗口；这次按 hwnd_at 取到的
+                    # target 子窗口投，并且粘完立刻 PostMessage 回车。粘没粘上交给后面的
+                    # WeFlow 回读判定；attempt 2 会走 raise 分支兜底。
+                    plan["image_paste"] = "wm_paste"
+                    time.sleep(cfg.get("after_paste_wait_image", 1.2))
+                elif _msg_mode(cfg) and attempt == 1:
                     # 消息模式发图：Qt 不认 WM_PASTE（2026-11-07 实测投了没粘上），
                     # 而 MCP 的 Shortcut 依赖「微信在前台」，后台进程 SetForegroundWindow
                     # 会被系统静默拒绝（2026-11-09 实测：图片永远发不出去，文字正常）。
@@ -4997,6 +5033,7 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                     _box = input_box_point(cfg, plan.get("window_rect"))
                     _prev_fg = int(ctypes.windll.user32.GetForegroundWindow() or 0)
                     _raised = False
+                    _raise_t0 = time.time()
                     try:
                         if _h:
                             winmsg.post_click(_h, _box[0], _box[1])
@@ -5008,7 +5045,7 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                             _raised = False
                             for _try in range(3):
                                 if winio is not None and winio.raise_window(_h):
-                                    time.sleep(0.25)
+                                    time.sleep(0.12)
                                     if int(ctypes.windll.user32.GetForegroundWindow() or 0) == int(_h):
                                         _raised = True
                                         break
@@ -5019,7 +5056,8 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                             else:
                                 log.warning("[wxui] 发图：三次都没抢到前台，退回 MCP Shortcut 粘贴")
                                 client.call("Shortcut", {"shortcut": "ctrl+v"})
-                            time.sleep(cfg.get("after_paste_wait", 1.2))
+                            time.sleep(cfg.get("after_paste_wait_image",
+                                               cfg.get("after_paste_wait", 0.8)))
                             with winmsg.focus_attached(_h):
                                 winmsg.post_key(_h, winio.VK_RETURN)
                             plan["image_paste"] = "raise+native-keys"
@@ -5034,6 +5072,7 @@ def send_image(cfg, target, image_path, commit=False, do_ocr=True, assume_curren
                             try:
                                 ctypes.windll.user32.SetForegroundWindow(int(_prev_fg))
                                 plan["fg_restored"] = int(_prev_fg)
+                                plan["fg_hold_s"] = round(time.time() - _raise_t0, 2)
                             except Exception:      # noqa: BLE001
                                 pass
                 else:
