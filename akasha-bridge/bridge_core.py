@@ -169,6 +169,21 @@ def _parse_chat_record_xml(xml: str) -> dict | None:
             (who.group(1).strip() if who else ""),
             desc.group(1).strip(),
         ))
+    if not items:
+        # 微信 4.x 转发的卡片常常没有 <recorditem>/<datalist>，
+        # 只有 <des> 里按行给出「说话人: 内容」（实测 2026-11-09 localId=432：
+        # <des>睡不完的觉💤: [图片]\n睡不完的觉💤: [图片]…</des>）。
+        des_match = re.search(r"<des>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</des>", text, re.S)
+        if des_match:
+            for line in html.unescape(des_match.group(1)).splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                who_m = re.match(r"^(.{1,40}?)[:：]\s*(.+)$", line)
+                if who_m:
+                    items.append((who_m.group(1).strip(), who_m.group(2).strip()))
+                else:
+                    items.append(("", line))
     if not title and not items:
         return None
     count_match = re.search(r'<datalist[^>]*count="(\d+)"', text)
@@ -184,6 +199,8 @@ def _format_chat_record(record: dict, max_items: int = 25, max_chars: int = 1200
     title = (record.get("title") or "聊天记录").strip()
     items = record.get("items") or []
     count = record.get("count") or len(items)
+    if not items:
+        return f"[转发聊天记录]「{title}」共 {count} 条（卡片没展开，只能读到标题）"
     lines = [f"[转发聊天记录]「{title}」共 {count} 条，前 {min(len(items), max_items)} 条："]
     for who, desc in items[:max_items]:
         desc = re.sub(r"\s+", " ", html.unescape(str(desc or ""))).strip()
@@ -1155,9 +1172,16 @@ class WeFlowBridge:
         cards.sort(key=_sort_key)
         for card in reversed(cards[-3:]):
             # media=true 时 content 只有占位文本「[聊天记录]」，XML 在 rawContent 里
-            xml = card.get("rawContent") or ""
-            if "<dataitem" not in xml:
-                xml = card.get("content") or ""
+            # 优先挑「真的有条目」的那一份：
+            # 4.x 常把 <datalist> 删掉、只在 <des> 里按行给内容（2026-11-09 实测）。
+            candidates = [card.get("rawContent") or "", card.get("content") or ""]
+            xml = ""
+            for cand in candidates:
+                if "<dataitem" in cand or "<des>" in cand:
+                    xml = cand
+                    break
+            if not xml:
+                xml = candidates[0] or candidates[1]
             record = _parse_chat_record_xml(xml)
             if not record:
                 continue
