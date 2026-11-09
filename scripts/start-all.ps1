@@ -242,7 +242,10 @@ $voiceModel = Join-Path $root 'rvc-backend\models_voice\纳西妲\config.json'
 $bv2Weight = Join-Path $root 'bertvits2\pretrained\纳西妲\G_114000.pth'
 $rvcPy = Join-Path $root 'rvc-backend\.venv\Scripts\python.exe'
 if (-not $env:NAHIDA_ENGINE) {
-    $env:NAHIDA_ENGINE = if (Test-Path $bv2Weight) { 'bv2' } else { 'edge' }
+    # 2026-11-09：默认回到 edge + svc(models_voice/纳西妲 G_40000) —— Bert-VITS2 的
+    # G_114000 对「忙归忙」这类口语会念成「王桂梅」，被听成粤语；edge 的中文朗读准确，
+    # svc 再换成纳西妲音色。要用 Bert-VITS2 时设 NAHIDA_ENGINE=bv2。
+    $env:NAHIDA_ENGINE = 'edge'
 }
 Write-Host ("  引擎：" + $env:NAHIDA_ENGINE)
 if (Test-Port 8795) {
