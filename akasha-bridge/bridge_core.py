@@ -813,6 +813,8 @@ class WeFlowBridge:
         return bool(push_event(event))
 
     _REVOKE_RAWSID_RE = re.compile(r"rawid[：:\s]*(\d+)")
+    _REVOKE_NAME_RE = re.compile(r'<replacemsg><!\[CDATA\[\s*"?([^"\]]{1,40})"?\s*撤回了一条消息')
+    _REVOKE_LOCALID_RE = re.compile(r"<newmsgid>\s*(\d+)\s*</newmsgid>")
 
     def _revoke_is_self(self, data: dict) -> bool:
         """这条「撤回」是不是本账号自己撤的？
@@ -823,6 +825,21 @@ class WeFlowBridge:
         1 = 我们自己发的 = 自己撤回。
         """
         content = data.get("content") or ""
+        # 2026-11-09：微信 4.x 的撤回 sysmsg 长这样（实测）：
+        #   <sysmsg type="revokemsg"><revokemsg><content>你撤回了一条消息</content>
+        #   <revoketime>1794218639</revoketime></revokemsg></sysmsg>
+        # 既没有 rawid 也没有 localId，所以旧的 rawid 回查永远拿不到。
+        # 「你撤回」= 本账号自己撤的，最直接也最可靠。
+        if "你撤回了一条消息" in content:
+            return True
+        # 变体：<replacemsg><![CDATA["鱼宝" 撤回了一条消息]]> —— 名字是本账号昵称也算自撤
+        m_name = self._REVOKE_NAME_RE.search(content)
+        if m_name:
+            who = m_name.group(1).strip()
+            names = set(getattr(config, "BOT_NICKNAMES", []) or [])
+            names.add(getattr(config, "BOT_WXID", "") or "")
+            if who and who in names:
+                return True
         m = self._REVOKE_RAWSID_RE.search(content)
         sid = data.get("sessionId") or ""
         if not m or not sid:
