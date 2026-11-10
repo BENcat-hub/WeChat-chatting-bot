@@ -70,6 +70,36 @@
 
 实测：`在线图片 API 参考图提交: size=4693x3520` → 45.8s → 产出 4693×3520 PNG（7.95 MB）。
 
+## 二·五、退回 1024x1024 + 提示词结构改造（同日晚）
+
+用户要求「还是改成 1024x1024，优化提示词」。三处关键发现：
+
+1. **`natural_language` 模式强制英文**：`image_runtime.py:10917` 的格式说明写死「用连贯、具体的
+   **英文**写成一段画面描述…末句用 Avoid ...」，所以提示词又长又英文。改用 `traditional`
+   （`Positive prompt: ... Negative prompt: ...`，正负分明）。
+2. **配置被启动回写覆盖**：直接改 `astrbot_plugin_private_companion_config.json` 无效 —— 插件
+   15:30:23 加载时会把文件重写回旧值（实测我的 15:29:11 改动全被还原）。**必须走面板 API**
+   `POST /api/plug/astrbot_plugin_private_companion/page/settings/update`（JWT = `cmd_config.json`
+   的 `dashboard.jwt_secret` 自签 HS256），与分段开关同一个坑。
+3. **754 字符裁剪把身份锚吃掉**：代理按上游 800 上限留「头部 + 结尾要求句」，而插件把中文
+   身份描述写在提示词中段 ⇒ `has_identity=true` 但 `identity_in_sent=false`。修法是
+   `scripts/jimeng_image_server.py::_identity_rescue()`：以身份标记（同一个人/鲸鳍/渐变长发/
+   天蓝色大眼睛…）为中心取 ±窗口，插在头部与要求句之间并计入预算。
+
+当前生效值（API 写入并已落盘）：
+
+| 键 | 值 |
+| --- | --- |
+| `external_image_api_size` / 端点 `size` | `1024x1024` |
+| `photo_generation_prompt_format` | `traditional` |
+| `photo_generation_style` | `二次元` |
+| `photo_generation_negative_prompt_mode` | `merge` |
+| `photo_generation_selfie_fixed_prompt` | 身份锚（蓝渐变长发 / 鲸鳍发饰 / 天蓝眼 / 纤细身形）+ 日常私服 + 日系二次元插画 |
+| `photo_generation_*_negative_prompt` | 动物、鲸鱼、尾巴、多余人物、文字水印、写实质感、畸形手指… |
+
+实测（16:16）：`prompt_chars=4932 → sent=761`，`has_identity=true`、`identity_in_sent=true`，
+`size=1024x1024`，36.7s 出图；画面出现鲸鳍状发饰、蓝色渐变长发、二次元线条，且无多余动物/水印。
+
 ## 三、涉及文件与回滚
 
 | 文件 | 改动 |

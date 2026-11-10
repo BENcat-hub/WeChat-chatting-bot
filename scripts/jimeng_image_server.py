@@ -143,39 +143,78 @@ def _requirement_suffix(text: str, limit: int) -> tuple[str, str]:
     return text[:chosen].strip(), text[chosen:].strip()
 
 
-def clamp_prompt(prompt: str, limit: int = PROMPT_MAX_CHARS) -> str:
-    """把提示词收进上游长度限制内：先整段保住结尾的要求句，再在句子/逗号/空格边界收口。
+_IDENTITY_HINT_RE = re.compile(
+    r"同一个人|始终是|鲸鳍|渐变长发|发梢浅蓝|发根深蓝|天蓝色大眼睛|识别特征|identity",
+    re.IGNORECASE,
+)
 
-    结尾的要求句（身份锚、`Pose override:`、`Avoid ...`）整段保留，被压缩的是中间的场景描写；
-    要求句合计超过一半预算时退化为「只保最后的否定句」（见 `_requirement_suffix`）。
-    否定句过长的老兜底保留：上游对超过 800 字符的请求直接 400
-    （`prompt can not be more than 800 chars`），宁可丢场景也不能超限。
+
+def _identity_rescue(text: str, limit: int) -> str:
+    """抓身份锚：以每个身份标记为中心取窗口（前 60、后 110 字符）。
+
+    窗口必须围绕标记，否则前置的重复填充会把关键词自己挤出预算（2026-11-10 实测）。
+    """
+    if not text:
+        return ""
+    cap = max(80, min(limit // 3, 300))
+    pieces: list[str] = []
+    used = 0
+    last_end = -1
+    for match in _IDENTITY_HINT_RE.finditer(text):
+        if match.start() < last_end:
+            continue
+        start = max(0, match.start() - 60)
+        end = min(len(text), match.end() + 110)
+        piece = re.sub(r"\s+", " ", text[start:end]).strip(" ,;.\n")
+        if len(piece) < 8:
+            continue
+        room = cap - used
+        if room <= 40:
+            break
+        pieces.append(piece[:room])
+        used += len(pieces[-1]) + 1
+        last_end = match.end()
+        if len(pieces) >= 3:
+            break
+    return " ".join(pieces)
+
+
+def clamp_prompt(prompt: str, limit: int = PROMPT_MAX_CHARS) -> str:
+    """把提示词收进上游长度限制内：结尾要求句 + 身份锚优先，场景描写让位。
+
+    预算顺序：结尾要求句 > 身份锚 > 头部场景。身份锚按窗口取（见 `_identity_rescue`）。
     """
     text = str(prompt or "")
     if len(text) <= limit:
         return text
     head_text, tail_text = _requirement_suffix(text, limit)
     tail = f" {tail_text}" if tail_text else ""
-    budget = max(120, limit - len(tail))
+    identity = _identity_rescue(text, limit)
+    id_part = f" {identity}" if identity else ""
+    budget = max(120, limit - len(tail) - len(id_part))
     head = head_text[:budget]
-    for sep in (". ", "。", "! ", "！", "? ", "？", "; ", "；", ", ", "，", " "):
+    marker_positions = [mt.start() for mt in _IDENTITY_HINT_RE.finditer(text)]
+    if identity and marker_positions and any(pos < len(head) for pos in marker_positions):
+        # 身份标记已经落在保留的头部里（哪怕窗口被截断），就不再重复追加。
+        id_part = ""
+        budget = max(120, limit - len(tail))
+        head = head_text[:budget]
+    for sep in (". ", "\u3002", "! ", "\uff01", "? ", "\uff1f", "; ", "\uff1b", ", ", "\uff0c", " "):
         idx = head.rfind(sep)
         if idx >= int(budget * 0.6):
             head = head[: idx + len(sep)]
             break
     else:
         head = head.rstrip()
-    result = (head.strip() + tail).strip()
+    result = (head.strip() + id_part + tail).strip()
     if len(result) > limit:
-        # 兜底：尾部（要求句）优先保留，头部按剩余空间再收一次。
-        # 2026-10-16 实测：tail 接近 limit//2 时旧算法会产出 823 字符，
-        # 上游直接 400 `prompt can not be more than 800 chars`（一次实验 3/3 全废）。
-        keep_tail = tail.strip()
+        keep_tail = (id_part + tail).strip()
         if len(keep_tail) >= limit:
             return keep_tail[:limit]
         room = limit - len(keep_tail) - 1
         result = (head_text[:room].rstrip() + " " + keep_tail).strip()[:limit]
     return result
+
 
 MODEL_ALIASES = {
     "jimeng-4.6": REQ_KEY_JIMENG_46,
@@ -871,6 +910,8 @@ class Handler(BaseHTTPRequestHandler):
             log_event({
                 "stage": "prompt_clamped",
                 "chars": [len(prompt), len(params["prompt"])],
+                "has_identity": bool(_IDENTITY_HINT_RE.search(prompt)),
+                "identity_in_sent": bool(_IDENTITY_HINT_RE.search(params["prompt"])),
                 "head": params["prompt"][:260],
                 "tail": params["prompt"][-320:],
                 # 2026-10-16 04:4x：`head`/`tail` 之间还有一段没记（800 上限下最长 ~200 字符），
