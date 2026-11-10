@@ -5,7 +5,7 @@ P = "astrbot/data/plugins/astrbot_plugin_private_companion/helpers.py"
 src = io.open(P, encoding="utf-8").read()
 tree = ast.parse(src)
 ns = {"re": re, "Any": object}
-wanted = {"_is_question_meant_for_user", "_strip_self_directed_questions", "_apply_wechat_chat_style"}
+wanted = {"_is_question_meant_for_user", "_strip_self_directed_questions", "_apply_wechat_chat_style", "_tail_clause"}
 mods, consts = [], []
 for node in tree.body:
     if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id.startswith("_") and ("QUESTION" in t.id or "INTERROGATIVE" in t.id) for t in node.targets):

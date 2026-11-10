@@ -5,7 +5,7 @@ import ast, logging, re, sys, types
 P = "astrbot/data/plugins/astrbot_plugin_private_companion/proactive_message.py"
 src = open(P, encoding="utf-8").read()
 tree = ast.parse(src)
-wanted = {"_is_real_question_to_user", "_strip_meaningless_question_tail"}
+wanted = {"_is_real_question_to_user", "_strip_meaningless_question_tail", "_tail_clause"}
 funcs = []
 for node in tree.body:
     if isinstance(node, ast.ClassDef):
@@ -13,7 +13,7 @@ for node in tree.body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name in wanted:
                 funcs.append(item)
 print("找到函数:", [f.name for f in funcs])
-assert len(funcs) == 2
+assert len(funcs) == 3
 
 mod = ast.Module(body=funcs, type_ignores=[])
 ns = {
@@ -30,6 +30,7 @@ class T:
 for name in wanted:
     setattr(T, name, ns[name])
 T._MEANINGLESS_QUESTION_TAIL_RE = re.compile(r"[？?]\s*$")
+T._NEGATED_INTERROGATIVE_RE = re.compile(r"没什么|没啥|不怎么|不怎么样|没什么事|没有|不少|差不多|多少有点")
 t = T()
 
 cases = [

@@ -1008,16 +1008,31 @@ _TO_USER_INTERROGATIVE_RE = re.compile(
 )
 
 
+_NEGATED_INTERROGATIVE_RE = re.compile(r"没什么|没啥|不怎么|不怎么样|没什么事|没有|不少|差不多|多少有点")
+
+
+def _tail_clause(text: str) -> str:
+    """取最后一小句（用逗号/空格/顿号切），问句判定只看它。"""
+    parts = re.split(r"[，,、\s]+", str(text or "").strip())
+    return parts[-1] if parts else ""
+
 def _is_question_meant_for_user(sentence: str) -> bool:
     """判断一句带问号的话是不是真的在问对方（而不是自问自答）。"""
     text = str(sentence or "").strip()
     if not text:
         return False
-    if _TO_USER_QUESTION_HEAD_RE.match(text):
+    probe = _NEGATED_INTERROGATIVE_RE.sub("", text)
+    tail = _tail_clause(probe) or probe
+    if _TO_USER_QUESTION_HEAD_RE.match(tail):
         return True
-    if len(text) <= 12 and re.search(r"(?:吗|么|呢)[？?]\s*$", text):
+    if len(tail) <= 12 and re.search(r"(?:吗|么|呢)[？?]\s*$", tail):
         return True
-    if re.search(r"你|您|妳", text) and _TO_USER_INTERROGATIVE_RE.search(text):
+    if not re.search(r"你|您|妳", tail):
+        return False
+    if _TO_USER_INTERROGATIVE_RE.search(tail):
+        return True
+    # A不A 型（冷不冷、累不累、好不好、行不行）
+    if re.search(r"([\u4e00-\u9fff])不\1", tail):
         return True
     return False
 

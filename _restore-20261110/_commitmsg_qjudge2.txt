@@ -1,0 +1,8 @@
+fix(proactive): 收紧「真问句」判定——只看末句 + 剔否定式
+
+线上样本 20:10:32 主动消息「我今晚这边没什么事 就是想着你那边别太累 累了就早点歇着？」
+里 `没什么` 的「什么」被当成疑问词，问号被保留。改为：
+- 判定只看最后一小句（`_tail_clause`）
+- 先剔除否定式疑问词（`_NEGATED_INTERROGATIVE_RE`：没什么/没啥/不怎么/没有/不少…）
+- 补 A不A 型（冷不冷/累不累）
+helpers 与 proactive_message 同步；单测 test_q_v2 4/4、test_helpers_selfq 6/6、test_noquestion 7/7。

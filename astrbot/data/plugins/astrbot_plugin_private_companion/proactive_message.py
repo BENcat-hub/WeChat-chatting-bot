@@ -8191,6 +8191,14 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
 
     _MEANINGLESS_QUESTION_TAIL_RE = re.compile(r"[？?]\s*$")
 
+    _NEGATED_INTERROGATIVE_RE = re.compile(r"没什么|没啥|不怎么|不怎么样|没什么事|没有|不少|差不多|多少有点")
+
+    @staticmethod
+    def _tail_clause(text: str) -> str:
+        """取最后一小句（逗号/空格/顿号切），问句判定只看它。"""
+        parts = re.split(r"[，,、\s]+", str(text or "").strip())
+        return parts[-1] if parts else ""
+
     def _is_real_question_to_user(self, sentence: str) -> bool:
         """判断一句带问号的话是不是真的在问对方。
 
@@ -8202,14 +8210,20 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         text = str(sentence or "").strip()
         if not text:
             return False
-        if re.match(r"^(?:要不要|是不是|想不想|有没有|好不好|行不行|在吗|睡了|醒了|忙吗|方便)", text):
+        probe = self._NEGATED_INTERROGATIVE_RE.sub("", text)
+        tail = self._tail_clause(probe) or probe
+        if re.match(r"^(?:要不要|是不是|想不想|有没有|好不好|行不行|在吗|睡了|醒了|忙吗|方便)", tail):
             return True
-        if not re.search(r"你|您|妳", text):
+        if len(tail) <= 12 and re.search(r"(?:吗|么|呢)[？?]\s*$", tail):
+            return True
+        if not re.search(r"你|您|妳", tail):
             return False
         if re.search(
             r"吗|呢|什么|怎么|咋|哪|谁|几点|多少|要不要|是不是|想不想|有没有|好不好|行不行|对不对|可以吗|方便吗",
-            text,
+            tail,
         ):
+            return True
+        if re.search(r"([\u4e00-\u9fff])不\1", tail):
             return True
         return False
 

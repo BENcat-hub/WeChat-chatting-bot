@@ -1,0 +1,12 @@
+fix(photo): 人设参考图真正生效，生图默认 4693x3520
+
+- photo_reference_catalog 写规范化 persona 条目（三处配置），
+  修掉 catalog=[] 时旧 photo_persona_reference_image_path 被忽略、
+  且 load_catalog 迁移时机早于属性复制导致人设图永远为空的问题
+- llm_tool_actions: 新增 _photo_size_or_default()，把模型照抄的
+  1024x1024 视为未指定，交给配置的 external_image_api_size
+- main.py 工具文档串去掉 1024x1024 示例，改为默认走配置
+- proactive_message 每日穿搭不再硬编码 1024x1024
+- docs/PHOTO-PERSONA-REFERENCE-20261110.md 记录根因与验证方式
+
+实测：reference_used=True，提交尺寸 4693x3520，45.8s 出图（7.95 MB）

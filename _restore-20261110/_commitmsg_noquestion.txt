@@ -1,0 +1,10 @@
+fix(proactive): 去掉自问自答的问号，出站排版统一收敛
+
+- proactive_message.py: 提示词加「不要用反问句/自问自答收尾」；
+  新增 _is_real_question_to_user / _strip_meaningless_question_tail，
+  在 _finalize_proactive_generated_text 里逐段剥离（分段路径每段都过闸）
+- helpers.py: 新增 _is_question_meant_for_user / _strip_self_directed_questions，
+  在 _apply_wechat_chat_style 的标点替换之前降级问号，覆盖普通回复与主动消息
+- 判据：带「你/您/妳」+ 疑问词，或以要不要/是不是/在吗… 开头，或 ≤12 字以吗/么/呢？结尾
+  才算真问句；其余（「就先这么坐着？」）改成陈述句
+- 单测 _restore-20261110/test_noquestion.py 7/7、test_helpers_selfq.py 6/6
