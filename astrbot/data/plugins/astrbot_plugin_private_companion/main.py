@@ -11679,6 +11679,14 @@ class PrivateCompanionPlugin(
         cap = int(getattr(self, "_last_budget_cap", 0) or 0)
         if cap < 4:
             return chunks
+        # 技术回答（命令行、包名、路径）不切条：切开会让命令断在半截
+        _flat = " ".join(
+            str(getattr(comp, "text", "") or "")
+            for chunk in chunks
+            for comp in (chunk or [])
+        )
+        if re.search(r"(?:pip |python |npm |sudo |cd |git |\.py|/|\.exe|--?\w{2,})", _flat):
+            return chunks
         try:
             max_segments = int(
                 runtime_persona_setting(self, "segmented_proactive_max_segments", 4) or 4
@@ -13863,7 +13871,8 @@ class PrivateCompanionPlugin(
         return (
             f"【硬性上限】这一条回复不得超过 {cap} 个字（{note}）。"
             "超过就是不合格，宁可用\"嗯\"这种一个字把话收住。"
-            "例外只有一种：对方明确在问怎么做、要步骤或要解释。"
+            "例外只有一种：对方明确在问怎么做、要步骤或要解释 —— 这时必须直接给能照做的命令或步骤"
+            "（例如 pip install requests），不受上限限制；只说\"装一下就行\"不算回答。"
         )
 
     def _format_reply_style_prompt_section(self) -> PromptSection:

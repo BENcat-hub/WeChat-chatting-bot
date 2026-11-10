@@ -1051,6 +1051,16 @@ def _strip_self_directed_questions(text) -> str:
     return "".join(out)
 
 
+_NL = chr(10)
+_TECH_HINT_RE = re.compile(
+    r"(?:pip |python |npm |sudo |cd |git |\.py|/|\.exe|--?\w{2,}"
+    r"|ModuleNotFoundError|SyntaxError|Traceback)"
+)
+_TECH_SEMI_RE = re.compile(r"[；;]\s*")
+_TECH_BLANK_RE = re.compile(r"\n{3,}")
+_PRIVATE_GLYPH_RE = re.compile("[\ue000-\uf8ff]|[\ufe00-\ufe0f]|[\u200b-\u200f\u2060\ufeff]")
+
+
 def _apply_wechat_chat_style(text: Any) -> str:
     """把聊天出站文本整理成微信口语排版：句末不加句号，逗号改用空格。
 
@@ -1061,6 +1071,12 @@ def _apply_wechat_chat_style(text: Any) -> str:
         return ""
     if "`" in normalized:
         return normalized
+    # 技术内容（命令、报错、路径）原样保留标点；换行折成句号——
+    # 微信输入框里的换行会被发送逻辑丢掉，折成句号才读得出步骤。
+    if _TECH_HINT_RE.search(normalized):
+        tech = re.sub(r"\s*\n+\s*", "。", normalized).strip()
+        tech = re.sub(r"。[。\s]*", "。", tech)
+        return tech.strip()
     # 自问自答式问号（无对象的「就先这么坐着？」）按陈述句处理，避免句末莫名一个问号
     normalized = _strip_self_directed_questions(normalized)
     # 句号（中英文）换成空格：两句之间留一个空隙，而不是直接粘在一起

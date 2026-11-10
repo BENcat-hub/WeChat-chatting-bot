@@ -6018,6 +6018,9 @@ class EventDispatchMixin:
         # Segment limits only apply to text, so image_path/extra_components are
         # intentionally ignored here and kept only for compatibility.
         normalized = str(text or "").strip()
+        if re.search(r"(?:pip |python |python3 |py -|npm |sudo |cd |git |bash |powershell |\.py|/|\.exe|--?\w{2,}|ModuleNotFoundError|SyntaxError|Traceback|No module named)", normalized):
+            # 技术内容整段直出：不切条、不改写、不合并，避免命令被拆散
+            return [normalized]
         if not normalized:
             return []
         tts_normalizer = getattr(self, "_normalize_tts_tags", None)

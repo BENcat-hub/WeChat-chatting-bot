@@ -153,3 +153,23 @@ select persona_id, length(system_prompt) from personas;
 `persona_id='1'` 原样保留，面板随时可切回。
 
 实测（6 条话题）：中位 6.5、≤6 字 0.5，回复开始带角色（「行吧，那就记着」「夸你的人还挺有眼光」）。
+
+## 六、技术回答不许被「人味」整形搞坏
+
+短句化跑到技术内容上会出事，实测两次：
+
+- 02:48「pip 装不上 requests」被切成 4 条，气泡里词序都乱了（「如果提示 pip 就先跑 本身不存在 -m python」）——
+  分段器把命令按空格切开再合并，顺序一错整条就没法照做。
+- 02:57 提示词里已经写死「问报错/要步骤时必须给命令」，模型照做给出了
+  `python -m pip install requests`，但排版层又把换行吃掉了。
+
+改法（两处闸 + 一处措辞）：
+
+1. `event_dispatch.py::_split_proactive_text`：正文命中 `pip/python/npm/sudo/git/.py/.exe/--xxx/ModuleNotFoundError/SyntaxError/Traceback` 就 **原样返回单条**，不切条不合并；
+2. `helpers.py::_apply_wechat_chat_style`：技术分支 **保留标点、只把换行折成句号**（微信输入框里的换行本来就会被发送逻辑丢掉）；
+3. `main.py::_reply_length_budget_hint` 的例外条款改成硬要求：
+   「对方在问报错/怎么做/要步骤时，必须直接给能照做的命令或步骤（例如 pip install requests），不受上限限制；只说"装一下就行"不算回答。」
+
+实测（03:01，文件传输助手）：
+`多半是代理或者证书链的问题 先用忽略证书校验的方式装。python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn requests。能装上就说明是证书问题 想根治就补一下证书。python -m pip install --upgrade certifi。…`
+—— 单条 261 字、顺序正确、命令完整，且普通闲聊仍是 4~10 字短句（同时段「那就去睡啊」「六点我叫你」）。
