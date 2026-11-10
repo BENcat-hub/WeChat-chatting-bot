@@ -132,3 +132,24 @@ python _restore-20261111/apply_style_block.py --restore --apply
 cp astrbot/data/plugins/astrbot_plugin_private_companion/event_dispatch.py.bak-shortbubble-<ts> .../event_dispatch.py
 cp astrbot/data/plugins/astrbot_plugin_private_companion/main.py.bak-budget-<ts> / main.py.bak-passivecap-<ts> ...
 ```
+
+## 五、底子换了：给 default 人格写入鱼宝
+
+之前的「AI 味」不只是长度，是**人格本身是出厂的**：
+
+```sql
+select persona_id, length(system_prompt) from personas;
+-- 1  1373   ← 用户早前写的鱼宝（含群聊串子与脏话）
+-- default  40  ← "You are a helpful and friendly assistant."
+```
+
+所有微信会话的 `conversations.persona_id` 都是 NULL，于是插件和主动引擎拿到的是那 40 个字。
+提示词只能补表面，底子还是「有用的助手」。
+
+做法（`_restore-20261111/set_persona_yubao.py`，写前备份 `data_v4.db.bak-persona-*`）：
+把 `default` 的 system_prompt 换成 1:1 陪伴版鱼宝（512 字）——保留身份、傲娇+软、
+爱吃白饭、游戏/番/数码/股票的兴趣与「哼／行吧／6／?真的假的」的口头习惯，
+**去掉串子与脏话**（那套适合群聊，不适合私聊真人），并写明禁止客服腔、emoji、长篇总结。
+`persona_id='1'` 原样保留，面板随时可切回。
+
+实测（6 条话题）：中位 6.5、≤6 字 0.5，回复开始带角色（「行吧，那就记着」「夸你的人还挺有眼光」）。

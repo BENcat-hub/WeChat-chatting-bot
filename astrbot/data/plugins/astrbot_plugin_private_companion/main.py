@@ -13762,11 +13762,33 @@ class PrivateCompanionPlugin(
             mode=PromptRenderMode.LABELED_BLOCK,
         )
 
+    _PROACTIVE_BUDGET_TIERS: tuple[tuple[float, int, str], ...] = (
+        (0.25, 12, "≤12 字：一句短话，像顺口丢过来的一句"),
+        (0.55, 22, "≤22 字：一句到两句，说完就停"),
+        (0.20, 35, "≤35 字：最多两句，中间用空格断"),
+    )
+
+    def _proactive_length_budget_hint(self) -> str:
+        """主动消息的字数预算：比被动接话宽松一档，避免碎片化。"""
+        if not bool(runtime_persona_setting(self, "humanize_length_budget", True)):
+            self._last_budget_cap = 0
+            return ""
+        roll = random.random()
+        picked_cap, picked_text = self._PROACTIVE_BUDGET_TIERS[-1][1], self._PROACTIVE_BUDGET_TIERS[-1][2]
+        acc = 0.0
+        for weight, cap, text in self._PROACTIVE_BUDGET_TIERS:
+            acc += weight
+            if roll <= acc:
+                picked_cap, picked_text = cap, text
+                break
+        self._last_budget_cap = picked_cap
+        return "【本轮字数预算】" + picked_text + "。主动开口不必凑字，意思到了就停。"
+
     def _format_proactive_voice_prompt_sections(self) -> list[PromptSection]:
         sections: list[PromptSection] = []
         base = self._normalize_persona_voice_text(runtime_persona_setting(self, 'reply_style_prompt', ""), max_chars=900)
         if base:
-            _budget = self._reply_length_budget_hint()
+            _budget = self._proactive_length_budget_hint()
             if _budget:
                 base = f"{base}\n{_budget}"
             sections.append(
