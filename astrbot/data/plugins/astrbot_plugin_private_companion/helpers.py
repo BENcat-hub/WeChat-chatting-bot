@@ -1095,6 +1095,9 @@ def _apply_wechat_chat_style(text: Any) -> str:
     # 2026-11-09 实测出站正文以 "\uf605" 结尾；注意 U+1F605（😅）在补充平面，不在这个区间。
     normalized = re.sub("[\ue000-\uf8ff]|[\ufe00-\ufe0f]|[\u200b-\u200f\u2060\ufeff]", "", normalized)
     normalized = re.sub(r"[ \t]{2,}", " ", normalized)
+    # 重复句号收口：'。 。' / '。  ' / '。。' 统一成一个句号（同一段被排版两次时会出现）
+    normalized = re.sub(r"[。．]\s*[。．]+", "。", normalized)
+    normalized = re.sub(r"[。．]\s+(?=[^\s])", "。", normalized)
     return normalized.strip()
 
 
