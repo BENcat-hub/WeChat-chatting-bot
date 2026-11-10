@@ -2208,6 +2208,8 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             "主动消息要短、口语，但必须自成一句读得懂的话：至少要有明确的主谓（谁在做什么、在哪、在想什么），"
             "不要用「那份/那个/一半」这类没有指代的说法起头，也不要停在半个句子上。多数控制在 20~45 字。",
             "除非语义确实需要，不要每句都用完整句号收尾；不要为了显得自然而堆叠解释、背景和客套。",
+            "不要用反问句或自问自答收尾（例如「就先这么坐着？」「我还没想好晚上怎么弄？」这类只有自己在嘀咕的问句）："
+            "陈述句直接把话说完就行。只有真的在问对方、而且问题具体（带「你」并落到对方身上）时才用问号。",
         ]
         if energy <= 42:
             lines.append("当前能量偏低：优先一条短句或一个轻问候，少用感叹号，最多一到两段，不要连续铺陈。")
@@ -8177,6 +8179,7 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
         reviewed = self._trim_performative_self_state_tail(reviewed)
         if reason == "morning_greeting":
             reviewed = self._strip_morning_meal_questions(reviewed)
+        reviewed = self._strip_meaningless_question_tail(reviewed)
         finalized = self._normalize_proactive_sentence_flow(reviewed)
         if finalized and getattr(self, "_recent_proactive_text_duplicated", None):
             try:
@@ -8185,6 +8188,55 @@ class ProactiveMessageMixin(FinalResponsePersistenceMixin):
             except Exception as exc:  # 去重失败不应阻断发送链路
                 logger.warning("主动消息近似去重检查失败: %s", exc)
         return (finalized, "") if finalized else ("", "最终句式整理后为空")
+
+    _MEANINGLESS_QUESTION_TAIL_RE = re.compile(r"[？?]\s*$")
+
+    def _is_real_question_to_user(self, sentence: str) -> bool:
+        """判断一句带问号的话是不是真的在问对方。
+
+        判据（任一命中即算真问句）：
+        - 出现第二人称（你/您/你们/妳）且带疑问词（吗/呢/什么/怎么/哪/谁/几/多少/要不要/是不是/想不想/有没有/好不好）；
+        - 或以「要不要/是不是/想不想/有没有/好不好/方便吗/在吗/睡了吗」这类面向对方的问句开头。
+        没有第二人称的自问（「就先这么坐着？」）一律不算。
+        """
+        text = str(sentence or "").strip()
+        if not text:
+            return False
+        if re.match(r"^(?:要不要|是不是|想不想|有没有|好不好|行不行|在吗|睡了|醒了|忙吗|方便)", text):
+            return True
+        if not re.search(r"你|您|妳", text):
+            return False
+        if re.search(
+            r"吗|呢|什么|怎么|咋|哪|谁|几点|多少|要不要|是不是|想不想|有没有|好不好|行不行|对不对|可以吗|方便吗",
+            text,
+        ):
+            return True
+        return False
+
+    def _strip_meaningless_question_tail(self, text: str) -> str:
+        """把「没有对象的自问/反问」的句末问号改成句号；真问句保持原样。"""
+        source = str(text or "").strip()
+        if not source or not re.search(r"[？?]", source):
+            return source
+        units = re.split(r"(?<=[。！？!?])", source)
+        out: list[str] = []
+        changed = 0
+        for unit in units:
+            piece = unit
+            if re.search(r"[？?]\s*$", piece) and not self._is_real_question_to_user(piece):
+                piece = self._MEANINGLESS_QUESTION_TAIL_RE.sub("。", piece)
+                if piece == unit:
+                    piece = re.sub(r"[？?]\s*$", "。", piece)
+                changed += 1
+            out.append(piece)
+        result = "".join(out).strip()
+        if changed:
+            logger.info(
+                "主动消息去掉自问/反问收尾 %d 处: %s",
+                changed,
+                _single_line(result, 80),
+            )
+        return result
 
     @staticmethod
     def _strip_morning_meal_questions(text: str) -> str:

@@ -999,6 +999,43 @@ def _normalize_outbound_punctuation_flow(text: Any) -> str:
     return normalized
 
 
+_SELF_QUESTION_TAIL_RE = re.compile(r"[？?]\s*$")
+_TO_USER_QUESTION_HEAD_RE = re.compile(
+    r"^(?:要不要|是不是|想不想|有没有|好不好|行不行|在吗|睡了|醒了|忙吗|方便)"
+)
+_TO_USER_INTERROGATIVE_RE = re.compile(
+    r"吗|么|呢|什么|怎么|咋|哪|谁|几点|多少|要不要|是不是|想不想|有没有|好不好|行不行|对不对|可以吗|方便吗"
+)
+
+
+def _is_question_meant_for_user(sentence: str) -> bool:
+    """判断一句带问号的话是不是真的在问对方（而不是自问自答）。"""
+    text = str(sentence or "").strip()
+    if not text:
+        return False
+    if _TO_USER_QUESTION_HEAD_RE.match(text):
+        return True
+    if len(text) <= 12 and re.search(r"(?:吗|么|呢)[？?]\s*$", text):
+        return True
+    if re.search(r"你|您|妳", text) and _TO_USER_INTERROGATIVE_RE.search(text):
+        return True
+    return False
+
+
+def _strip_self_directed_questions(text) -> str:
+    """把没有对象的自问/反问（「就先这么坐着？」）的句末问号改成句号。"""
+    source = str(text or "")
+    if not source or not re.search(r"[？?]", source):
+        return source
+    out = []
+    for unit in re.split(r"(?<=[。！？!?])", source):
+        piece = unit
+        if re.search(r"[？?]\s*$", piece) and not _is_question_meant_for_user(piece):
+            piece = _SELF_QUESTION_TAIL_RE.sub("。", piece)
+        out.append(piece)
+    return "".join(out)
+
+
 def _apply_wechat_chat_style(text: Any) -> str:
     """把聊天出站文本整理成微信口语排版：句末不加句号，逗号改用空格。
 
@@ -1009,6 +1046,8 @@ def _apply_wechat_chat_style(text: Any) -> str:
         return ""
     if "`" in normalized:
         return normalized
+    # 自问自答式问号（无对象的「就先这么坐着？」）按陈述句处理，避免句末莫名一个问号
+    normalized = _strip_self_directed_questions(normalized)
     # 句号（中英文）换成空格：两句之间留一个空隙，而不是直接粘在一起
     normalized = normalized.replace("。", " ").replace("．", " ")
     # 逗号换成空格；数字千分位（如 3,000）不动
