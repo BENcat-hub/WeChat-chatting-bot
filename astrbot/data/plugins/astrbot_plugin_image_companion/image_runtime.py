@@ -38,6 +38,49 @@ from xml.etree import ElementTree as ET
 
 _PHOTO_GENERATION_TRACE_FILE_LOCK = threading.Lock()
 
+# --- plugin probe cache -------------------------------------------------------
+# `_find_sdgen_plugin` and `_get_comfyui_public_service` used to fall back to
+# `gc.get_objects()` (a full-heap walk over >100k objects).  Neither backend is
+# installed on this host, so every probe walked the whole heap and returned
+# None: synchronously, inside the proactive tick, once per user.  That single
+# pattern produced 15~39s event-loop stalls.  Results are memoised here and the
+# heap walk is disabled by default (set IMAGE_PROBE_GC=1 to re-enable).
+_PROBE_CACHE_LOCK = threading.Lock()
+_PROBE_CACHE: dict[str, tuple[float, float, object]] = {}
+_PROBE_TTL = float(os.environ.get("IMAGE_PROBE_TTL", "900"))
+_PROBE_POSITIVE_TTL = float(os.environ.get("IMAGE_PROBE_POSITIVE_TTL", "60"))
+_PROBE_GC_ALLOWED = os.environ.get("IMAGE_PROBE_GC", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _probe_cache_get(key: str) -> tuple[bool, object]:
+    with _PROBE_CACHE_LOCK:
+        item = _PROBE_CACHE.get(key)
+    if not item:
+        return False, None
+    ts, ttl, value = item
+    if ttl > 0 and (time.time() - ts) > ttl:
+        return False, None
+    return True, value
+
+
+def _probe_cache_set(key: str, value: object, ttl: float | None = None) -> None:
+    resolved = _PROBE_POSITIVE_TTL if (ttl is None and value is not None) else ttl
+    if resolved is None:
+        resolved = _PROBE_TTL
+    with _PROBE_CACHE_LOCK:
+        _PROBE_CACHE[key] = (time.time(), float(resolved), value)
+
+
+def invalidate_plugin_probe_cache() -> None:
+    """Drop every cached plugin probe (call after installing/removing a plugin)."""
+    with _PROBE_CACHE_LOCK:
+        _PROBE_CACHE.clear()
+
 
 def _photo_prompt_section_field(
     section: Any,
@@ -16663,6 +16706,14 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         return AnimaMasterAdapter(find_anima_master_plugin(self.context), event_factory, materialize)
 
     def _find_sdgen_plugin(self) -> Any | None:
+        hit, cached = _probe_cache_get("sdgen")
+        if hit:
+            return cached  # type: ignore[return-value]
+        found = self._locate_sdgen_plugin()
+        _probe_cache_set("sdgen", found)
+        return found
+
+    def _locate_sdgen_plugin(self) -> Any | None:
         try:
             getter = getattr(getattr(self, "context", None), "get_registered_star", None)
             if callable(getter):
@@ -16672,7 +16723,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                         return plugin
         except Exception:
             pass
-        for obj in gc.get_objects():
+        for obj in (gc.get_objects() if _PROBE_GC_ALLOWED else ()):
             try:
                 cls = obj.__class__
                 module = str(getattr(cls, "__module__", ""))
@@ -20654,6 +20705,14 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         return self._image_service.comfyui_model_call(getattr(self, "_image_owner", None))
 
     def _get_comfyui_public_service(self) -> Any | None:
+        hit, cached = _probe_cache_get("comfyui_service")
+        if hit:
+            return cached  # type: ignore[return-value]
+        found = self._locate_comfyui_public_service()
+        _probe_cache_set("comfyui_service", found)
+        return found
+
+    def _locate_comfyui_public_service(self) -> Any | None:
         native = self._native_comfyui_service()
         if native is not None:
             return native
@@ -20667,7 +20726,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 service = getattr(plugin, "public_service", None)
                 if service is not None:
                     return service
-        for obj in gc.get_objects():
+        for obj in (gc.get_objects() if _PROBE_GC_ALLOWED else ()):
             try:
                 if "astrbot_plugin_comfyui" not in str(getattr(obj.__class__, "__module__", "")):
                     continue

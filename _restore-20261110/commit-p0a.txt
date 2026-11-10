@@ -1,0 +1,27 @@
+perf(events): 拆掉事件循环上的 GC 全堆扫描，卡顿从 15~39s 降到微秒级
+
+event_loop_watchdog 的 27 个 dump 里有 50 处栈帧停在
+image_runtime._find_sdgen_plugin 的 `for obj in gc.get_objects()`：
+
+  daily_state_tick -> proactive._schedule_next_proactive
+  -> _queue_event_driven_proactive_impulses -> _action_is_available
+  -> _photo_text_available -> image_companion_bridge._image_companion_status
+  -> image_companion.status -> capability_status -> _sdgen_photo_available
+  -> _find_sdgen_plugin -> gc.get_objects()
+
+sdgen / comfyui 插件本机根本没装，所以每一次探测都扫完整堆再返回 None，
+而且每个用户、每次 tick 都重算一次；启动期 _prime_enabled_user_schedules
+走同一条链。astrbot.out.log 里对应 22 次 Event loop lag detected。
+
+改动：
+* image_runtime：新增模块级探测缓存（_PROBE_CACHE / _probe_cache_get /
+  _probe_cache_set / invalidate_plugin_probe_cache），负结果 900s、正结果 60s；
+  _find_sdgen_plugin / _get_comfyui_public_service 拆成「缓存外壳 + _locate_*」；
+  两处 gc.get_objects() 兜底改由 IMAGE_PROBE_GC 开关控制，默认关闭。
+* image_companion_bridge：_image_companion_status 加 20s 记忆
+  （IMAGE_STATUS_CACHE_TTL），并拆出 _image_companion_status_uncached；
+  缓存键含 (id(api), generation, mode, reason)，实例换代自动失效。
+
+验证：_restore-20261110/verify_probe_cache.py —— 冷 0.009ms、热 0.3us、
+清缓存后仍 0.004ms（不再全堆扫描）；重启后 25 个插件/模型加载、零 ERROR、
+7 端口全 UP、watchdog dump 停在 27 未增。

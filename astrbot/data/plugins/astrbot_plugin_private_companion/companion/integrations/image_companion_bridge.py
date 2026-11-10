@@ -124,6 +124,9 @@ _IMAGE_PROMPT_SECTION_FIELDS = (
 )
 
 
+_IMAGE_STATUS_CACHE_TTL = float(os.environ.get("IMAGE_STATUS_CACHE_TTL", "20"))
+
+
 class _ImageCurrentContractError(RuntimeError):
     """Body-free current-contract refusal used only inside this bridge."""
 
@@ -794,8 +797,36 @@ class ImageCompanionBridgeMixin:
         )
 
     def _image_companion_status(self) -> dict[str, Any]:
+        """Return the split service status, memoised for a short window.
+
+        The proactive tick asks for this once per action and per user; with no
+        cache that rebuilt the whole six-backend status dozens of times inside
+        a single tick, on the event loop.
+        """
+        mode, api, generation, reason = self._image_companion_contract()
+        key = (id(api), generation, mode, reason)
+        now = time.monotonic()
+        cache = getattr(self, "_image_status_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._image_status_cache = cache
+        hit = cache.get(key)
+        if hit is not None and (now - hit[0]) <= _IMAGE_STATUS_CACHE_TTL:
+            return dict(hit[1])
+        value = self._image_companion_status_uncached(mode, api, generation, reason)
+        if len(cache) > 16:
+            cache.clear()
+        cache[key] = (now, value)
+        return value
+
+    def _image_companion_status_uncached(
+        self,
+        mode: str,
+        api: Any,
+        _generation: int,
+        reason: str,
+    ) -> dict[str, Any]:
         """Return the split service status without importing its runtime."""
-        mode, api, _generation, reason = self._image_companion_contract()
         if api is None:
             return {
                 "installed": False,
