@@ -191,6 +191,9 @@ def prepare_speech_text(text: str) -> str:
     """
     s = str(text or "")
     s = re.sub(r"</?[A-Za-z_][\w:.-]*(?:\s[^>]*)?/?>", "", s)
+    # 被截断的标签残片：`</pc`、`<pc_tts` 这类没有收尾 `>` 的，单独清一遍
+    s = re.sub(r"</?\s*(?:pc|tc)[A-Za-z0-9_]*\s*$", "", s)
+    s = re.sub(r"</?\s*(?:pc|tc)[A-Za-z0-9_]*\s*>", "", s)
     for junk in ("**", "__", "`", "#", "~~"):
         s = s.replace(junk, "")
     s = s.replace("\r", " ").replace("\n", "，")
