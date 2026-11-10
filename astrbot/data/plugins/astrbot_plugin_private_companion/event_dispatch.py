@@ -6630,6 +6630,9 @@ class EventDispatchMixin:
                     continue
                 buf = ""
                 for piece in _pieces(text):
+                    if len(piece) < 4 and produced:
+                        produced[-1] = (produced[-1] + " " + piece).strip()
+                        continue
                     candidate = piece if not buf else (buf + " " + piece)
                     if len(candidate) <= max_chars:
                         buf = candidate
@@ -6680,7 +6683,7 @@ class EventDispatchMixin:
             if segments and bool(setting("humanize_short_bubbles", True)) and len(segments) > 0:
                 segments = _humanize_shorten(
                     segments,
-                    _safe_int(setting("humanize_max_chars", 16), 16, 8, 40),
+                    getattr(self, "_last_budget_cap", 0) or _safe_int(setting("humanize_max_chars", 16), 16, 8, 40),
                     max_segments,
                 )
             return segments if segments and (len(segments) > 1 or cleanup_enabled) else [restore_markdown(normalized)]
@@ -6713,7 +6716,7 @@ class EventDispatchMixin:
         if segments and bool(setting("humanize_short_bubbles", True)) and len(segments) > 0:
             segments = _humanize_shorten(
                 segments,
-                _safe_int(setting("humanize_max_chars", 16), 16, 8, 40),
+                getattr(self, "_last_budget_cap", 0) or _safe_int(setting("humanize_max_chars", 16), 16, 8, 40),
                 max_segments,
             )
         return segments if segments and (len(segments) > 1 or cleanup_enabled) else [restore_markdown(normalized)]

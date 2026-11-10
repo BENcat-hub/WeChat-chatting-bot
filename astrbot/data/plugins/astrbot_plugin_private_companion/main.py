@@ -11688,6 +11688,8 @@ class PrivateCompanionPlugin(
         max_segments = max(1, min(6, max_segments))
 
         def _split(text: str) -> list[str]:
+            # 没有标点的长句，退一步在「就/也/才/都/又/还」这类连接词前断，读起来仍像人话
+            text = re.sub(r"(?<=[一-鿿])(?=[就也才又还而且但可])", "，", text)
             raw = re.split(r"([，,、；;：:\s。！？!?…~～]+)", text)
             pieces: list[str] = []
             buf = ""
@@ -11707,6 +11709,10 @@ class PrivateCompanionPlugin(
             packed: list[str] = []
             cur = ""
             for piece in pieces:
+                # 太碎的片段（<4 字）不单独成条，粘回上一条，避免出现「我这边」这种半截话
+                if len(piece) < 4 and packed:
+                    packed[-1] = (packed[-1] + " " + piece).strip()
+                    continue
                 candidate = piece if not cur else (cur + " " + piece)
                 if len(candidate) <= cap:
                     cur = candidate
@@ -13760,6 +13766,9 @@ class PrivateCompanionPlugin(
         sections: list[PromptSection] = []
         base = self._normalize_persona_voice_text(runtime_persona_setting(self, 'reply_style_prompt', ""), max_chars=900)
         if base:
+            _budget = self._reply_length_budget_hint()
+            if _budget:
+                base = f"{base}\n{_budget}"
             sections.append(
                 prompt_section(
                     key="proactive.base_voice",
@@ -13797,7 +13806,7 @@ class PrivateCompanionPlugin(
         )
 
     _REPLY_BUDGET_TIERS: tuple[tuple[float, int, str], ...] = (
-        (0.15, 2, "只回一个字或两个字，像\"嗯\"\"好\"\"哦\"\"没有\""),
+        (0.15, 2, "只回一个字或两个字，像\"嗯\"\"嗯嗯\"\"好\"\"好啊\"\"哦\"\"没有\""),
         (0.45, 6, "6 个字以内，一个词也行"),
         (0.30, 12, "12 个字以内，一句短话"),
         (0.10, 25, "25 个字以内，最多两句"),
