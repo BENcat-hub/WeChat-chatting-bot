@@ -11668,6 +11668,26 @@ class PrivateCompanionPlugin(
         cleaned_chunks = self._humanize_split_chunks(cleaned_chunks, event)
         return cleaned_chunks
 
+    def _soft_break_after_particle(self, text: str, min_len: int = 14, tail_min: int = 6) -> str:
+        """语气词后面接新小句时补一个逗号（只在长句里动手，避免把短句切碎）。"""
+        if not text or len(text) < min_len:
+            return text
+        particles = "了吧啊呢嘛呀哦"
+        stops = "，。！？、；：…~～\n 「」《》『』"
+        out: list[str] = []
+        n = len(text)
+        for idx, ch in enumerate(text):
+            out.append(ch)
+            if ch not in particles:
+                continue
+            nxt = text[idx + 1] if idx + 1 < n else ""
+            if not nxt or nxt in stops or nxt in "吗呢吧啊呀哦嘛了的":
+                continue
+            if n - (idx + 1) < tail_min:
+                continue
+            out.append("，")
+        return "".join(out)
+
     def _humanize_split_chunks(
         self,
         chunks: list[list[Any]],
@@ -11697,6 +11717,7 @@ class PrivateCompanionPlugin(
 
         def _split(text: str) -> list[str]:
             # 没有标点的长句，退一步在「就/也/才/都/又/还」这类连接词前断，读起来仍像人话
+            text = self._soft_break_after_particle(text)
             text = re.sub(r"(?<=[一-鿿])(?=[就也才又还而且但可])", "，", text)
             raw = re.split(r"([，,、；;：:\s。！？!?…~～]+)", text)
             pieces: list[str] = []

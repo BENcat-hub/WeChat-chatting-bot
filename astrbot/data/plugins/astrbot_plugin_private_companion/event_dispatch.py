@@ -6606,7 +6606,28 @@ class EventDispatchMixin:
                     return True
                 return any(mark in text for mark in ("「", "」", "《", "》", "『", "』"))
 
+            def _particle_break(text: str, min_len: int = 14, tail_min: int = 6) -> str:
+                """语气词后接新小句时补逗号，解决"那就这么定了我这会儿就…"这种黏连。"""
+                if not text or len(text) < min_len:
+                    return text
+                particles = "了吧啊呢嘛呀哦"
+                stops = "，。！？、；：…~～\n 「」《》『』"
+                out: list[str] = []
+                n = len(text)
+                for idx, ch in enumerate(text):
+                    out.append(ch)
+                    if ch not in particles:
+                        continue
+                    nxt = text[idx + 1] if idx + 1 < n else ""
+                    if not nxt or nxt in stops or nxt in "吗呢吧啊呀哦嘛了的":
+                        continue
+                    if n - (idx + 1) < tail_min:
+                        continue
+                    out.append("，")
+                return "".join(out)
+
             def _pieces(text: str) -> list[str]:
+                text = _particle_break(text)
                 raw = re.split(r"([，,、；;：:]+|\s+|[。！？!?…~～]+)", text)
                 out: list[str] = []
                 buf = ""
