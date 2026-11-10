@@ -1,0 +1,26 @@
+fix(companion): 同一真人的两份档案合流，Panel 不再出现重复记录
+
+bridge 早期用 abs(hash(wxid)) % 2**31 生成 OneBot user_id（受
+PYTHONHASHSEED 影响），后来改成 sha256 派生（akasha-bridge/state.py
+stable_int）。改动之后同一个人拿到新 id，AstrBot 里旧 id 的档案还留着，
+于是「不曾为世界整除」有 1905794693 与 1031792701 两份记录，两者
+next_proactive_at 曾同为 1794312600 —— 同一时刻各发一条主动消息。
+
+对账（当前 id 由 wxid 现算）：
+  旧 1905794693 -> 新 1031792701  不曾为世界整除 (wxid_qvj04bh9wqhl22)
+  旧 2119307100 -> 新 1007787221  陈奥琦        (wxid_ml4l1e98nlyn22)
+  旧  16250560  -> 新 1043793717  天文学家      (wxid_iwfcw218p6pq22)
+  旧 1012022627 -> 新 1057020421  文件传输助手  (filehelper)
+
+_restore-20261110/merge_dup_20261110.py（停 AstrBot 后跑，写前备份）：
+* DB：把旧 umo 的 conversations 去重合并进新 umo，删旧行，校正 umo_aliases
+* companions.json：情节/未完结话题/长期记忆/表达规则/关系账本/最近主动话题
+  按内容去重并入；ignored_streak 取 max、next_proactive_at 取非零较小值
+* 清掉 4 个纯残留壳：桃桃真可爱 / . / onebot:1045254607:... / onebot:1905794693:...
+
+结果：users 12 -> 7（+2 个插件自建的空壳，proactive 关闭），
+不曾为世界整除 只剩 1031792701（ep5 / mem9），陈奥琦 仍按配置走
+2119307100（原本就有 private_user_aliases: 1007787221=2119307100）。
+
+顺手补 private_user_aliases：1905794693=1031792701
+（_restore-20261110/pc_set_user_aliases.py 走面板 API 写入，避免启动回写）。
