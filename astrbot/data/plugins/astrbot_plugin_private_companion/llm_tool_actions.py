@@ -87,6 +87,16 @@ from .photo_nai_params import merge_user_photo_nai_params, recent_cached_photo_n
 
 logger = get_module_logger(__name__)
 
+def _photo_size_or_default(value: object) -> str:
+    """模型常照抄工具文档示例的 1024x1024；这里把「示例默认值」视为未指定，
+    交给图片插件按配置的 external_image_api_size（当前 4693x3520）出图。"""
+    text = _single_line(value, 40)
+    if text.lower().replace(" ", "").replace("*", "x") in {"", "1024x1024"}:
+        return ""
+    return text
+
+
+
 
 def _render_tool_prompt_section_labeled(section: PromptSection | None) -> str:
     if section is None:
@@ -4125,7 +4135,7 @@ class LlmToolActionsMixin:
             ),
             "reference_image_path": reference_path,
             "reference_image_paths": list(resolved_reference_paths),
-            "image_size": _single_line(image_size or kwargs.get("size"), 40),
+            "image_size": _photo_size_or_default(image_size or kwargs.get("size")),
             "requested_scene_preset": preset_text,
             "suggested_scene_preset": preset_text,
             "workflow_default_scene_preset": workflow_default_preset,
