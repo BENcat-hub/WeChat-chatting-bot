@@ -1,0 +1,29 @@
+chore(disk): 调试产物自动裁剪 + AstrBot 日志启动轮转 + WAL checkpoint
+
+磁盘占用主要在可重生成的中间件上：logs\wmcp（每次截图/OCR 的落盘）、
+logs\jimeng-out（代理层 4K 出图缓存，单张 10~19MB）、logs\msgprobe（探针截图）、
+logs\voice（语音中间 wav），以及 plugin_data 里越攒越多的 companions 备份。
+data_v4.db 的 -wal 长期不 checkpoint，最高到过 4.1MB。
+
+scripts/prune_artifacts.py（默认 dry-run，--apply 才删）
+* 目录按「至少保留最新 N 个 + 超过 X 天才删」裁剪；出图缓存/探针截图/语音中间件
+  用 count-only 硬裁剪（成图归档在 plugin_data\...\generated_photos，留最新 60 张、
+  超过 30 天才清）
+* companions.json.bak-* 留最新 3 份，其余 .bak-* 留最新 2 份
+* 每次运行顺带 PRAGMA wal_checkpoint(TRUNCATE)
+* --auto 供启动脚本调用：logs 超过 120MB（PRUNE_LOGS_MB 可调）才真裁，否则只 checkpoint
+
+scripts/_start_astrbot_hidden.ps1
+* 启动前轮转 astrbot.out.log / astrbot.err.log：超过 8MB 才把上一份挪成 .1，
+  小文件仍走覆盖写（不丢近期现场，也不让异常退出的残留越堆越大）
+
+scripts/start-all.ps1
+* 起 AstrBot 之前先跑一次 prune_artifacts.py --auto（失败不影响启动）
+
+实测效果（本次）：
+  logs\                233.2MB -> 51.2MB
+  jimeng-out 35 个 -> 6 个，voice 42 个 -> 10 个，msgprobe 577 -> 40
+  companions.json.bak-* 7 -> 3，其余 .bak-* 7 -> 2
+  data_v4.db-wal       20.1KB -> 0B
+  plugin_data\astrbot_plugin_private_companion 仍 130MB —— 主要是 17 张用户成图
+  （~98MB）与表情库（14MB），属于用户内容，不自动清。

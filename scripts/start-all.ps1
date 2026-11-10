@@ -205,6 +205,16 @@ if ($SkipAstrBot) {
                 Write-Host '  ⚠ 群会话补齐失败（不影响启动）' -ForegroundColor Yellow
             }
         }
+        # 磁盘卫生：logs 超过 120MB 才裁剪调试产物（wmcp/出图缓存/探针截图/语音中间件），
+        # 顺手把 data_v4.db 的 WAL checkpoint 掉。失败不影响启动。
+        $prune = Join-Path $PSScriptRoot 'prune_artifacts.py'
+        if (Test-Path $prune) {
+            try {
+                & $exe '-X' 'utf8' $prune '--auto' | ForEach-Object { '  ' + $_ }
+            } catch {
+                Write-Host '  ⚠ 磁盘清理跳过（不影响启动）' -ForegroundColor Yellow
+            }
+        }
         Start-Svc 'astrbot' $exe $astrbotRoot @('-X', 'utf8', $entry, 'run')
         if (Wait-Port 11229 60) { Write-Host '  11229 已监听（无控制台窗口）' }
         else { Write-Host '  ✗ 60 秒内 11229 未监听，查看 logs\astrbot-*.err.log' -ForegroundColor Yellow }

@@ -60,6 +60,20 @@ if (-not $env:DEEPSEEK_API_KEY) {
 $entry = Join-Path $PSScriptRoot '_astrbot_entry.py'
 $outLog = Join-Path $logs 'astrbot.out.log'
 $errLog = Join-Path $logs 'astrbot.err.log'
+
+# 启动前轮转：RedirectStandardOutput 是覆盖写，但异常退出残留的大文件会越堆越多。
+# 只保留上一份 .1，超过 8MB 才轮转（小文件直接覆盖，不占地也不丢近期现场）。
+foreach ($f in @($outLog, $errLog)) {
+    if (Test-Path $f) {
+        $len = (Get-Item $f).Length
+        if ($len -gt 8MB) {
+            $keep = $f + '.1'
+            if (Test-Path $keep) { Remove-Item $keep -Force -ErrorAction SilentlyContinue }
+            try { Move-Item $f $keep -Force -ErrorAction Stop } catch { }
+        }
+    }
+}
+
 $p = Start-Process -FilePath $py -ArgumentList @('-X', 'utf8', $entry, 'run') `
     -WorkingDirectory $astrbotRoot -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput $outLog -RedirectStandardError $errLog
