@@ -96,6 +96,8 @@ def replies_since(start_ts: float) -> list[str]:
     out = []
     for row in fetch_filehelper(160):
         ts = row.get("createTime") or 0
+        if isinstance(ts, (int, float)) and ts > 1e12:  # 毫秒时间戳统一成秒
+            ts = ts / 1000.0
         if not isinstance(ts, (int, float)) or ts < start_ts - 5:
             continue
         if not row.get("isSend"):
