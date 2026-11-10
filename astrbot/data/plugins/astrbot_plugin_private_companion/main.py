@@ -11665,7 +11665,102 @@ class PrivateCompanionPlugin(
                 "分段前已移除内部控制标记: session=%s",
                 _single_line(getattr(event, "unified_msg_origin", ""), 120) or "unknown",
             )
+        cleaned_chunks = self._humanize_split_chunks(cleaned_chunks, event)
         return cleaned_chunks
+
+    def _humanize_split_chunks(
+        self,
+        chunks: list[list[Any]],
+        event: AstrMessageEvent | None = None,
+    ) -> list[list[Any]]:
+        """按本轮字数上限把过长的气泡拆成几条（只切分，不改写）。"""
+        if not bool(runtime_persona_setting(self, "humanize_short_bubbles", True)):
+            return chunks
+        cap = int(getattr(self, "_last_budget_cap", 0) or 0)
+        if cap < 4:
+            return chunks
+        try:
+            max_segments = int(
+                runtime_persona_setting(self, "segmented_proactive_max_segments", 4) or 4
+            )
+        except Exception:
+            max_segments = 4
+        max_segments = max(1, min(6, max_segments))
+
+        def _split(text: str) -> list[str]:
+            raw = re.split(r"([，,、；;：:\s。！？!?…~～]+)", text)
+            pieces: list[str] = []
+            buf = ""
+            for part in raw:
+                if not part:
+                    continue
+                if re.fullmatch(r"[，,、；;：:\s。！？!?…~～]+", part):
+                    if buf:
+                        pieces.append(buf)
+                        buf = ""
+                    continue
+                buf += part
+            if buf:
+                pieces.append(buf)
+            if not pieces:
+                return [text]
+            packed: list[str] = []
+            cur = ""
+            for piece in pieces:
+                candidate = piece if not cur else (cur + " " + piece)
+                if len(candidate) <= cap:
+                    cur = candidate
+                else:
+                    if cur:
+                        packed.append(cur)
+                    cur = piece
+                while len(cur) > cap:
+                    # 宁可整块留长，也不半路砍断词句
+                    packed.append(cur)
+                    cur = ""
+                    break
+            if cur:
+                packed.append(cur)
+            return packed or [text]
+
+        out: list[list[Any]] = []
+        for chunk in chunks:
+            plains = [comp for comp in chunk if isinstance(comp, Plain)]
+            others = [comp for comp in chunk if not isinstance(comp, Plain)]
+            if len(plains) != 1:
+                out.append(chunk)
+                continue
+            text = str(getattr(plains[0], "text", "") or "").strip()
+            if len(text) <= cap:
+                out.append(chunk)
+                continue
+            pieces = _split(text)
+            if len(pieces) <= 1:
+                out.append(chunk)
+                continue
+            out.append([Plain(pieces[0])] + others)
+            for piece in pieces[1:]:
+                out.append([Plain(piece)])
+        if len(out) > max_segments:
+            merged: list[list[Any]] = out[: max_segments - 1]
+            tail_texts = []
+            for chunk in out[max_segments - 1:]:
+                chunk_text = " ".join(
+                    str(getattr(comp, "text", "") or "").strip()
+                    for comp in chunk
+                    if isinstance(comp, Plain)
+                ).strip()
+                if chunk_text:
+                    tail_texts.append(chunk_text)
+            if tail_texts:
+                merged.append([Plain(" ".join(tail_texts))])
+            out = merged
+
+        try:
+            setattr(event, "_private_companion_humanize_split", True)
+        except Exception:
+            pass
+        return out
 
     def _llm_controlled_segmenting_allowed(self, event: AstrMessageEvent | None = None) -> bool:
         """Return whether the current conversation may use LLM boundaries."""
@@ -13701,8 +13796,50 @@ class PrivateCompanionPlugin(
             mode=PromptRenderMode.LABELED_BLOCK,
         )
 
+    _REPLY_BUDGET_TIERS: tuple[tuple[float, int, str], ...] = (
+        (0.15, 2, "只回一个字或两个字，像\"嗯\"\"好\"\"哦\"\"没有\""),
+        (0.45, 6, "6 个字以内，一个词也行"),
+        (0.30, 12, "12 个字以内，一句短话"),
+        (0.10, 25, "25 个字以内，最多两句"),
+    )
+
+    def _reply_length_budget_hint(self) -> str:
+        """本轮字数预算（随机抽档，制造真人那种长短交错）。
+
+        措辞是「硬性上限 + 超了算错」，比「请简洁」这类软提示更容易被遵守。
+        环境变量 HUMANIZE_FORCE_CAP 可强制一个上限（测试服从率时用）。
+        """
+        if not bool(runtime_persona_setting(self, "humanize_length_budget", True)):
+            return ""
+        forced = os.environ.get("HUMANIZE_FORCE_CAP", "").strip()
+        self._last_budget_cap = 0
+        cap = 0
+        note = ""
+        if forced.isdigit():
+            cap = int(forced)
+            note = "只说一两个词也行"
+        else:
+            roll = random.random()
+            acc = 0.0
+            for weight, tier_cap, tier_note in self._REPLY_BUDGET_TIERS:
+                acc += weight
+                if roll <= acc:
+                    cap, note = tier_cap, tier_note
+                    break
+            else:
+                cap, note = self._REPLY_BUDGET_TIERS[-1][1], self._REPLY_BUDGET_TIERS[-1][2]
+        self._last_budget_cap = int(cap)
+        return (
+            f"【硬性上限】这一条回复不得超过 {cap} 个字（{note}）。"
+            "超过就是不合格，宁可用\"嗯\"这种一个字把话收住。"
+            "例外只有一种：对方明确在问怎么做、要步骤或要解释。"
+        )
+
     def _format_reply_style_prompt_section(self) -> PromptSection:
         text = str(runtime_persona_setting(self, 'reply_style_prompt', "") or "").strip()
+        _budget_hint = self._reply_length_budget_hint()
+        if _budget_hint:
+            text = (text + "\n" + _budget_hint).strip() if text else _budget_hint
         persona_voice_section = self._format_persona_voice_channel_prompt_section("conversation")
         persona_voice = ""
         if persona_voice_section is not None:

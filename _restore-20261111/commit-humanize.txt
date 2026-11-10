@@ -1,0 +1,28 @@
+feat(persona): 让聊天更像真人——量化基线、提示词重写、结构层切短
+
+1. 先量差距：新增 scripts/humanize_metrics.py，用 WeFlow 本地库 5 个会话
+   各 400 条，按 isSend 分真人/机器人算风格指标。基线：真人中位 5 字、
+   ≤6 字 60.6%、无标点 86.6%、逗号密度 0.15；机器人中位 14 字、≤6 字 18.8%、
+   逗号密度 0.53 —— 成段说话是「AI 味」的主因。
+
+2. 提示词：reply_style_prompt 从 116 字换成 653 字的《怎么说话》规则块
+   （短句、允许一两个字、不总结、少问号、标点从简、带真人样例），
+   去掉原文「复杂问题可无视这一要求」这句长回复许可。写入走面板 API，
+   避免启动镜像回写（脚本 _restore-20261111/apply_style_v2.py）。
+
+3. 结构强制：光写提示词服从率只有三成，所以在代码里兜底
+   - event_dispatch.py `_split_proactive_text` 增 `_humanize_shorten`：
+     主动消息超 16 字的气泡按逗号/顿号/空格切开，最多 4 条；
+     引号书名号里的创作摘录不动。
+   - main.py `_clean_segmented_reply_chunks` 增 `_humanize_split_chunks`：
+     被动回复按本轮抽到的字数上限拆成多条。
+   - main.py `_reply_length_budget_hint` 每轮随机抽硬上限
+     （15% 1~2 字 / 45% ≤6 字 / 30% ≤12 字 / 10% ≤25 字）写进提示词，
+     并把上限记到 `_last_budget_cap` 供拆条使用；可用 HUMANIZE_FORCE_CAP 强制。
+   - 新增开关 humanize_short_bubbles / humanize_length_budget（默认开）。
+
+4. 效果（同 5~8 条话题复测，文件传输助手自检）：
+   中位 14 → 8 字，≤6 字 0.188 → 0.333，逗号密度 0.53 → 0.11，
+   无标点 0.576 → 0.889，≤3 字应答 0.055 → 0.222（真人 0.292）。
+
+5. docs/HUMANIZE-STYLE-20261111.md 记了完整数据表、三层改法、五个坑与回滚步骤。

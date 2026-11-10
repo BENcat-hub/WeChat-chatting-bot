@@ -90,3 +90,6 @@ akasha-bridge/wxui_recent_sends.json
 bertvits2/pretrained/
 bertvits2/bert/
 bertvits2/jieba.cache
+# 人味儿评估语料（含真实聊天内容，不入库）
+_restore-20261111/corpus-*.json
+_restore-20261111/eval-*.json

@@ -6583,6 +6583,76 @@ class EventDispatchMixin:
                 for item in merged
             ]
 
+        def _humanize_shorten(
+            items: list[str],
+            max_chars: int = 16,
+            max_bubbles: int = 4,
+        ) -> list[str]:
+            """把偏长的气泡切短，贴近真人「一条一句、短句连发」的节奏。
+
+            只做切分，不改写、不删字：切点优先逗号/顿号/分号/空格，
+            其次在句末标点处；带引号书名号或换行的创作摘录不动。
+            """
+            if max_chars < 8:
+                max_chars = 8
+            if max_bubbles < 1:
+                max_bubbles = 1
+
+            def _protected(text: str) -> bool:
+                if "\n" in text:
+                    return True
+                return any(mark in text for mark in ("「", "」", "《", "》", "『", "』"))
+
+            def _pieces(text: str) -> list[str]:
+                raw = re.split(r"([，,、；;：:]+|\s+|[。！？!?…~～]+)", text)
+                out: list[str] = []
+                buf = ""
+                for part in raw:
+                    if not part:
+                        continue
+                    if re.fullmatch(r"[，,、；;：:\s。！？!?…~～]+", part):
+                        if buf:
+                            out.append(buf)
+                            buf = ""
+                        continue
+                    buf += part
+                if buf:
+                    out.append(buf)
+                return [piece for piece in out if piece.strip()]
+
+            produced: list[str] = []
+            for item in items:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                if len(text) <= max_chars or _protected(text):
+                    produced.append(text)
+                    continue
+                buf = ""
+                for piece in _pieces(text):
+                    candidate = piece if not buf else (buf + " " + piece)
+                    if len(candidate) <= max_chars:
+                        buf = candidate
+                    else:
+                        if buf:
+                            produced.append(buf)
+                        buf = piece
+                if buf:
+                    produced.append(buf)
+
+            while len(produced) > max_bubbles:
+                best = -1
+                best_len = 10 ** 9
+                for pos in range(len(produced) - 1):
+                    size = len(produced[pos]) + len(produced[pos + 1])
+                    if size < best_len:
+                        best_len = size
+                        best = pos
+                if best < 0:
+                    break
+                produced[best] = (produced[best] + " " + produced[best + 1]).strip()
+                del produced[best + 1]
+            return produced
         if split_mode == "words":
             configured_split_words = setting(
                 "split_words",
@@ -6607,6 +6677,12 @@ class EventDispatchMixin:
                         segments.append(cleaned)
             segments = _merge_segments(segments)
             segments = [restore_markdown(segment) for segment in segments]
+            if segments and bool(setting("humanize_short_bubbles", True)) and len(segments) > 0:
+                segments = _humanize_shorten(
+                    segments,
+                    _safe_int(setting("humanize_max_chars", 16), 16, 8, 40),
+                    max_segments,
+                )
             return segments if segments and (len(segments) > 1 or cleanup_enabled) else [restore_markdown(normalized)]
 
         try:
@@ -6634,6 +6710,12 @@ class EventDispatchMixin:
             _strip_soft_trailing_punctuation(restore_markdown(segment))
             for segment in segments
         ]
+        if segments and bool(setting("humanize_short_bubbles", True)) and len(segments) > 0:
+            segments = _humanize_shorten(
+                segments,
+                _safe_int(setting("humanize_max_chars", 16), 16, 8, 40),
+                max_segments,
+            )
         return segments if segments and (len(segments) > 1 or cleanup_enabled) else [restore_markdown(normalized)]
 
     async def _calc_segmented_proactive_interval(
